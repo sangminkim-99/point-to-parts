@@ -126,6 +126,11 @@ def main():
     ap.add_argument("--merge-rigid", type=int, default=1,
                     help="also offer a grouping in which groups that never move "
                          "relative to each other are merged")
+    ap.add_argument("--score-round", type=int, default=3,
+                    help="decimals the split ratio is rounded to before coverage "
+                         "and part count break the tie. At 2 a harmful merge ties "
+                         "with the grouping it damages and wins on fewer parts, "
+                         "costing RBO cabinet02 a drawer.")
     ap.add_argument("--merge-eps", type=float, default=0.0,
                     help="how much score a merged grouping may give up and still "
                          "be preferred over the over-segmented one. Zero: at 0.03 "
@@ -684,7 +689,7 @@ def main():
         # explain the posteriors about equally well, prefer the one that labels
         # more of the object, and then the one with fewer parts.
         r, c = e[3]
-        return round(r, 2), c
+        return round(r, args.score_round), c
     cand.sort(key=lambda x: (-combined(x)[0], -combined(x)[1],
                              len(set(x[1][x[1] >= 0].tolist()))))
     print("[g] grouping selection: " +
