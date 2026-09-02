@@ -120,6 +120,11 @@ def main():
                     help="cluster a co-association matrix instead of carrying "
                          "hypothesis slots across frames")
     ap.add_argument("--no-coassoc", dest="coassoc", action="store_false")
+    ap.add_argument("--winsets", type=int, default=1,
+                    help="also group by clustering the recurring decisive winner "
+                         "sets, and let the GT-free score choose")
+    ap.add_argument("--winset-min-members", type=int, default=3)
+    ap.add_argument("--winset-thresh", type=float, default=0.5)
     ap.add_argument("--coassoc-weight", choices=["none", "decisive", "disagree"],
                     default="none",
                     help="weight each frame's co-association evidence by how far "
@@ -557,6 +562,12 @@ def main():
         full = np.full(len(cloud), -1, dtype=int)
         full[sub_co] = lab_co
         cand.append(("coassoc", lab_co, sub_co, grouping_score(full)))
+    if args.winsets:
+        lab_ws, sub_ws = assign.winset_labels(min_members=args.winset_min_members,
+                                              thresh=args.winset_thresh,
+                                              min_group=args.min_group)
+        if (lab_ws >= 0).any():
+            cand.append(("winsets", lab_ws, sub_ws, grouping_score(lab_ws)))
     cand.sort(key=lambda x: -x[3])
     print("[g] grouping selection: " +
           "  ".join(f"{n}={sc:.3f}" for n, _, _, sc in cand))

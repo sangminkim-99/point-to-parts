@@ -241,6 +241,7 @@ class GaussianPartAssignment:
         if getattr(self, "co_idx", None) is not None:
             self.accumulate_coassoc_soft(R, bestval < 1e5,
                                          weight_mode=self.coassoc_weight)
+        self.record_winsets(wins)
         self.last_wins = [w.detach().cpu().numpy() for w in wins]
         self.last_slots = list(slot_of)
         return {
@@ -708,6 +709,77 @@ class GaussianPartAssignment:
                 return
         self.co_same += wf * (P.T @ P)
         self.co_seen += wf * (v[:, None] * v[None, :])
+
+    # ------------------------------------------------------------------ #
+    #  Grouping by recurring winner sets
+    # ------------------------------------------------------------------ #
+    def record_winsets(self, wins, min_group=100, max_frac=0.5):
+        """Keep every decisive winner set that is substantial but not the whole
+        object.
+
+        Co-association averages over all frames, and on RBO that is fatal: only
+        about a tenth of gaussians are decisive in the median frame, so the many
+        frames in which one hypothesis explains everything push every pair
+        towards "same" and leave a same/cross affinity gap of 0.035. Yet the
+        evidence IS there -- cabinet01 has frames where a hypothesis wins an
+        rb1-dominant set at 92-99% purity. A set like that recurs, frame after
+        frame, and is similar to itself; averaging is what destroys it. So keep
+        the sets and cluster the SETS instead of the pairs.
+
+        Sets covering more than `max_frac` of the object are the "everything
+        moved together" case and carry no separation information.
+        """
+        if not hasattr(self, "winsets"):
+            self.winsets = []
+        n = len(self.cloud)
+        for w in wins:
+            c = int(w.sum())
+            if c < min_group or c > max_frac * n:
+                continue
+            self.winsets.append(
+                torch.where(w)[0].detach().cpu().numpy().astype(np.int32))
+
+    def winset_labels(self, min_members=3, thresh=0.5, min_group=100,
+                      core_frac=0.5):
+        """Cluster the recorded winner sets by Jaccard overlap; each cluster's
+        core is a part. Returns (labels over all gaussians, indices kept)."""
+        sets = getattr(self, "winsets", [])
+        n = len(self.cloud)
+        if len(sets) < 2 * min_members:
+            return np.full(n, -1, dtype=int), np.arange(n)
+        M = np.zeros((len(sets), n), dtype=bool)
+        for i, idx in enumerate(sets):
+            idx = idx[idx < n]
+            M[i, idx] = True
+        Mf = M.astype(np.float32)
+        inter = Mf @ Mf.T
+        sz = Mf.sum(1)
+        union = sz[:, None] + sz[None, :] - inter
+        J = inter / np.maximum(union, 1.0)
+        D = np.clip(1.0 - J, 0.0, 1.0)
+        np.fill_diagonal(D, 0.0)
+
+        from sklearn.cluster import AgglomerativeClustering
+        cl = AgglomerativeClustering(n_clusters=None, metric="precomputed",
+                                     linkage="average",
+                                     distance_threshold=1.0 - thresh).fit(D)
+        labels = np.full(n, -1, dtype=int)
+        score = np.zeros(n, dtype=np.float32)
+        g = 0
+        for c in np.unique(cl.labels_):
+            rows = np.where(cl.labels_ == c)[0]
+            if rows.size < min_members:
+                continue
+            freq = M[rows].mean(axis=0)
+            core = freq >= core_frac
+            if core.sum() < min_group:
+                continue
+            # a gaussian belongs to the cluster that claims it most often
+            take = core & (freq > score)
+            labels[take] = g
+            score[take] = freq[take]
+            g += 1
+        return labels, np.arange(n)
 
     def coassoc_labels(self, min_frac=0.5, min_group=50, max_k=5, adaptive=True):
         """Cluster the co-association matrix.
