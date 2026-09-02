@@ -120,7 +120,7 @@ def main():
                     help="cluster a co-association matrix instead of carrying "
                          "hypothesis slots across frames")
     ap.add_argument("--no-coassoc", dest="coassoc", action="store_false")
-    ap.add_argument("--coassoc-weight", choices=["none", "decisive"],
+    ap.add_argument("--coassoc-weight", choices=["none", "decisive", "disagree"],
                     default="none",
                     help="weight each frame's co-association evidence by how far "
                          "its posterior is from a single hypothesis owning "
@@ -1006,7 +1006,12 @@ def main():
                 if Tp is None:
                     continue
                 Tp = np.asarray(Tp)
-                base = jm.point if jm.kind == "revolute" else gm[w].mean(0)
+                # the fitted point is only determined up to a slide along the
+                # axis -- (I-R) annihilates the axis direction -- so anchor the
+                # drawn segment at the point nearest the part it belongs to
+                c = gm[w].mean(0)
+                base = (jm.point + jm.axis * float((c - jm.point) @ jm.axis)
+                        if jm.kind == "revolute" else c)
                 seg = np.stack([base - jm.axis * 0.12, base + jm.axis * 0.12])
                 q = seg @ Tp[:3, :3].T + Tp[:3, 3]
                 if (q[:, 2] > 1e-3).all():

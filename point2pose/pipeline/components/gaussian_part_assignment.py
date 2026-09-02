@@ -685,12 +685,25 @@ class GaussianPartAssignment:
         # 0.035. Weighting each frame by how far its posterior is from a single
         # hypothesis owning everything lets the informative frames dominate.
         wf = 1.0
-        if weight_mode == "decisive":
+        if weight_mode != "none":
             n_v = float(v.sum())
             if n_v < 1:
                 return
-            conc = float((P.sum(dim=1) / n_v).max())
-            wf = max(0.0, 1.0 - conc)
+            if weight_mode == "decisive":
+                # how far the mean posterior is from one hypothesis owning
+                # everything. Measured on RBO this barely varies frame to frame
+                # -- the posteriors are soft, so the weight is nearly constant
+                # and changes nothing.
+                wf = max(0.0, 1.0 - float((P.sum(dim=1) / n_v).max()))
+            elif weight_mode == "disagree":
+                # the sharper question: what fraction of gaussians do NOT pick
+                # the majority hypothesis. A frame where every surface picks the
+                # same motion says nothing about which surfaces move together.
+                am = P.argmax(dim=0)[v > 0]
+                if am.numel() < 1:
+                    return
+                maj = float(torch.bincount(am, minlength=P.shape[0]).max())
+                wf = max(0.0, 1.0 - maj / float(am.numel()))
             if wf <= 1e-3:
                 return
         self.co_same += wf * (P.T @ P)

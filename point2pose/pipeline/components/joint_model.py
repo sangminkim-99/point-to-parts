@@ -62,9 +62,18 @@ class JointModel:
         ref = u[np.argmax(ang[big])]
         n = (u * np.sign(u @ ref)[:, None]).mean(axis=0)
         n /= np.linalg.norm(n) + 1e-12
-        # every observation must satisfy (I - R_i) p = t_i for the same p
-        M = np.concatenate([np.eye(3) - A[i, :3, :3] for i in np.where(big)[0]], 0)
-        b = np.concatenate([t[i] for i in np.where(big)[0]], 0)
+        # Every observation must satisfy (I - R_i) p = t_i for the same p.
+        # Weighted by rotation angle: (I - R) is near-singular for a small
+        # rotation, so a part that has only just started to swing contributes an
+        # almost unconstrained row. The laptop lid's joint is first fitted from
+        # under 25 degrees of motion, and an unweighted solve put its axis about
+        # 110 mm off -- enough that the joint sweep bracketed the true pose
+        # without ever landing on it.
+        idx = np.where(big)[0]
+        w = ang[idx]
+        M = np.concatenate([(np.eye(3) - A[i, :3, :3]) * wi
+                            for i, wi in zip(idx, w)], 0)
+        b = np.concatenate([t[i] * wi for i, wi in zip(idx, w)], 0)
         p, *_ = np.linalg.lstsq(M, b, rcond=None)
         return "revolute", n, p
 
