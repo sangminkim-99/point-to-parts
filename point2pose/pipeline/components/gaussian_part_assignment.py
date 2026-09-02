@@ -248,6 +248,7 @@ class GaussianPartAssignment:
             self.accumulate_coassoc_soft(R, bestval < 1e5,
                                          weight_mode=self.coassoc_weight)
         self.record_winsets(wins, max_frac=self.winset_max_frac)
+        self.last_decisive = float(decisive.float().mean())
         self.last_wins = [w.detach().cpu().numpy() for w in wins]
         self.last_slots = list(slot_of)
         return {

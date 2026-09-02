@@ -41,7 +41,14 @@ def main():
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
     args = ap.parse_args()
 
-    r = open_sequence(args.seq_dir)
+    # a RealSense recording (rgb/, depth/, cam_K.txt) or a dataset sequence
+    if (Path(args.seq_dir).expanduser() / "cam_K.txt").exists():
+        from examples.multi_part.recording import Recording
+        r = Recording(args.seq_dir)
+        rec_mode = True
+    else:
+        r = open_sequence(args.seq_dir)
+        rec_mode = False
     ext = None
     if args.object_masks:
         d = np.load(args.object_masks, allow_pickle=True)
@@ -51,6 +58,8 @@ def main():
     def object_mask(i):
         if ext is not None:
             return ext.get(i)
+        if rec_mode:
+            return r.get_mask(i)
         m = np.zeros((r.H, r.W), np.uint8)
         for x in r.get_masks(i):
             m |= x
@@ -59,6 +68,12 @@ def main():
     frames = list(range(0, len(r), args.stride))
     if ext is not None:
         frames = [i for i in frames if ext.get(i) is not None]
+    if rec_mode:
+        frames = [i for i in frames if object_mask(i) is not None]
+        if not frames:
+            raise SystemExit(
+                "no masks: run  python -m examples.multi_part.annotate "
+                f"--seq-dir {args.seq_dir}")
     if args.max_frames:
         frames = frames[:args.max_frames]
 
@@ -114,8 +129,11 @@ def main():
                 vis = np.vstack([vis, np.hstack([panel, pad])])
         bar = np.full((30, vis.shape[1], 3), (28, 24, 20), np.uint8)
         fps = 1000.0 / max(np.median(times[-30:]), 1e-6)
-        label = (f"{s.state}  parts {len(s.parts)}  "
-                 f"{s.last_timings['total_ms']:.0f} ms  ~{fps:.1f} fps")
+        d = s.diag
+        label = (f"{s.state} parts {len(s.parts)} | hyp {d.get('hyp', 0)} "
+                 f"tracks {d.get('tracks_live', 0)}/{d.get('tracks', 0)} "
+                 f"decisive {100*d.get('decisive', 0):.0f}% "
+                 f"tries {d.get('tries', 0)} | {fps:.1f} fps")
         cv2.putText(bar, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (235, 235, 235), 1, cv2.LINE_AA)
         canvas = np.vstack([vis, bar])

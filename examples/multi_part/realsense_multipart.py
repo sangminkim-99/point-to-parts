@@ -190,7 +190,7 @@ class RealSenseMultiPart:
 
                     fps = 1000.0 / max(np.median(self.times[-30:]), 1e-6) if self.times else 0
                     t = self.stream.last_timings
-                    bar = np.full((52, disp.shape[1], 3), (28, 24, 20), np.uint8)
+                    bar = np.full((86, disp.shape[1], 3), (28, 24, 20), np.uint8)
                     cv2.putText(bar, f"{self.stream.state}   parts {len(self.stream.parts)}"
                                      f"   {t.get('total_ms', 0):.0f} ms   {fps:.1f} fps",
                                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
@@ -198,8 +198,21 @@ class RealSenseMultiPart:
                     cv2.putText(bar, f"track {t.get('track_ms', 0):.0f}  "
                                      f"hyp {t.get('hyp_ms', 0):.0f}  "
                                      f"dense {t.get('dense_ms', 0):.0f}  (ms)",
-                                (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                                (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                                 (150, 150, 150), 1, cv2.LINE_AA)
+                    d = self.stream.diag
+                    # a split needs >=2 DISTINCT hypotheses; with one, every
+                    # gaussian has the same posterior and nothing can separate
+                    hcol = (90, 90, 235) if d.get("hyp", 0) < 2 else (150, 220, 150)
+                    cv2.putText(bar, f"hypotheses {d.get('hyp', 0)}   "
+                                     f"tracks {d.get('tracks_live', 0)}/{d.get('tracks', 0)}"
+                                     f"   decisive {100*d.get('decisive', 0):.0f}%"
+                                     f"   split tries {d.get('tries', 0)}",
+                                (8, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                                hcol, 1, cv2.LINE_AA)
+                    cv2.putText(bar, d.get("why", ""), (8, 76),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                (170, 170, 170), 1, cv2.LINE_AA)
                     disp = np.vstack([disp, bar])
 
                 cv2.imshow("multi-part", disp)

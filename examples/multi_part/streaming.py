@@ -202,6 +202,8 @@ class StreamingPartDiscovery:
         self.cloud = None
         self.assign = None
         self.last_timings = {}
+        self.diag = {}
+        self.debug = True
 
     # ---- anchor frame ----
     def start(self, rgb, depth, mask):
@@ -281,6 +283,16 @@ class StreamingPartDiscovery:
             self._step_split(rgb, depth, mask, hyps, i)
         t_end = time.perf_counter()
 
+        n_uni = len({tuple(np.round(np.asarray(T).ravel(), 4)) for T in hyps})
+        _, cok, cvi = self.cur_tracks
+        self.diag = {
+            "hyp": n_uni,
+            "tracks_live": int((cok & cvi).sum()),
+            "tracks": int(len(cok)),
+            "decisive": float(getattr(self.assign, "last_decisive", 0.0)),
+            "tries": getattr(self, "split_tries", 0),
+            "why": getattr(self, "last_split_why", "no attempt yet"),
+        }
         self.last_timings = {
             "track_ms": (t_track - t0) * 1e3,
             "hyp_ms": (t_hyp - t_track) * 1e3,
@@ -418,10 +430,20 @@ class StreamingPartDiscovery:
                     best = e
                     break
 
+        self.last_scored = [(nm, len(set(lb[lb >= 0].tolist())), r, c)
+                            for nm, lb, r, c in scored]
         name, lab, ratio, cov = best
         groups = sorted(g for g in set(lab[lab >= 0].tolist()) if g >= 0)
         groups = [g for g in groups if (lab == g).sum() >= cfg.min_group]
+        self.split_tries = getattr(self, "split_tries", 0) + 1
         if len(groups) < 2:
+            self.last_split_why = (
+                f"best '{name}' ratio {ratio:.3f} cov {cov:.2f} -> "
+                f"{len(groups)} group(s) >= {cfg.min_group} gaussians")
+            if self.debug:
+                print(f"[split {self.split_tries}] " + "  ".join(
+                    f"{nm}:r={r:.3f},c={c:.2f}[{ng}]"
+                    for nm, ng, r, c in self.last_scored))
             return False
 
         self.parts = []
