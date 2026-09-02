@@ -634,7 +634,12 @@ def main():
                     pa = X @ Ta[:3, :3].T + Ta[:3, 3]
                     pb = X @ Tb[:3, :3].T + Tb[:3, 3]
                     d.append(float(np.linalg.norm(pa - pb, axis=1).mean()))
-                if d and float(np.median(d)) < tol:
+                # a high percentile, not the median: two groups are one body
+                # only if they NEVER move apart. On RBO the drawers agree with
+                # the body in most frames -- exactly the pathology that makes
+                # the sequence hard -- and a median test merged all six groups
+                # into one.
+                if d and float(np.percentile(d, 90)) < tol:
                     ra, rb = find(a_), find(b_)
                     if ra != rb:
                         parent[rb] = ra
