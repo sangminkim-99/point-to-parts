@@ -121,8 +121,8 @@ def main():
                          "hypothesis slots across frames")
     ap.add_argument("--no-coassoc", dest="coassoc", action="store_false")
     ap.add_argument("--coverage-weight", type=float, default=0.3,
-                    help="how much a grouping is rewarded for labelling more of "
-                         "the object, added to the split ratio")
+                    help="unused; coverage now breaks ties rather than trading "
+                         "against the split ratio (see combined())")
     ap.add_argument("--merge-rigid", type=int, default=1,
                     help="also offer a grouping in which groups that never move "
                          "relative to each other are merged")
@@ -676,9 +676,17 @@ def main():
     # same hypothesis leaves `split` unchanged, so a correct merge scores exactly
     # the same as the over-segmented version it replaces
     def combined(e):
+        # Coverage BREAKS TIES; it does not trade against the split ratio. Added
+        # with a weight it silently overrides the ratio: on the simulated
+        # eyeglasses a 2-group labelling at 87% coverage (ratio 1.015) beat the
+        # correct 3-group one at 73% (ratio 1.036) and lost a temple. Rounding
+        # the ratio first says plainly what is meant -- when two groupings
+        # explain the posteriors about equally well, prefer the one that labels
+        # more of the object, and then the one with fewer parts.
         r, c = e[3]
-        return r + args.coverage_weight * c
-    cand.sort(key=lambda x: (-combined(x), len(set(x[1][x[1] >= 0].tolist()))))
+        return round(r, 2), c
+    cand.sort(key=lambda x: (-combined(x)[0], -combined(x)[1],
+                             len(set(x[1][x[1] >= 0].tolist()))))
     print("[g] grouping selection: " +
           "  ".join(f"{n}={sc[0]:.3f}x{sc[1]:.2f}"
                     f"[{len(set(lb[lb >= 0].tolist()))}]"
@@ -692,10 +700,8 @@ def main():
     best_name = cand[0][0]
     if not best_name.endswith("+merge"):
         for e in cand[1:]:
-            if e[0] == best_name + "+merge" and \
-                    combined(e) >= combined(cand[0]) - args.merge_eps:
-                print(f"[g] taking the merged variant ({combined(e):.3f} vs "
-                      f"{combined(cand[0]):.3f}, within tolerance)")
+            if e[0] == best_name + "+merge" and combined(e) >= combined(cand[0]):
+                print("[g] taking the merged variant (same score, fewer parts)")
                 cand = [e] + [c for c in cand if c is not e]
                 break
     chosen, lab, sub, _ = cand[0]
