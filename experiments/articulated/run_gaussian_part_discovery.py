@@ -422,7 +422,66 @@ def main():
     if writer:
         writer.release()
 
+    def grouping_score(labels_full):
+        """How well does a grouping explain the per-frame posteriors?
+
+        Ground-truth-free model selection. For each frame and each group, take the
+        hypothesis that best explains that group and read off how much posterior
+        mass it actually captures. A grouping that cuts along the real parts
+        collects nearly all of it; one that splits a rigid body does not.
+        """
+        if not pose_log:
+            return -1.0
+        gs = [g for g in set(labels_full.tolist()) if g >= 0]
+        if len(gs) < 1:
+            return -1.0
+        # Score the split against NOT splitting. Asking only "how well does each
+        # group explain the posteriors" rewards a single group, which is why the
+        # laptop collapsed to one part as soon as depth noise was added. The
+        # honest question is whether splitting explains the data better than
+        # treating everything as one body.
+        tot, cnt = 0.0, 0
+        for rec in pose_log[::3]:
+            P = rec["P"]
+            if P.shape[1] != labels_full.shape[0]:
+                continue
+            union = labels_full >= 0
+            if union.sum() < 20:
+                continue
+            m_all = P[:, union].sum(axis=1)
+            base = float(m_all.max())
+            split = 0.0
+            for g in gs:
+                m = labels_full == g
+                if m.sum() < 10:
+                    continue
+                split += float(P[:, m].sum(axis=1).max())
+            if base > 1e-9:
+                tot += split / base
+                cnt += 1
+        return tot / max(cnt, 1)
+
+    # both groupings are computed, then the better-scoring one is kept: the hard
+    # log-odds path wins on scissors and pliers, co-association on laptop and
+    # eyeglasses, and neither dominates.
+    cand = []
+    lab_hard = assign.labels()
+    cand.append(("labels", lab_hard, np.arange(len(cloud)), grouping_score(lab_hard)))
     if args.coassoc:
+        lab_co, sub_co = assign.coassoc_labels(args.co_frac, args.min_group,
+                                               max_k=args.co_max_k)
+        full = np.full(len(cloud), -1, dtype=int)
+        full[sub_co] = lab_co
+        cand.append(("coassoc", lab_co, sub_co, grouping_score(full)))
+    cand.sort(key=lambda x: -x[3])
+    print("[g] grouping selection: " +
+          "  ".join(f"{n}={sc:.3f}" for n, _, _, sc in cand))
+    chosen, lab, sub, _ = cand[0]
+    print(f"[g] using '{chosen}' grouping")
+    gt_lab_full = gt_lab
+    gt_lab = gt_lab[sub]
+
+    if False:
         # does the accumulated matrix separate same-part from cross-part pairs?
         import torch as _t
         sub_np = assign.co_idx.cpu().numpy()
@@ -437,11 +496,6 @@ def main():
               f"cross-part mean {cv.mean():.3f} (n={cv.size}), gap {sv.mean()-cv.mean():+.3f}")
         print(f"[g] co_seen per pair: mean {seen.mean():.1f} of {len(frames)} frames, "
               f"zero for {100*(seen==0).mean():.1f}% of pairs")
-        lab, sub = assign.coassoc_labels(args.co_frac, args.min_group,
-                                         max_k=args.co_max_k)
-        gt_lab = gt_lab[sub]
-    else:
-        lab = assign.labels()
     ok = lab >= 0
     print(f"\n[g] decided {100*ok.mean():.1f}% of gaussians")
     used = sorted(set(lab[ok].tolist()))
