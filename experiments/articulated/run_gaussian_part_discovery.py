@@ -147,6 +147,9 @@ def main():
                          "44 mm). The lid's colours are its screen face, and once "
                          "the back turns to the camera every colour disagrees, so "
                          "the energy starts preferring poses that hide the part.")
+    ap.add_argument("--max-step", type=float, default=0.2,
+                    help="largest translation a part may move between two tracked "
+                         "frames, metres; 0 disables the guard")
     ap.add_argument("--exclusive-mask", type=int, default=1)
     ap.add_argument("--joint-tol", type=float, default=0.02,
                     help="how far off the joint manifold a pose may be and still "
@@ -705,7 +708,17 @@ def main():
                                 cands.append(c["T"])
                 best_T, best_e, best_i = None, float("inf"), -1
                 dbg = []
+                # A part cannot teleport between two consecutive frames. Without
+                # this the joint sweep -- which deliberately proposes poses all
+                # over the joint's range so a lost part can be recovered -- also
+                # lets a part that was tracking perfectly jump: the storage
+                # cabinet's static body, tracked to 0.7 mm for two thirds of the
+                # sequence, ended up 815 mm away.
                 for ci, Tc in enumerate(cands):
+                    if T_prev is not None and args.max_step > 0:
+                        d = float(np.linalg.norm(np.asarray(Tc)[:3, 3] - T_prev[:3, 3]))
+                        if d > args.max_step:
+                            continue
                     Tr = assign.refine_pose(Tc, w, K, H, W, dep_i, iters=8,
                                             huber=0.04, obs_mask=om_j)
                     # truncated energy over ALL the part's gaussians, not a median
@@ -740,10 +753,7 @@ def main():
                         was = jm.kind
                         if jm.fit():
                             inf["jv"] = [jm.value_of(a_) for a_ in jm.A]
-                            if jm.kind != was:
-                                print(f"[g]   part {j} joint: {jm.kind} axis "
-                                      f"{np.round(jm.axis, 3)} after "
-                                      f"{len(jm.A)} frames")
+                            _ = was
                     elif jm.kind is not None:
                         inf["jv"].append(jm.value_of(A))
                 if T_prev is not None:
@@ -788,6 +798,21 @@ def main():
                     n_grown += n_new
             nrec += 1
 
+        for j, inf in enumerate(infos):
+            jm = inf["joint"]
+            if jm is None:
+                continue
+            gt_ = inf["row"]["dominant_gt"]
+            if jm.kind is None:
+                print(f"[g] joint {gt_}: not fitted ({len(jm.A)} trusted frames)")
+            else:
+                rng = (np.degrees(max(inf["jv"]) - min(inf["jv"]))
+                       if jm.kind == "revolute" else
+                       1000 * (max(inf["jv"]) - min(inf["jv"])))
+                print(f"[g] joint {gt_} -> {infos[inf['parent']]['row']['dominant_gt']}"
+                      f": {jm.kind} axis {np.round(jm.axis, 3)}  range "
+                      f"{rng:.0f}{'deg' if jm.kind == 'revolute' else 'mm'}"
+                      f"  from {len(jm.A)} frames")
         if args.track_grow > 0:
             print(f"[g] part modelling grew the cloud by {n_grown} gaussians "
                   f"({len(cloud)} total)")
@@ -873,7 +898,12 @@ def main():
                 w = np.concatenate([w, np.zeros(gm.shape[0] - w.shape[0], bool)])
             members[gtp] = w
             try:
-                boxes[gtp] = fit_oriented_box(gm[w])
+                # trim the outer few percent before fitting the box: online
+                # growth occasionally attaches a stray pixel through a slipped
+                # pose, and one such point inflates an oriented box visibly
+                q = gm[w]
+                d = np.linalg.norm(q - np.median(q, axis=0), axis=1)
+                boxes[gtp] = fit_oriented_box(q[d <= np.percentile(d, 97)])
             except Exception:
                 boxes[gtp] = None
         pose_at = {g: dict(t) for g, t in part_tracks.items()}
@@ -910,11 +940,17 @@ def main():
                         p0 = (int(org[0]*K[0,0]/org[2]+K[0,2]), int(org[1]*K[1,1]/org[2]+K[1,2]))
                         p1 = (int(tip[0]*K[0,0]/tip[2]+K[0,2]), int(tip[1]*K[1,1]/tip[2]+K[1,2]))
                         cv2.arrowedLine(im, p0, p1, acol, 2, cv2.LINE_AA, tipLength=0.3)
-            # the estimated joint axis, drawn through the parent's pose
+            # the estimated joint axis, drawn through the parent's pose. Both
+            # ends of a pair carry a model of the same joint, so draw it once.
+            drawn = set()
             for k, (gtp, w) in enumerate(members.items()):
                 jm, par = part_joints.get(gtp, (None, None))
                 if jm is None or jm.kind is None or par == gtp:
                     continue
+                key = frozenset((gtp, par))
+                if key in drawn:
+                    continue
+                drawn.add(key)
                 Tp = pose_at.get(par, {}).get(int(i))
                 if Tp is None:
                     continue
@@ -929,7 +965,7 @@ def main():
                              4, cv2.LINE_AA)
                     cv2.line(im, (pu[0], pv[0]), (pu[1], pv[1]), (40, 40, 40),
                              2, cv2.LINE_AA)
-                    cv2.putText(im, jm.kind[:4], (pu[1], pv[1]),
+                    cv2.putText(im, jm.kind, (pu[1] + 6, pv[1]),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (30, 30, 30), 1,
                                 cv2.LINE_AA)
             bar = np.full((30, W, 3), (26, 22, 18), np.uint8)
