@@ -1,0 +1,702 @@
+"""Online part discovery and per-part 6-DoF tracking, one frame at a time.
+
+The offline experiment in `experiments/articulated/run_gaussian_part_discovery.py`
+is two-pass: it walks the whole sequence accumulating evidence, groups once at the
+end, then walks it again to track each part. That is fine for a benchmark and
+useless for a camera. This is the same method restructured as a state machine that
+never looks forward:
+
+    RIGID   one body, one box. Motion hypotheses are proposed and assigned every
+            frame, and the evidence (co-association, winner sets, log-odds) piles
+            up. Every `regroup_every` frames the accumulated evidence is offered
+            to the same ground-truth-free model selection the benchmark uses. If
+            it prefers a split over a single body, the split is committed.
+
+    SPLIT   each part carries its own membership, dense model, 6-DoF pose and
+            joint. Tracking is forward-only: the previous pose, the current
+            hypotheses, a screw extrapolation and a sweep of the fitted joint are
+            all refined and the best-explaining one wins.
+
+Timing on an RTX-class GPU, measured: the dense stage costs about 22 ms/frame and
+is nearly independent of cloud size, because it is dominated by the kernel launches
+of the ICP loop rather than by the number of gaussians. Point tracking and RANSAC
+sit on top of that.
+"""
+
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from point2pose.pipeline.components.gaussian_part_assignment import (
+    GaussianCloud,
+    GaussianPartAssignment,
+)
+from point2pose.pipeline.components.joint_model import JointModel
+
+
+def se3_pow(T, s):
+    """T raised to a real power, along its own screw axis."""
+    from scipy.linalg import expm, logm
+
+    if abs(s - 1.0) < 1e-9:
+        return np.asarray(T)
+    try:
+        return np.real(expm(np.real(logm(np.asarray(T, dtype=np.float64))) * s))
+    except Exception:
+        return np.asarray(T)
+
+
+def sample_points(mask, depth, n, border=4):
+    """Pick n pixels inside the mask that have valid depth."""
+    m = (mask > 0) & (depth > 0.05)
+    m[:border] = m[-border:] = m[:, :border] = m[:, -border:] = False
+    ys, xs = np.where(m)
+    if len(ys) == 0:
+        return np.zeros((0, 2), np.float32)
+    idx = np.random.default_rng(0).choice(len(ys), size=min(n, len(ys)), replace=False)
+    return np.stack([xs[idx], ys[idx]], 1).astype(np.float32)
+
+
+def lift(pts, depth, K):
+    """Pixels -> camera-frame 3D, with a validity flag."""
+    u = np.clip(pts[:, 0].astype(int), 0, depth.shape[1] - 1)
+    v = np.clip(pts[:, 1].astype(int), 0, depth.shape[0] - 1)
+    z = depth[v, u]
+    ok = z > 0.05
+    xyz = np.stack([(u - K[0, 2]) * z / K[0, 0],
+                    (v - K[1, 2]) * z / K[1, 1], z], 1).astype(np.float32)
+    return xyz, ok
+
+
+@dataclass
+class Part:
+    """One discovered part: what it is made of, where it is, and how it hinges."""
+    weights: np.ndarray                 # soft membership over gaussians
+    pose: np.ndarray = field(default_factory=lambda: np.eye(4))
+    energy: float = float("inf")
+    box: object = None                  # oriented box in the anchor frame
+    joint: JointModel = None
+    parent: int = 0
+    joint_values: list = field(default_factory=list)
+    d_pose: np.ndarray = None           # last inter-frame increment
+    track_idx: np.ndarray = None        # sparse tracks sitting on this part
+
+
+@dataclass
+class Config:
+    max_hyp: int = 4
+    gauss_target: int = 3000
+    gauss_stride_max: int = 2
+    n_points: int = 400
+    inlier_thres: float = 0.008
+    min_inliers: int = 10
+    depth_sigma: float = 0.02
+    win_steps: int = 20
+    ransac_iters: int = 200
+    # Point tracking is the dominant cost -- TAPIR runs about 0.55 ms per query
+    # point, so 400 points is 226 ms/frame. Skipping frames is possible but it is
+    # NOT free: the sparse tracks are used after the split as well, both for the
+    # global hypotheses and for the per-part RANSAC fit that a thin, fast-rotating
+    # part depends on. 1 = every frame; raise it only against a measured cost.
+    hyp_every: int = 1
+    win_min_span: int = 4
+    co_sample: int = 4000
+    min_group: int = 30
+    # when to try splitting
+    min_frames_before_split: int = 25
+    regroup_every: int = 10
+    pose_log_max: int = 120
+    # per-part tracking
+    track_rmax: float = 0.05
+    max_step: float = 0.2
+    grow_every: int = 2
+    grow_gate: float = 0.015
+    # a pose slightly off the surface is still informative about the joint, and
+    # the fit re-evaluates both joint types anyway
+    joint_gate: float = 0.035
+    grow_max: int = 1500
+    exclusive_mask: bool = True
+    score_round: int = 3
+    merge_eps: float = 0.002
+    merge_tol: float = 0.012
+
+
+class StreamingPartDiscovery:
+    """Discover parts and track their 6-DoF poses from a live RGB-D stream."""
+
+    RIGID = "rigid"
+    SPLIT = "split"
+
+    def __init__(self, K, cfg=None, tracker=None, register=None):
+        self.K = np.asarray(K, dtype=np.float64)
+        self.cfg = cfg or Config()
+        self.tracker = tracker
+        self.reg = register
+        self.state = self.RIGID
+        self.n = 0
+        self.parts = []
+        self.cloud = None
+        self.assign = None
+        self.last_timings = {}
+
+    # ------------------------------------------------------------------ #
+    #  Anchor frame
+    # ------------------------------------------------------------------ #
+    def start(self, rgb, depth, mask):
+        """Lift the first masked frame to gaussians and seed the point tracks."""
+        from point2pose.data_types.frame import Frame
+
+        cfg = self.cfg
+        H, W = depth.shape
+        self.H, self.W = H, W
+
+        # stride from how many gaussians the object actually yields: a thin object
+        # at a fixed stride gives a few hundred, and nothing is then decisive
+        gs = cfg.gauss_stride_max
+        while gs > 1 and int((mask[::gs, ::gs] > 0).sum()) < cfg.gauss_target:
+            gs -= 1
+        self.gauss_stride = gs
+
+        self.cloud = GaussianCloud.from_depth(rgb, depth, self.K, mask, stride=gs)
+        if self.cloud is None or len(self.cloud) < 50:
+            raise RuntimeError("anchor frame gives too few gaussians")
+        self.assign = GaussianPartAssignment(
+            self.cloud, cfg.max_hyp, depth_sigma=cfg.depth_sigma)
+        self.assign.init_coassoc(min(cfg.co_sample, len(self.cloud)))
+
+        pts0 = sample_points(mask, depth, cfg.n_points)
+        f0 = Frame(id=0, rgb=rgb, depth=depth, intrinsics=self.K)
+        self.tracker.add_query_points(f0, pts0)
+        self.tracker.initialize(f0)
+        self.anchor_xyz, self.anchor_ok = lift(pts0, depth, self.K)
+
+        self.past = {}          # frame index -> (xyz, ok, visible)
+        self.order = []
+        self.anchor_to = {}
+        self.pose_log = []
+        self.n = 1
+        self.whole_pose = np.eye(4)
+        self.whole_box = self._fit_box(np.ones(len(self.cloud), bool))
+        return self
+
+    # ------------------------------------------------------------------ #
+    #  One frame
+    # ------------------------------------------------------------------ #
+    def step(self, rgb, depth, mask):
+        from point2pose.data_types.frame import Frame
+
+        t0 = time.perf_counter()
+        i = self.n
+        self.n += 1
+        cfg = self.cfg
+
+        tracks, _, vis = self.tracker.track_once(
+            Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K))
+        vis = vis.astype(bool)
+        cur, cur_ok = lift(tracks, depth, self.K)
+        self.past[i] = (cur.copy(), cur_ok.copy(), vis.copy())
+        self.order.append(i)
+        # keep only what the trailing window can still reach
+        for j in list(self.past):
+            if i - j > cfg.win_steps + 2:
+                self.past.pop(j, None)
+        t_track = time.perf_counter()
+
+        self.cur_tracks = (cur, cur_ok, vis)
+        if cfg.hyp_every <= 1 or i % cfg.hyp_every == 0 \
+                or not getattr(self, "_last_hyps", None):
+            hyps = self._hypotheses(i, cur, cur_ok, vis)
+            self._last_hyps = hyps
+        else:
+            hyps = self._last_hyps
+            self.anchor_to[i] = self.anchor_to.get(self.order[-2], np.eye(4))
+        t_hyp = time.perf_counter()
+
+        if self.state == self.RIGID:
+            self._step_rigid(rgb, depth, mask, hyps, i)
+        else:
+            self._step_split(rgb, depth, mask, hyps, i)
+        t_end = time.perf_counter()
+
+        self.last_timings = {
+            "track_ms": (t_track - t0) * 1e3,
+            "hyp_ms": (t_hyp - t_track) * 1e3,
+            "dense_ms": (t_end - t_hyp) * 1e3,
+            "total_ms": (t_end - t0) * 1e3,
+        }
+        return self.state
+
+    # ------------------------------------------------------------------ #
+    def _hypotheses(self, i, cur, cur_ok, vis):
+        """Rigid-motion candidates, all expressed anchor -> current."""
+        cfg = self.cfg
+        # the anchor-to-current dominant motion, kept every frame so a windowed
+        # fit can always be composed back into the frame the gaussians live in
+        u0 = np.where(self.anchor_ok & cur_ok & vis)[0]
+        Ta = None
+        if len(u0) >= cfg.min_inliers and self.reg is not None:
+            c = self.reg._RANSAC(p0=self.anchor_xyz[u0], tgt_pcd=cur[u0], w=None,
+                                 remaining=np.ones(len(u0), bool), init_pose=None)
+            if c is not None:
+                Ta = c["T"]
+        if Ta is None:
+            Ta = self.anchor_to.get(self.order[-2], np.eye(4)) \
+                if len(self.order) > 1 else np.eye(4)
+        self.anchor_to[i] = Ta
+        for j in list(self.anchor_to):
+            if i - j > cfg.win_steps + 2:
+                self.anchor_to.pop(j, None)
+
+        hyps = []
+        for span in (cfg.win_steps, cfg.win_steps // 2, cfg.win_steps // 4):
+            if span < cfg.win_min_span or len(self.order) <= span:
+                continue
+            j = self.order[-1 - span]
+            if j not in self.past or j not in self.anchor_to:
+                continue
+            sp, so, sv = self.past[j]
+            u = np.where(so & sv & cur_ok & vis)[0]
+            if len(u) < 2 * cfg.min_inliers:
+                continue
+            rem = np.ones(len(u), bool)
+            got = []
+            for _ in range(cfg.max_hyp):
+                c = self.reg._RANSAC(p0=sp[u], tgt_pcd=cur[u], w=None,
+                                     remaining=rem, init_pose=None)
+                if c is None:
+                    break
+                got.append(c["T"] @ self.anchor_to[j])
+            if got:
+                hyps.extend(got)
+                break
+        hyps.append(Ta)
+
+        uniq = []
+        for T in hyps:
+            if all(np.linalg.norm(T[:3, 3] - U[:3, 3]) > 0.008 or
+                   np.linalg.norm(T[:3, :3] - U[:3, :3]) > 0.02 for U in uniq):
+                uniq.append(T)
+        hyps = uniq[:cfg.max_hyp]
+        while len(hyps) < cfg.max_hyp:
+            hyps.append(hyps[-1])
+        return hyps
+
+    # ------------------------------------------------------------------ #
+    #  RIGID: accumulate evidence, and try to split from time to time
+    # ------------------------------------------------------------------ #
+    def _step_rigid(self, rgb, depth, mask, hyps, i):
+        cfg = self.cfg
+        a = self.assign
+        H, W = self.H, self.W
+
+        hy = list(hyps)
+        R = a.residuals(hy, self.K, H, W, depth, obs_mask=mask)
+        P = a.soft_membership(R)
+        hy = [a.refine_pose(T, P[k], self.K, H, W, depth, obs_mask=mask)
+              for k, T in enumerate(hy)]
+        a.step_pointwise(hy, self.K, H, W, depth, obs_mask=mask)
+
+        Pm = a.soft_membership(
+            a.residuals(hy, self.K, H, W, depth, obs_mask=mask))
+        self.pose_log.append({"frame": i, "T": [np.asarray(T) for T in hy],
+                              "P": Pm.detach().cpu().numpy()})
+        if len(self.pose_log) > cfg.pose_log_max:
+            self.pose_log.pop(0)
+
+        # the whole object still reads as one body: show the dominant motion
+        self.whole_pose = np.asarray(hy[int(Pm.sum(dim=1).argmax())])
+
+        if (i >= cfg.min_frames_before_split
+                and i % cfg.regroup_every == 0):
+            self._try_split()
+
+    def _try_split(self):
+        """Offer the accumulated evidence to the model selection. Commit only a
+        grouping that beats treating the object as one body."""
+        cfg = self.cfg
+        a = self.assign
+        n = len(self.cloud)
+
+        cand = []
+        lab_hard = a.labels()
+        cand.append(("labels", lab_hard))
+        try:
+            lab_co, sub_co = a.coassoc_labels(0.5, cfg.min_group, max_k=5)
+            full = np.full(n, -1, dtype=int)
+            full[sub_co] = lab_co
+            cand.append(("coassoc", full))
+        except Exception:
+            pass
+        try:
+            lab_ws, _ = a.winset_labels(min_members=3, thresh=0.5)
+            if (lab_ws >= 0).any():
+                cand.append(("winsets", lab_ws))
+        except Exception:
+            pass
+
+        merged = []
+        for nm, lb in cand:
+            mf = self._merge_rigid(lb)
+            if (mf >= 0).any() and \
+                    len(set(mf[mf >= 0].tolist())) < len(set(lb[lb >= 0].tolist())):
+                merged.append((nm + "+merge", mf))
+        cand.extend(merged)
+
+        scored = [(nm, lb) + self._grouping_score(lb) for nm, lb in cand]
+        scored.sort(key=lambda x: (-round(x[2], cfg.score_round), -x[3],
+                                   len(set(x[1][x[1] >= 0].tolist()))))
+        # prefer the merged variant of the winner within the measured window
+        best = scored[0]
+        if not best[0].endswith("+merge"):
+            for e in scored[1:]:
+                if e[0] == best[0] + "+merge" and \
+                        round(e[2], cfg.score_round) >= round(best[2], cfg.score_round) - cfg.merge_eps:
+                    best = e
+                    break
+
+        name, lab, ratio, cov = best
+        groups = sorted(g for g in set(lab[lab >= 0].tolist()) if g >= 0)
+        groups = [g for g in groups if (lab == g).sum() >= cfg.min_group]
+        if len(groups) < 2:
+            return False
+
+        self.parts = []
+        gm = self.cloud.means.detach().cpu().numpy()
+        for j, g in enumerate(groups):
+            w = (lab == g).astype(np.float32)
+            self.parts.append(Part(weights=w, box=self._fit_box(w > 0.5),
+                                   track_idx=self._tracks_on(gm, w)))
+        # each part is jointed to the biggest OTHER part
+        order = np.argsort([-p.weights.sum() for p in self.parts])
+        self.parts = [self.parts[k] for k in order]
+        for j, p in enumerate(self.parts):
+            p.parent = 1 if j == 0 else 0
+            p.joint = JointModel() if len(self.parts) > 1 else None
+        self.state = self.SPLIT
+        self.split_info = {"grouping": name, "ratio": ratio, "coverage": cov,
+                           "frame": self.n, "n_parts": len(self.parts)}
+        print(f"[stream] split at frame {self.n}: {len(self.parts)} parts "
+              f"from '{name}' (ratio {ratio:.3f}, coverage {cov:.2f})")
+        return True
+
+    def _grouping_score(self, labels_full):
+        """How much better does splitting explain the recent posteriors than not
+        splitting, and how much of the object does the grouping label."""
+        gs = [g for g in set(labels_full.tolist()) if g >= 0]
+        if not self.pose_log or not gs:
+            return 0.0, 0.0
+        tot, cnt = 0.0, 0
+        for rec in self.pose_log[::3]:
+            P = rec["P"]
+            if P.shape[1] != labels_full.shape[0]:
+                continue
+            union = labels_full >= 0
+            if union.sum() < 20:
+                continue
+            base = float(P[:, union].sum(axis=1).max())
+            split = 0.0
+            for g in gs:
+                m = labels_full == g
+                if m.sum() < 10:
+                    continue
+                split += float(P[:, m].sum(axis=1).max())
+            if base > 1e-9:
+                tot += split / base
+                cnt += 1
+        return tot / max(cnt, 1), float((labels_full >= 0).mean())
+
+    def _merge_rigid(self, labels_full):
+        """Merge groups that never move relative to each other."""
+        cfg = self.cfg
+        gs = sorted(g for g in set(labels_full.tolist()) if g >= 0)
+        if len(gs) < 2 or not self.pose_log:
+            return labels_full
+        gm = self.cloud.means.detach().cpu().numpy()
+        pts, seq = {}, {g: [] for g in gs}
+        for g in gs:
+            m = np.where(labels_full == g)[0]
+            if m.size > 400:
+                m = m[np.linspace(0, m.size - 1, 400).astype(int)]
+            pts[g] = gm[m]
+        for rec in self.pose_log[::2]:
+            P, Ts = rec["P"], rec["T"]
+            if P.shape[1] != labels_full.shape[0]:
+                continue
+            for g in gs:
+                m = labels_full == g
+                seq[g].append(np.asarray(Ts[int(np.argmax(P[:, m].sum(axis=1)))])
+                              if m.sum() >= 10 else None)
+        parent = {g: g for g in gs}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for ii, A in enumerate(gs):
+            for B in gs[ii + 1:]:
+                X = np.concatenate([pts[A], pts[B]], 0)
+                d = [float(np.linalg.norm(
+                        (X @ Ta[:3, :3].T + Ta[:3, 3])
+                        - (X @ Tb[:3, :3].T + Tb[:3, 3]), axis=1).mean())
+                     for Ta, Tb in zip(seq[A], seq[B]) if Ta is not None and Tb is not None]
+                # a high percentile, not the median: two groups are one body only
+                # if they NEVER move apart
+                if d and float(np.percentile(d, 90)) < cfg.merge_tol:
+                    ra, rb = find(A), find(B)
+                    if ra != rb:
+                        parent[rb] = ra
+        remap, nxt = {}, 0
+        out = np.full_like(labels_full, -1)
+        for g in gs:
+            r = find(g)
+            if r not in remap:
+                remap[r] = nxt
+                nxt += 1
+            out[labels_full == g] = remap[r]
+        return out
+
+    # ------------------------------------------------------------------ #
+    #  SPLIT: forward-only per-part tracking
+    # ------------------------------------------------------------------ #
+    def _step_split(self, rgb, depth, mask, hyps, i):
+        cfg = self.cfg
+        a = self.assign
+        H, W = self.H, self.W
+        mask_b = mask > 0
+
+        # what each part currently covers, so the parts can exclude each other
+        occ = [a.occupancy(p.pose, p.weights, self.K, H, W, dilate=2)
+               if p.pose is not None else None for p in self.parts]
+
+        R = a.residuals(hyps, self.K, H, W, depth, obs_mask=mask)
+        Pm = a.soft_membership(R).detach().cpu().numpy()
+
+        for j, part in enumerate(self.parts):
+            w = part.weights
+            # the object mask minus what the OTHER parts hold
+            om = mask
+            if cfg.exclusive_mask:
+                others = None
+                for k2, o in enumerate(occ):
+                    if k2 == j or o is None:
+                        continue
+                    others = o if others is None else (others | o)
+                if others is not None:
+                    if occ[j] is not None:
+                        others = others & (~occ[j])
+                    cand_m = mask_b & (~others)
+                    if cand_m.sum() >= 200:
+                        om = cand_m.astype(np.uint8)
+
+            cands = []
+            score = (Pm * w[None, :Pm.shape[1]]).sum(axis=1)
+            k = int(np.argmax(score))
+            cands.append(hyps[k] if score[k] > 0 else part.pose)
+            cands.append(part.pose)
+            if part.d_pose is not None:
+                for s in (0.5, 1.0, 1.5, 2.0):
+                    cands.append(se3_pow(part.d_pose, s) @ part.pose)
+            cands.extend(np.asarray(T) for T in hyps)
+
+            # A hypothesis fitted to THIS part's own sparse tracks. The global
+            # hypotheses are dominated by the biggest surface, so a small thin
+            # part undergoing a large rotation never gets a good initialisation
+            # from them -- measured offline, that is exactly where the scissors
+            # blade and the eyeglasses temple diverged.
+            tidx = part.track_idx
+            if tidx is not None and tidx.size >= 6 and self.reg is not None:
+                cu, cok, cvi = self.cur_tracks
+                sel_t = tidx[self.anchor_ok[tidx] & cok[tidx] & cvi[tidx]]
+                if sel_t.size >= 6:
+                    c = self.reg._RANSAC(p0=self.anchor_xyz[sel_t],
+                                         tgt_pcd=cu[sel_t], w=None,
+                                         remaining=np.ones(sel_t.size, bool),
+                                         init_pose=None)
+                    if c is not None:
+                        cands.append(c["T"])
+
+            # the joint reduces the pose to a scalar, so sweep it
+            jm = part.joint
+            Tp = self.parts[part.parent].pose if jm is not None else None
+            if jm is not None and jm.kind is not None and Tp is not None and part.joint_values:
+                vs = part.joint_values
+                span = max(max(vs) - min(vs), 1e-3)
+                pred = vs[-1] + (vs[-1] - vs[-2] if len(vs) > 1 else 0.0)
+                full = (np.linspace(-np.pi, np.pi, 121) if jm.kind == "revolute"
+                        else np.linspace(-0.6, 0.6, 121))
+                grid = np.concatenate(
+                    [pred + np.linspace(-1.0, 1.0, 41) * max(span, 0.1), full])
+                Tg = [Tp @ jm.at(float(v)) for v in grid]
+                eg = a.fit_energy_batch(Tg, w, self.K, H, W, depth,
+                                        obs_mask=om, r_max=cfg.track_rmax)
+                for oi in np.argsort(eg)[:3]:
+                    cands.append(Tg[int(oi)])
+
+            best_T, best_e = None, float("inf")
+            for Tc in cands:
+                # a part cannot teleport between two consecutive frames
+                if cfg.max_step > 0 and part.pose is not None:
+                    if np.linalg.norm(np.asarray(Tc)[:3, 3] - part.pose[:3, 3]) > cfg.max_step:
+                        continue
+                Tr = a.refine_pose(Tc, w, self.K, H, W, depth, iters=8,
+                                   huber=0.04, obs_mask=om)
+                e = a.fit_energy(Tr, w, self.K, H, W, depth, obs_mask=om,
+                                 r_max=cfg.track_rmax)
+                if e < best_e:
+                    best_T, best_e = Tr, e
+            if best_T is None:
+                continue
+            Tf = a.refine_pose(best_T, w, self.K, H, W, depth, iters=8,
+                               huber=0.006, obs_mask=om)
+            ef = a.fit_energy(Tf, w, self.K, H, W, depth, obs_mask=om,
+                              r_max=cfg.track_rmax)
+            if ef < best_e:
+                best_T, best_e = Tf, ef
+
+            part.d_pose = best_T @ np.linalg.inv(part.pose)
+            part.pose, part.energy = best_T, best_e
+
+            # feed the joint from poses the tracker trusts, and refit as it learns
+            if jm is not None and Tp is not None and best_e < cfg.joint_gate:
+                A = np.linalg.inv(Tp) @ best_T
+                jm.add(A)
+                if jm.kind is None or len(jm.A) % 4 == 0:
+                    if jm.fit():
+                        part.joint_values = [jm.value_of(x) for x in jm.A]
+                elif jm.kind is not None:
+                    part.joint_values.append(jm.value_of(A))
+
+        # ---- online part modelling ----
+        if cfg.grow_every > 0 and i % cfg.grow_every == 0:
+            poses = [p.pose for p in self.parts]
+            ws = [p.weights for p in self.parts]
+            ok_g = [p.energy < cfg.grow_gate for p in self.parts]
+            n_new, owner = a.grow_parts(rgb, depth, self.K, mask, poses, ws,
+                                        stride=self.gauss_stride,
+                                        max_new=cfg.grow_max, grow_ok=ok_g)
+            if n_new:
+                for j, p in enumerate(self.parts):
+                    p.weights = np.concatenate(
+                        [p.weights, (owner == j).astype(np.float32)])
+                gm = self.cloud.means.detach().cpu().numpy()
+                for p in self.parts:
+                    p.box = self._fit_box(p.weights > 0.5)
+                    # the model grew, so which tracks sit on this part can change
+                    p.track_idx = self._tracks_on(gm, p.weights)
+
+    def _tracks_on(self, gm, w):
+        """Which sparse tracks sit on this part, by nearest gaussian in the
+        anchor frame. The part then has its own hypothesis generator."""
+        mem = gm[w > 0.5]
+        if mem.shape[0] < 10 or self.anchor_xyz.shape[0] == 0:
+            return None
+        from scipy.spatial import cKDTree
+        dist, _ = cKDTree(mem).query(self.anchor_xyz, k=1)
+        thr = max(0.01, float(np.percentile(dist, 20)) * 2.0)
+        return np.where(dist < thr)[0]
+
+    # ------------------------------------------------------------------ #
+    def _fit_box(self, sel):
+        """Oriented box around a set of gaussians, in the anchor frame."""
+        try:
+            from experiments.articulated.demo_part_discovery import fit_oriented_box
+        except Exception:
+            return None
+        gm = self.cloud.means.detach().cpu().numpy()
+        q = gm[sel]
+        if q.shape[0] < 20:
+            return None
+        try:
+            # trim the outer few percent: one stray grown point inflates a box
+            d = np.linalg.norm(q - np.median(q, axis=0), axis=1)
+            return fit_oriented_box(q[d <= np.percentile(d, 97)])
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------ #
+    def render(self, bgr, palette=None):
+        """Draw the current state onto a BGR image."""
+        import cv2
+        from point2pose.utils.visualization import draw_oriented_3d_box
+
+        pal = palette or [(60, 140, 235), (200, 120, 40), (70, 180, 90),
+                          (200, 80, 200), (60, 200, 200)]
+        gm = self.cloud.means.detach().cpu().numpy()
+        K = self.K
+        out = bgr
+
+        def splat(pts3, color, radius=1):
+            z = pts3[:, 2]
+            ok = z > 1e-3
+            if not ok.any():
+                return
+            u = (pts3[ok, 0] * K[0, 0] / z[ok] + K[0, 2]).astype(int)
+            v = (pts3[ok, 1] * K[1, 1] / z[ok] + K[1, 2]).astype(int)
+            good = (u >= 0) & (u < out.shape[1]) & (v >= 0) & (v < out.shape[0])
+            for uu, vv in zip(u[good], v[good]):
+                cv2.circle(out, (uu, vv), radius, color, -1)
+
+        if self.state == self.RIGID:
+            T = self.whole_pose
+            splat(gm @ T[:3, :3].T + T[:3, 3], (150, 150, 150))
+            if self.whole_box is not None:
+                try:
+                    out = draw_oriented_3d_box(K, out, T, self.whole_box,
+                                               line_color=(200, 200, 200), linewidth=2)
+                except Exception:
+                    pass
+            return out
+
+        for j, p in enumerate(self.parts):
+            col = pal[j % len(pal)]
+            sel = p.weights[:gm.shape[0]] > 0.5
+            T = p.pose
+            splat(gm[sel] @ T[:3, :3].T + T[:3, 3], col)
+            if p.box is not None:
+                try:
+                    out = draw_oriented_3d_box(K, out, T, p.box,
+                                               line_color=col, linewidth=2)
+                except Exception:
+                    pass
+            # pose axes at the part centroid
+            c = gm[sel].mean(0) if sel.any() else np.zeros(3)
+            org = T[:3, :3] @ c + T[:3, 3]
+            for ax, acol in zip(np.eye(3) * 0.05,
+                                [(60, 60, 235), (60, 220, 60), (235, 160, 60)]):
+                tip = T[:3, :3] @ (c + ax) + T[:3, 3]
+                if org[2] > 1e-3 and tip[2] > 1e-3:
+                    p0 = (int(org[0] * K[0, 0] / org[2] + K[0, 2]),
+                          int(org[1] * K[1, 1] / org[2] + K[1, 2]))
+                    p1 = (int(tip[0] * K[0, 0] / tip[2] + K[0, 2]),
+                          int(tip[1] * K[1, 1] / tip[2] + K[1, 2]))
+                    cv2.arrowedLine(out, p0, p1, acol, 2, cv2.LINE_AA, tipLength=0.3)
+
+        # the estimated joint axis, once per pair
+        drawn = set()
+        for j, p in enumerate(self.parts):
+            jm = p.joint
+            if jm is None or jm.kind is None or p.parent == j:
+                continue
+            key = frozenset((j, p.parent))
+            if key in drawn:
+                continue
+            drawn.add(key)
+            Tp = self.parts[p.parent].pose
+            sel = p.weights[:gm.shape[0]] > 0.5
+            c = gm[sel].mean(0) if sel.any() else np.zeros(3)
+            # the fitted point is only determined up to a slide along the axis
+            base = (jm.point + jm.axis * float((c - jm.point) @ jm.axis)
+                    if jm.kind == "revolute" else c)
+            seg = np.stack([base - jm.axis * 0.10, base + jm.axis * 0.10])
+            q = seg @ Tp[:3, :3].T + Tp[:3, 3]
+            if (q[:, 2] > 1e-3).all():
+                pu = (q[:, 0] * K[0, 0] / q[:, 2] + K[0, 2]).astype(int)
+                pv = (q[:, 1] * K[1, 1] / q[:, 2] + K[1, 2]).astype(int)
+                cv2.line(out, (pu[0], pv[0]), (pu[1], pv[1]), (255, 255, 255), 4, cv2.LINE_AA)
+                cv2.line(out, (pu[0], pv[0]), (pu[1], pv[1]), (30, 30, 30), 2, cv2.LINE_AA)
+                cv2.putText(out, jm.kind, (pu[1] + 6, pv[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (30, 30, 30), 1, cv2.LINE_AA)
+        return out
