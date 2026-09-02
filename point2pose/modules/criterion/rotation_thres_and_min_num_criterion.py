@@ -34,7 +34,18 @@ class RotationThresholdAndMinNumCriterion(SampleCriterion):
         for obj_id in range(self._num_obj):
             self._v_list.append(np.array([[0, 0, 1]]))
 
+    def _ensure_object(self, obj_id: int):
+        """Grow the per-object state so parts spawned mid-stream are covered.
+
+        The criterion sizes its state once at initialize(), but the articulated
+        extension can add an object at any frame when a part splits off.
+        """
+        while len(self._v_list) <= obj_id:
+            self._v_list.append(np.array([[0, 0, 1]]))
+        self._num_obj = len(self._v_list)
+
     def check_sample_criterion(self, context: CriterionContext, obj_id: int) -> bool:
+        self._ensure_object(obj_id)
         obj = context.objects[obj_id]
 
         reg_stats = context.reg_stats[obj_id]

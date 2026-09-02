@@ -100,6 +100,36 @@ class PointTrackTable:
         else:
             self.obj2track_map[obj_id] = new_indices
 
+    def move_points_to_obj(self, track_indices: np.ndarray, new_obj_id: int):
+        """Reassign ownership of existing tracks to another object.
+
+        Used when a part splits off its parent: the tracks keep their global ids
+        and their tracker state, only the object they belong to changes.
+        Returns the global indices actually moved.
+        """
+        track_indices = np.asarray(track_indices, dtype=np.int64).reshape(-1)
+        touched, moved = set(), []
+        for t in track_indices.tolist():
+            t = int(t)
+            old_id = self.track2obj_map.get(t, None)
+            if old_id is None or old_id == new_obj_id:
+                continue
+            touched.add(old_id)
+            self.track2obj_map[t] = new_obj_id
+            moved.append(t)
+        if not moved:
+            return np.empty((0,), dtype=np.int64)
+
+        touched.add(new_obj_id)
+        # rebuild the forward map for every object whose membership changed
+        rebuilt = {oid: [] for oid in touched}
+        for t, oid in self.track2obj_map.items():
+            if oid in rebuilt:
+                rebuilt[oid].append(t)
+        for oid, idxs in rebuilt.items():
+            self.obj2track_map[oid] = np.array(sorted(idxs), dtype=np.int64)
+        return np.array(moved, dtype=np.int64)
+
     def update_track_table(self, track_2d, track_3d, valid, uncertainties, visibles):
         self.track_2d = track_2d
         self.track_3d = track_3d

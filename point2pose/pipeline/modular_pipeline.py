@@ -20,6 +20,16 @@ from point2pose.utils.logger_fields import RAGGED_FIELDS
 
 # Components
 from point2pose.pipeline.components.front_end import FrontEnd
+from point2pose.pipeline.components.part_discovery import PartDiscovery
+from point2pose.pipeline.components.trajectory_part_discovery import (
+    TrajectoryPartDiscovery,
+)
+from point2pose.pipeline.components.rigidity_part_discovery import (
+    RigidityPartDiscovery,
+)
+from point2pose.pipeline.components.window_ransac_part_discovery import (
+    WindowRansacPartDiscovery,
+)
 from point2pose.pipeline.components.key_frame_manager import KeyFrameManager
 from point2pose.pipeline.components.local_optimizer import LocalOptimizer
 from point2pose.pipeline.components.key_frame_graph import KeyFrameGraph
@@ -38,10 +48,27 @@ class ModularPipeline:
         self.local_optimizer = LocalOptimizer(cfg)
         self.kf_graph = KeyFrameGraph(cfg) if self.use_key_frame_graph else None
         self.sdf_builder = SDFBuilder(cfg.reconstructor.params)
+        pd_cfg = cfg.get("part_discovery", {}) if hasattr(cfg, "get") else {}
+        pd_params = pd_cfg.get("params", {}) if hasattr(pd_cfg, "get") else {}
+        self.part_discovery_mode = str(
+            pd_cfg.get("type", "consensus") if hasattr(pd_cfg, "get") else "consensus"
+        )
+        if self.part_discovery_mode == "trajectory":
+            self.part_discovery = TrajectoryPartDiscovery(pd_params)
+        elif self.part_discovery_mode == "rigidity":
+            self.part_discovery = RigidityPartDiscovery(pd_params)
+        elif self.part_discovery_mode == "window_ransac":
+            self.part_discovery = WindowRansacPartDiscovery(pd_params)
+        else:
+            self.part_discovery = PartDiscovery(pd_params)
 
         # State
         self.track_table = PointTrackTable.new(n0=0)
         self.objects = []
+        # kinematic bookkeeping for the articulated extension: child obj_id ->
+        # parent obj_id, and the record of when each split happened
+        self.part_of = {}
+        self.part_spawn_log = []
         self.num_obj = self.pipeline_cfg.get("max_num_obj", 1)
         self._initialized = False
 
@@ -420,6 +447,34 @@ class ModularPipeline:
         # per-object update
         for obj_id in range(self.num_obj):
             self._update_object_from_frontend(obj_id, fe_result)
+
+        # ---- articulated extension: promote persistent secondary consensus
+        # sets to parts.  Runs after the per-object update so each object's pose
+        # is current, and before the keyframe/optimizer stages so a new part is
+        # a first-class object for the rest of this frame.
+        if self.part_discovery.enabled:
+            traj = self.part_discovery_mode in (
+                "trajectory", "rigidity", "window_ransac")
+            if traj:
+                for obj_id in range(self.num_obj):
+                    self.part_discovery.observe(
+                        frame.id, obj_id, self.objects[obj_id], self.track_table
+                    )
+            for obj_id in list(range(self.num_obj)):
+                if traj:
+                    proposals = self.part_discovery.update(
+                        frame.id, obj_id, self.objects[obj_id], self.track_table
+                    )
+                else:
+                    proposals = self.part_discovery.update(frame.id, obj_id, fe_result)
+                for track_ids in proposals:
+                    new_id = self.spawn_part(
+                        obj_id, track_ids, frame_id=frame.id, fe_result=fe_result
+                    )
+                    if new_id is not None:
+                        self.part_discovery.note_new_object(new_id)
+                        if traj:
+                            self.part_discovery.drop_tracks(obj_id, track_ids)
 
         pose_frontend = {}
         for obj_id in range(self.num_obj):
@@ -956,6 +1011,145 @@ class ModularPipeline:
                     obb_ls,
                 )
         return out_pose
+
+    def _seed_child_frontend_result(self, fe_result, parent_id, new_id, child):
+        """Give a just-spawned part an entry in this frame's front-end result.
+
+        The part was registered this frame as part of its parent, so it inherits
+        the parent's result, restricted to the tracks that moved with it. Without
+        this the keyframe manager and criterion index a missing obj_id and the
+        frame dies halfway through.
+        """
+        if fe_result is None:
+            return
+        moved = set(int(t) for t in child.kp_track_indices.tolist())
+
+        fe_result.obj_poses[new_id] = (
+            child.pose.copy() if child.pose is not None else np.eye(4)
+        )
+        rel = fe_result.rel_poses.get(parent_id, None)
+        fe_result.rel_poses[new_id] = rel.copy() if rel is not None else np.eye(4)
+        fe_result.mean_residuals[new_id] = fe_result.mean_residuals.get(parent_id, 0.0)
+        fe_result.valid_stats[new_id] = dict(fe_result.valid_stats.get(parent_id, {}))
+        fe_result.dense_recovery_triggered[new_id] = False
+
+        parent_idx = fe_result.valid_indices.get(parent_id, None)
+        if parent_idx is None or len(parent_idx) == 0:
+            fe_result.valid_indices[new_id] = np.empty((0,), dtype=np.int64)
+            fe_result.valid_key_points[new_id] = np.empty((0, 3))
+            fe_result.valid_curr_3d[new_id] = np.empty((0, 3))
+        else:
+            parent_idx = np.asarray(parent_idx).reshape(-1)
+            take = np.array([j for j, t in enumerate(parent_idx.tolist())
+                             if int(t) in moved], dtype=int)
+            keep = np.setdiff1d(np.arange(parent_idx.size), take)
+
+            def _split(d, key, rows):
+                a = d.get(key, None)
+                return None if a is None else np.asarray(a)[rows]
+
+            fe_result.valid_indices[new_id] = parent_idx[take]
+            for key in ("valid_key_points", "valid_curr_3d"):
+                arr = getattr(fe_result, key).get(parent_id, None)
+                if arr is not None and len(arr) == parent_idx.size:
+                    getattr(fe_result, key)[new_id] = np.asarray(arr)[take]
+                    getattr(fe_result, key)[parent_id] = np.asarray(arr)[keep]
+            fe_result.valid_indices[parent_id] = parent_idx[keep]
+
+        # Inherit the parent's stats wholesale so every key downstream code
+        # expects is present, then override what is part-specific.
+        parent_stats = fe_result.reg_stats.get(parent_id, {})
+        child_stats = dict(parent_stats)
+        n_moved = int(fe_result.valid_indices[new_id].size)
+        child_stats.update({
+            "inliers": np.ones(n_moved, dtype=bool),
+            "residuals": np.zeros(n_moved),
+            "num_inliers": n_moved,
+            "clusters": [],
+            "valid_idx": fe_result.valid_indices[new_id],
+            "correspond_curr3d": fe_result.valid_curr_3d.get(
+                new_id, np.empty((0, 3))
+            ),
+            "spawned_from": int(parent_id),
+        })
+        fe_result.reg_stats[new_id] = child_stats
+
+        # the parent lost those rows, so its own stats must shrink to match
+        if parent_stats:
+            keep_n = int(fe_result.valid_indices[parent_id].size)
+            parent_stats["valid_idx"] = fe_result.valid_indices[parent_id]
+            parent_stats["correspond_curr3d"] = fe_result.valid_curr_3d.get(
+                parent_id, np.empty((0, 3))
+            )
+            for k in ("inliers", "residuals"):
+                a = parent_stats.get(k, None)
+                if a is not None and np.asarray(a).size != keep_n:
+                    parent_stats[k] = (
+                        np.ones(keep_n, dtype=bool) if k == "inliers"
+                        else np.zeros(keep_n)
+                    )
+
+    def spawn_part(self, parent_id, track_indices, frame_id=None, fe_result=None):
+        """Split a discovered part off an existing object, mid-stream.
+
+        This is the one structural addition the articulated extension needs. The
+        pipeline is already keyed by obj_id throughout and already resizes
+        num_obj at init, so a part becomes just another object: it gets its own
+        pose, keypoint map and reconstruction volume, while the kinematic link
+        back to its parent is recorded separately.
+
+        Args:
+            parent_id: object the part is leaving.
+            track_indices: global track ids that move to the new part.
+            frame_id: frame the split happened on, for logging.
+
+        Returns the new object id, or None if the split was rejected.
+        """
+        if parent_id >= len(self.objects):
+            return None
+        parent = self.objects[parent_id]
+        new_id = len(self.objects)
+
+        child = parent.split_off(track_indices, new_id)
+        if child is None or child.key_points.shape[0] == 0:
+            return None
+
+        moved = self.track_table.move_points_to_obj(child.kp_track_indices, new_id)
+        if moved.size == 0:
+            return None
+
+        self.objects.append(child)
+        self.num_obj = len(self.objects)
+        # keep the components' per-object loops in sync, exactly as
+        # initialize_first_frame does when the segmenter reports more objects
+        self.frontend.num_obj = self.num_obj
+        self.kf_manager.num_obj = self.num_obj
+
+        if self.save_pose:
+            path = os.path.join(self.pose_save_path, f"obj_{new_id}_pose.txt")
+            f = open(path, "w", encoding="utf-8")
+            f.write("# timestamp tx ty tz qx qy qz qw\n")
+            f.write(self._pose_matrix_to_tum_format(child.pose, timestamp=time.time()))
+            self.pose_log_files.append(f)
+        else:
+            self.pose_log_files.append(None)
+
+        self._seed_child_frontend_result(fe_result, parent_id, new_id, child)
+        self.part_of.setdefault(new_id, parent_id)
+        self.part_spawn_log.append(
+            {
+                "frame": frame_id,
+                "parent": int(parent_id),
+                "child": int(new_id),
+                "n_points": int(child.key_points.shape[0]),
+            }
+        )
+        print(
+            f"[pipeline] frame {frame_id}: part {new_id} split from object "
+            f"{parent_id} with {child.key_points.shape[0]} keypoints "
+            f"({parent.key_points.shape[0]} left on the parent)"
+        )
+        return new_id
 
     def _update_object_from_frontend(self, obj_id, fe_result):
         obj = self.objects[obj_id]

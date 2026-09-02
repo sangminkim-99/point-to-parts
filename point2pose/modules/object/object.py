@@ -114,6 +114,60 @@ class Object:
         new_rows = np.arange(old_m, new_m, dtype=np.int32)
         self.track_idx_2_obj_idx[new_indices] = new_rows
 
+    def rebuild_track_index(self):
+        """Rebuild the global-track-id -> row lookup from kp_track_indices."""
+        if self.kp_track_indices.size == 0:
+            self.track_idx_2_obj_idx = np.full((0,), -1, dtype=np.int32)
+            return
+        n = int(self.kp_track_indices.max()) + 1
+        self.track_idx_2_obj_idx = np.full((n,), -1, dtype=np.int32)
+        self.track_idx_2_obj_idx[self.kp_track_indices] = np.arange(
+            self.kp_track_indices.size, dtype=np.int32
+        )
+
+    def split_off(self, track_indices: np.ndarray, new_id: int):
+        """Move the rows for `track_indices` into a new Object and return it.
+
+        This is how a discovered part leaves its parent.  The child inherits the
+        parent's current pose, because up to this instant the two were explained
+        by the same rigid motion; they diverge from here on.  Keypoints keep
+        their global track ids, so the tracker is untouched by the split.
+
+        Returns None if none of the requested tracks belong to this object.
+        """
+        track_indices = np.asarray(track_indices, dtype=np.int64).reshape(-1)
+        in_range = track_indices < self.track_idx_2_obj_idx.size
+        tids = track_indices[in_range]
+        if tids.size == 0:
+            return None
+        rows = self.track_idx_2_obj_idx[tids]
+        rows = rows[rows >= 0]
+        if rows.size == 0:
+            return None
+
+        child = Object(new_id)
+        child.key_points = self.key_points[rows].copy()
+        child.kp_track_indices = self.kp_track_indices[rows].copy()
+        child.uncertainties = self.uncertainties[rows].copy()
+        child.valid = self.valid[rows].copy()
+        child.key_point_frames = self.key_point_frames[rows].copy()
+        child.num_keyframes = self.num_keyframes
+        # the child was part of the parent until now, so it inherits that history
+        child.keyframes = list(self.keyframes)
+        child.init_pose = self.init_pose.copy()
+        child.pose = self.pose.copy()
+        child.rebuild_track_index()
+
+        keep = np.ones(self.key_points.shape[0], dtype=bool)
+        keep[rows] = False
+        self.key_points = self.key_points[keep]
+        self.kp_track_indices = self.kp_track_indices[keep]
+        self.uncertainties = self.uncertainties[keep]
+        self.valid = self.valid[keep]
+        self.key_point_frames = self.key_point_frames[keep]
+        self.rebuild_track_index()
+        return child
+
     def save_key_points_with_colors(self, save_path: str, current_frame_id: int = None):
         """
         Save key points as a colored point cloud with different colors for different frames.
