@@ -119,6 +119,7 @@ class Part:
     weights: np.ndarray                 # soft membership over gaussians
     pose: np.ndarray = field(default_factory=lambda: np.eye(4))
     energy: float = float("inf")
+    best_energy: float = float("inf")   # best this part has ever explained at
     box: object = None                  # oriented box in the anchor frame
     joint: JointModel = None
     parent: int = 0
@@ -160,8 +161,11 @@ class Config:
     # pipeline_test2.yaml pose_jump_guard_trans_thres
     max_step: float = 0.15
     grow_every: int = 2
-    # pipeline_test2.yaml map_growth_max_mean_residual
-    grow_gate: float = 0.006
+    # Relative to the part's own best, not absolute. An absolute 0.006 (copied
+    # from map_growth_max_mean_residual, which is a different quantity) blocked
+    # 17 of 23 growth attempts because part energies sit at 0.02-0.05.
+    grow_gate_rel: float = 1.6
+    grow_gate_abs: float = 0.05
     # a pose slightly off the surface is still informative about the joint, and
     # the fit re-evaluates both joint types anyway
     joint_gate: float = 0.035
@@ -621,6 +625,7 @@ class StreamingPartDiscovery:
 
             part.d_pose = best_T @ np.linalg.inv(part.pose)
             part.pose, part.energy = best_T, best_e
+            part.best_energy = min(part.best_energy, best_e)
 
             # feed the joint from poses the tracker trusts, and refit as it learns
             if jm is not None and Tp is not None and best_e < cfg.joint_gate:
@@ -652,7 +657,7 @@ class StreamingPartDiscovery:
                        and occ[j] is not None and occ[j].sum() > 200)
             if not (new_view or starved):
                 continue
-            if part.energy > cfg.grow_gate and not starved:
+            if not self._grow_ok(part) and not starved:
                 continue        # do not anchor through a pose that has slipped
             if len(self.anchor_xyz) >= cfg.key_max_points:
                 continue
@@ -782,15 +787,27 @@ class StreamingPartDiscovery:
             self._draw_tracks(out, self.parts, pal)
         return out
 
+    def _grow_ok(self, part):
+        """Is this part explaining the surface well enough to anchor new data?"""
+        cfg = self.cfg
+        if part.energy > cfg.grow_gate_abs:
+            return False
+        if not np.isfinite(part.best_energy):
+            return True
+        return part.energy <= cfg.grow_gate_rel * part.best_energy
+
     def _grow(self, rgb, depth, mask):
         """Add gaussians for object surface no part explains yet."""
         cfg, a = self.cfg, self.assign
         poses = [p.pose for p in self.parts]
         ws = [p.weights for p in self.parts]
-        ok_g = [p.energy < cfg.grow_gate for p in self.parts]
+        ok_g = [self._grow_ok(p) for p in self.parts]
         n_new, owner = a.grow_parts(rgb, depth, self.K, mask, poses, ws,
                                     stride=self.gauss_stride,
                                     max_new=cfg.grow_max, grow_ok=ok_g)
+        self.grow_calls = getattr(self, "grow_calls", 0) + 1
+        self.grow_blocked = getattr(self, "grow_blocked", 0) + int(not any(ok_g))
+        self.grown_total = getattr(self, "grown_total", 0) + int(n_new or 0)
         if not n_new:
             return 0
         for j, p in enumerate(self.parts):
@@ -851,37 +868,44 @@ class StreamingPartDiscovery:
         return True
 
     def hypothesis_panel(self, depth, mask=None, width=200, r_max=0.05):
-        """Per hypothesis: what its gaussians look like, and where they disagree.
+        """What each motion explains: its RGB render on top, its residual below.
 
-        Top row is the gsplat RGB render at that pose, bottom row the depth
-        residual -- blue is surface the hypothesis explains, red is surface it
-        does not.
+        Before the split there is one body, so every hypothesis is drawn with the
+        whole cloud. Afterwards each part owns its gaussians and is drawn with
+        those alone -- rendering the whole cloud under a part's pose shows a
+        disagreement that belongs to the other parts, not to this one.
         """
         import cv2
 
-        hs = getattr(self, "last_hyp_set", None)
-        if not hs:
-            return None
-        share = getattr(self, "last_share", np.zeros(len(hs)))
+        if self.state == self.SPLIT and self.parts:
+            items = [(f"p{j}", p.pose, torch.as_tensor(
+                        p.weights[:len(self.cloud)] > 0.5, device=self.assign.device))
+                     for j, p in enumerate(self.parts)]
+        else:
+            hs = getattr(self, "last_hyp_set", None)
+            if not hs:
+                return None
+            share = getattr(self, "last_share", np.zeros(len(hs)))
+            items, seen = [], []
+            for k, T in enumerate(hs):
+                if any(np.allclose(T, U, atol=1e-6) for U in seen):
+                    continue
+                seen.append(np.asarray(T))
+                items.append((f"h{k} {100 * share[k]:.0f}%", T, None))
         obs = torch.as_tensor(depth, dtype=torch.float32,
                               device=self.assign.device)
         mk = (torch.as_tensor(mask > 0, device=obs.device)
               if mask is not None else torch.ones_like(obs, dtype=torch.bool))
-        tiles, seen = [], []
-        for k, T in enumerate(hs):
-            if any(np.allclose(T, U, atol=1e-6) for U in seen):
-                continue
-            seen.append(np.asarray(T))
+        tiles = []
+        for label, T, subset in items:
             col, dep_r, alpha = self.cloud.render(T, self.K, depth.shape[0],
-                                                  depth.shape[1])
+                                                  depth.shape[1], subset=subset)
             a_np = (alpha > 0.3).cpu().numpy()
 
-            # what the hypothesis says the object looks like
             rgb_t = (col.clamp(0, 1) * 255).byte().cpu().numpy()
             rgb_t = cv2.cvtColor(rgb_t, cv2.COLOR_RGB2BGR)
             rgb_t[~a_np] = (32, 30, 28)
 
-            # where it disagrees with the depth actually measured
             vis = (alpha > 0.3) & (obs > 0) & mk
             res = (dep_r - obs).abs().clamp(max=r_max) / r_max
             err = cv2.applyColorMap(
@@ -891,9 +915,8 @@ class StreamingPartDiscovery:
             h = int(rgb_t.shape[0] * width / rgb_t.shape[1])
             rgb_t = cv2.resize(rgb_t, (width, h))
             err = cv2.resize(err, (width, h))
-            cv2.putText(rgb_t, f"h{k}  {100 * share[k]:.0f}%", (6, 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1,
-                        cv2.LINE_AA)
+            cv2.putText(rgb_t, label, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        (255, 255, 255), 1, cv2.LINE_AA)
             tiles.append(np.vstack([rgb_t, err]))
         if not tiles:
             return None

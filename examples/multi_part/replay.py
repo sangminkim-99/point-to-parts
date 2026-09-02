@@ -135,6 +135,11 @@ def main():
     if split_costs:
         print(f"[replay]   split attempt  median {np.median(split_costs):7.1f} ms "
               f"({len(split_costs)} attempts)")
+    print(f"[replay] growth: {getattr(s, 'grown_total', 0)} gaussians added over "
+          f"{getattr(s, 'grow_calls', 0)} attempts, "
+          f"{getattr(s, 'grow_blocked', 0)} blocked by the energy gate "
+          f"(rel gate {cfg.grow_gate_rel}); part energies "
+          f"{[round(p.energy, 4) for p in s.parts]}")
     print(f"[replay] final state: {s.state}, {len(s.parts)} parts")
     for j, p in enumerate(s.parts):
         jm = p.joint
