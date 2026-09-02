@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--co-sample", type=int, default=None)
     ap.add_argument("--min-inliers", type=int, default=None)
     ap.add_argument("--pips-iter", type=int, default=None)
+    ap.add_argument("--view", type=int, default=1,
+                    help="show a live cv2 window; 'q' quits, 'space' pauses")
     ap.add_argument("--hyp-panel", type=int, default=1,
                     help="strip of per-hypothesis render-vs-depth residuals")
     ap.add_argument("--min-frames", type=int, default=None)
@@ -142,8 +144,20 @@ def main():
             writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"),
                                      15, (canvas.shape[1], canvas.shape[0]))
         writer.write(canvas)
+
+        if args.view:
+            cv2.imshow("multi-part replay", canvas)
+            k = cv2.waitKey(1) & 0xFF
+            if k == ord("q"):
+                print("[replay] stopped by user")
+                break
+            if k == ord(" "):                       # pause until space again
+                while (cv2.waitKey(50) & 0xFF) != ord(" "):
+                    pass
     if writer:
         writer.release()
+    if args.view:
+        cv2.destroyAllWindows()
 
     t = np.array(times)
     print(f"[replay] wrote {args.out}")
