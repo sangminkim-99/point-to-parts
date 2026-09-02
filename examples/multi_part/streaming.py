@@ -415,7 +415,7 @@ class StreamingPartDiscovery:
             self.last_split_ms = (time.perf_counter() - t0) * 1e3
 
     def _try_split(self, min_groups=2, min_ratio=0.0, min_cov=0.0,
-                   max_groups=None):
+                   max_groups=None, require_relative_motion=False):
         """Offer the accumulated evidence to the model selection. Commit only a
         grouping that beats treating the object as one body."""
         cfg = self.cfg
@@ -502,9 +502,29 @@ class StreamingPartDiscovery:
                 print("             " + self._why_no_split())
             return False
 
+        # An extra part has to actually move relative to its parent. _merge_rigid
+        # already measures that; as one candidate among many it never gated
+        # anything, so a re-split kept adding parts that move together.
+        if require_relative_motion:
+            mf = self._merge_rigid(lab)
+            if len(set(mf[mf >= 0].tolist())) < len(groups):
+                self.last_split_why = (
+                    f"best '{name}' splits into {len(groups)} but the groups are "
+                    f"rigid to each other")
+                if self.debug:
+                    print(f"[split {self.split_tries}] {self.last_split_why}")
+                return False
+
         prev = list(self.parts)
-        self.parts = []
         gm = self.cloud.means.detach().cpu().numpy()
+        # A re-split labels only the decisive gaussians -- 8% of the cloud on a
+        # real sequence. Rebuilding the parts from that alone throws away the
+        # 92% that were already correctly partitioned, which is what scrambles
+        # parts that had been clean. Carry the undecided ones over instead.
+        if prev:
+            lab = self._carry_over(lab, groups, prev, gm)
+            groups = [g for g in groups if (lab == g).any()]
+        self.parts = []
         for j, g in enumerate(groups):
             w = (lab == g).astype(np.float32)
             part = Part(weights=w, box=self._fit_box(w > 0.5),
@@ -562,6 +582,43 @@ class StreamingPartDiscovery:
                 f"margin med {np.median(margin):.2f} p90 {np.percentile(margin, 90):.2f} "
                 f"(need 1.0) | undecided {int((lab < 0).sum())}/{len(lab)} "
                 f"| groups {sizes}")
+
+    def _carry_over(self, lab, groups, prev, gm):
+        """Give every gaussian the new grouping left undecided back to a part:
+        the new group nearest it that came from the same old part."""
+        lab = lab.copy()
+        n = min(len(lab), gm.shape[0])
+        lab = lab[:n]
+        # which old part each new group came from
+        src = {}
+        for g in groups:
+            m = lab == g
+            ov = [float((m & (q.weights[:n] > 0.5)).sum()) for q in prev]
+            src[g] = int(np.argmax(ov)) if ov and max(ov) > 0 else -1
+        free = np.where(lab < 0)[0]
+        if free.size == 0:
+            return lab
+        old = np.full(n, -1, dtype=int)
+        for q_i, q in enumerate(prev):
+            old[(q.weights[:n] > 0.5)] = q_i
+        try:
+            from scipy.spatial import cKDTree
+        except Exception:
+            return lab
+        for q_i in set(old[free].tolist()):
+            heirs = [g for g in groups if src[g] == q_i]
+            if q_i < 0 or not heirs:
+                continue
+            take = free[old[free] == q_i]
+            pool = np.where(np.isin(lab, heirs))[0]
+            if pool.size == 0:
+                continue
+            if len(heirs) == 1:
+                lab[take] = heirs[0]
+                continue
+            _, j = cKDTree(gm[pool]).query(gm[take], k=1)
+            lab[take] = lab[pool[j]]
+        return lab
 
     def _grouping_score(self, labels_full):
         """How much better does splitting explain the recent posteriors than not
@@ -833,7 +890,8 @@ class StreamingPartDiscovery:
                 self._try_split(min_groups=len(self.parts) + 1,
                                 max_groups=len(self.parts) + 1,
                                 min_ratio=cfg.resplit_min_ratio,
-                                min_cov=cfg.resplit_cov_frac * prev_cov)
+                                min_cov=cfg.resplit_cov_frac * prev_cov,
+                                require_relative_motion=True)
                 self.last_split_ms = (time.perf_counter() - t0) * 1e3
 
         # ---- online part modelling ----
