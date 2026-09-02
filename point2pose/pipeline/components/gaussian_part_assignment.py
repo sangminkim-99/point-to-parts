@@ -592,7 +592,8 @@ class GaussianPartAssignment:
         return n_new
 
     def grow_parts(self, rgb, depth, K, mask, poses, weights, tol=0.02,
-                   stride=3, max_new=1500, max_total=300000, grow_ok=None):
+                   stride=3, max_new=1500, max_total=300000, grow_ok=None,
+                   max_adj_px=25.0):
         """Attach newly revealed surface to the part it is adjacent to.
 
         `grow` anchors new points through the *first* hypothesis, which is fine
@@ -653,7 +654,7 @@ class GaussianPartAssignment:
 
         # nearest covered pixel decides which part a new surface joins: a face
         # that has just come into view borders the part it belongs to
-        _, near = cv2.distanceTransformWithLabels(
+        dist, near = cv2.distanceTransformWithLabels(
             (~cov).astype(np.uint8), cv2.DIST_L2, 3,
             labelType=cv2.DIST_LABEL_PIXEL)
         ys, xs = np.where(cov)
@@ -668,6 +669,17 @@ class GaussianPartAssignment:
             vs, us = vs[pick], us[pick]
             n_new = max_new
         vn, un = vs.cpu().numpy(), us.cpu().numpy()
+        # Nearest-covered-pixel with no distance limit hands a pixel at the far
+        # edge of the mask to whichever part happens to be closest, which is what
+        # trails a part's gaussians off the object and inflates its box.
+        if max_adj_px > 0:
+            keep = dist[vn, un] <= max_adj_px
+            if not keep.any():
+                return 0, None
+            vs, us = vs[torch.as_tensor(keep, device=vs.device)], \
+                us[torch.as_tensor(keep, device=us.device)]
+            vn, un = vn[keep], un[keep]
+            n_new = int(keep.sum())
         li = near[vn, un] - 1
         li = np.clip(li, 0, len(ys) - 1)
         owner = labn[ys[li], xs[li]]
