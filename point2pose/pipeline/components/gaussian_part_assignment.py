@@ -247,7 +247,8 @@ class GaussianPartAssignment:
         if getattr(self, "co_idx", None) is not None:
             self.accumulate_coassoc_soft(R, bestval < 1e5,
                                          weight_mode=self.coassoc_weight)
-        self.record_winsets(wins, max_frac=self.winset_max_frac)
+        self.record_winsets(wins, max_frac=self.winset_max_frac,
+                            max_sets=getattr(self, "winset_max", 400))
         self.last_decisive = float(decisive.float().mean())
         self.last_wins = [w.detach().cpu().numpy() for w in wins]
         self.last_slots = list(slot_of)
@@ -701,6 +702,11 @@ class GaussianPartAssignment:
         c.opacities = torch.cat([c.opacities, torch.ones(n_new, device=self.device)], 0)
         q = torch.zeros((n_new, 4), device=self.device); q[:, 0] = 1.0
         c.quats = torch.cat([c.quats, q], 0)
+        # without this the log-odds table is shorter than the cloud, `labels()`
+        # returns a mismatched array and the grouping score silently drops it
+        self.logodds = torch.cat(
+            [self.logodds, torch.zeros((n_new, self.logodds.shape[1]),
+                                       device=self.device)], 0)
         return n_new, owner
 
     def init_coassoc(self, n_sample=4000, seed=0):
@@ -776,7 +782,7 @@ class GaussianPartAssignment:
     #  Grouping by recurring winner sets
     # ------------------------------------------------------------------ #
     def record_winsets(self, wins, min_group=None, max_frac=0.5,
-                       min_frac=0.02, min_abs=25):
+                       min_frac=0.02, min_abs=25, max_sets=400):
         """Keep every decisive winner set that is substantial but not the whole
         object.
 
@@ -809,6 +815,11 @@ class GaussianPartAssignment:
                 continue
             self.winsets.append(
                 torch.where(w)[0].detach().cpu().numpy().astype(np.int32))
+        # a ring buffer, not a log: winset_labels builds a dense
+        # (sets x gaussians) matrix, so an unbounded history is gigabytes on a
+        # long recording
+        if len(self.winsets) > max_sets:
+            del self.winsets[:len(self.winsets) - max_sets]
 
     def winset_labels(self, min_members=3, thresh=0.5, min_group=None,
                       core_frac=0.5, min_frac=0.02, min_abs=25):

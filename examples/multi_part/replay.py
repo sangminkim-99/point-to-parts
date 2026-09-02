@@ -133,7 +133,8 @@ def main():
         label = (f"{s.state} parts {len(s.parts)} | hyp {d.get('hyp', 0)} "
                  f"tracks {d.get('tracks_live', 0)}/{d.get('tracks', 0)} "
                  f"decisive {100*d.get('decisive', 0):.0f}% "
-                 f"tries {d.get('tries', 0)} | {fps:.1f} fps")
+                 f"tries {d.get('tries', 0)} | g {d.get('gauss', 0)//1000}k "
+                 f"ws {d.get('winsets', 0)} | {fps:.1f} fps")
         cv2.putText(bar, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (235, 235, 235), 1, cv2.LINE_AA)
         canvas = np.vstack([vis, bar])
@@ -153,6 +154,14 @@ def main():
     if split_costs:
         print(f"[replay]   split attempt  median {np.median(split_costs):7.1f} ms "
               f"({len(split_costs)} attempts)")
+    try:
+        import resource
+        print(f"[replay] peak RSS "
+              f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1e6:.2f} GB, "
+              f"cloud {len(s.cloud)} gaussians, "
+              f"winsets {len(getattr(s.assign, 'winsets', []))}")
+    except Exception:
+        pass
     print(f"[replay] growth: {getattr(s, 'grown_total', 0)} gaussians added over "
           f"{getattr(s, 'grow_calls', 0)} attempts, "
           f"{getattr(s, 'grow_blocked', 0)} blocked by the energy gate "

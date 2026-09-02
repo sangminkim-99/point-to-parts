@@ -170,6 +170,9 @@ class Config:
     # the fit re-evaluates both joint types anyway
     joint_gate: float = 0.035
     grow_max: int = 1500
+    # a live stream has no end, so the model needs a ceiling
+    gauss_max: int = 150000
+    winset_max: int = 400
     # Point2Pose's live sampling criterion, per part (pipeline_test2.yaml:
     # rotation_threshold max_angle_deg 15, sampler num_points 20 / max 50).
     key_angle_deg: float = 15.0
@@ -291,6 +294,8 @@ class StreamingPartDiscovery:
             "tracks": int(len(cok)),
             "decisive": float(getattr(self.assign, "last_decisive", 0.0)),
             "tries": getattr(self, "split_tries", 0),
+            "gauss": len(self.cloud),
+            "winsets": len(getattr(self.assign, "winsets", [])),
             "why": getattr(self, "last_split_why", "no attempt yet"),
         }
         self.last_timings = {
@@ -826,7 +831,8 @@ class StreamingPartDiscovery:
         ok_g = [self._grow_ok(p) for p in self.parts]
         n_new, owner = a.grow_parts(rgb, depth, self.K, mask, poses, ws,
                                     stride=self.gauss_stride,
-                                    max_new=cfg.grow_max, grow_ok=ok_g)
+                                    max_new=cfg.grow_max, grow_ok=ok_g,
+                                    max_total=cfg.gauss_max)
         self.grow_calls = getattr(self, "grow_calls", 0) + 1
         self.grow_blocked = getattr(self, "grow_blocked", 0) + int(not any(ok_g))
         self.grown_total = getattr(self, "grown_total", 0) + int(n_new or 0)

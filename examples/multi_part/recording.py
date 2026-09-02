@@ -21,12 +21,13 @@ class Recording:
         self.K = np.loadtxt(self.root / "cam_K.txt")
         h, w = cv2.imread(str(self.rgb_files[0])).shape[:2]
         self.H, self.W = h, w
-        self.masks = None
+        # memory-mapped: a 1000-frame 640x480 mask stack is 300 MB, and holding
+        # a dict of decompressed arrays on top of it is how replay ran out of RAM
+        self._mz, self._mi = None, {}
         npz = self.root / "masks.npz"
         if npz.exists():
-            d = np.load(npz, allow_pickle=True)
-            self.masks = {int(f): d["masks"][k]
-                          for k, f in enumerate(d["frames"]) if k < len(d["masks"])}
+            self._mz = np.load(npz, allow_pickle=True, mmap_mode="r")
+            self._mi = {int(f): k for k, f in enumerate(self._mz["frames"])}
 
     def __len__(self):
         return min(len(self.rgb_files), len(self.depth_files))
@@ -41,4 +42,6 @@ class Recording:
         return d.astype(np.float32) / 1000.0
 
     def get_mask(self, i):
-        return None if self.masks is None else self.masks.get(i)
+        if self._mz is None or i not in self._mi:
+            return None
+        return np.asarray(self._mz["masks"][self._mi[i]])
