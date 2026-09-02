@@ -147,6 +147,13 @@ def main():
                          "44 mm). The lid's colours are its screen face, and once "
                          "the back turns to the camera every colour disagrees, so "
                          "the energy starts preferring poses that hide the part.")
+    ap.add_argument("--dense-hyp", type=int, default=0,
+                    help="propose an extra motion hypothesis by fitting the "
+                         "surface no existing hypothesis explains")
+    ap.add_argument("--dense-hyp-tol", type=float, default=0.02,
+                    help="depth residual above which a gaussian counts as "
+                         "unexplained, metres")
+    ap.add_argument("--dense-hyp-min", type=int, default=200)
     ap.add_argument("--max-step", type=float, default=0.2,
                     help="largest translation a part may move between two tracked "
                          "frames, metres; 0 disables the guard")
@@ -375,7 +382,42 @@ def main():
                 P = assign.soft_membership(Rm)
                 hy = [assign.refine_pose(T, P[k], K, H, W, dep, obs_mask=om)
                       for k, T in enumerate(hy)]
+            # ---- dense hypothesis generation ----
+            # On real data the bottleneck is not the assignment but the
+            # hypotheses: measured on RBO, one sparse RANSAC hypothesis matches
+            # all three drawers to within 6-25 mm, because they open AND close,
+            # so net displacement from a fixed anchor stays comparable to both
+            # the depth noise and the inlier threshold. Sparse keypoints also
+            # have to LAND on a part before it can be proposed at all. The
+            # surface that no hypothesis explains is itself the evidence for a
+            # motion nobody has proposed yet, so fit one to it directly.
+            if args.dense_hyp:
+                import torch as _t
+                Rm = assign.residuals(hy, K, H, W, dep, obs_mask=om)
+                bestr = Rm.min(dim=0).values
+                un = (bestr > args.dense_hyp_tol) & (bestr < 1.0)
+                if int(un.sum()) >= args.dense_hyp_min:
+                    w_un = un.float().detach().cpu().numpy()
+                    cand = []
+                    for T0 in hy:
+                        Tr = assign.refine_pose(T0, w_un, K, H, W, dep, iters=10,
+                                                huber=0.04, obs_mask=om)
+                        cand.append((assign.fit_energy(Tr, w_un, K, H, W, dep,
+                                                       obs_mask=om), Tr))
+                    e_n, T_n = min(cand, key=lambda x: x[0])
+                    novel = all(
+                        np.linalg.norm(T_n[:3, 3] - U[:3, 3]) > 0.01 or
+                        np.linalg.norm(T_n[:3, :3] - U[:3, :3]) > 0.03 for U in hy)
+                    if novel and e_n < args.dense_hyp_tol:
+                        hy = hy[:max(1, args.max_hyp - 1)] + [T_n]
+                        st_dense = 1
+                    else:
+                        st_dense = 0
+                else:
+                    st_dense = 0
             st = assign.step_pointwise(hy, K, H, W, dep, obs_mask=om)
+            if args.dense_hyp:
+                st["dense_hyp"] = st_dense
             hyps = hy + hyps[len(hy):]
             # the refined transforms ARE the per-part 6-DoF poses; keep them so
             # they can be scored against ground truth once groups are known
@@ -601,7 +643,7 @@ def main():
         # at all. A joint constrains a pair, and either end can be the reference.
         infos.sort(key=lambda d: -float(d["w"].sum()))
         for j, inf in enumerate(infos):
-            inf["parent"] = 1 if j == 0 else 0
+            inf["parent"] = (1 if j == 0 else 0) if len(infos) > 1 else j
             inf["joint"] = JointModel() if len(infos) > 1 else None
             inf["jv"] = []
 
@@ -809,7 +851,8 @@ def main():
                 rng = (np.degrees(max(inf["jv"]) - min(inf["jv"]))
                        if jm.kind == "revolute" else
                        1000 * (max(inf["jv"]) - min(inf["jv"])))
-                print(f"[g] joint {gt_} -> {infos[inf['parent']]['row']['dominant_gt']}"
+                print(f"[g] joint {gt_} -> "
+                      f"{infos[inf['parent']]['row']['dominant_gt']}"
                       f": {jm.kind} axis {np.round(jm.axis, 3)}  range "
                       f"{rng:.0f}{'deg' if jm.kind == 'revolute' else 'mm'}"
                       f"  from {len(jm.A)} frames")
@@ -821,7 +864,8 @@ def main():
             part_tracks[gtp_] = inf["track"]
             # the grown membership and the fitted joint, for the demo
             part_members[gtp_] = inf["w"] > 0.5
-            part_joints[gtp_] = (inf["joint"], infos[inf["parent"]]["row"]["dominant_gt"])
+            par_ = infos[inf["parent"]]["row"]["dominant_gt"] if inf["joint"] else gtp_
+            part_joints[gtp_] = (inf["joint"], par_)
 
         print("[g] per-part 6-DoF tracking (fixed membership, warm-started):")
         for gtp, track in part_tracks.items():
