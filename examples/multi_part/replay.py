@@ -39,6 +39,8 @@ def main():
     ap.add_argument("--min-group-frac", type=float, default=None)
     ap.add_argument("--resplit", type=int, default=None)
     ap.add_argument("--resplit-wait", type=int, default=None)
+    ap.add_argument("--resplit-min-ratio", type=float, default=None)
+    ap.add_argument("--resplit-cov-frac", type=float, default=None)
     ap.add_argument("--pips-iter", type=int, default=None)
     ap.add_argument("--grow-gate-rel", type=float, default=None)
     ap.add_argument("--outside-w", type=float, default=None)
@@ -109,6 +111,10 @@ def main():
         cfg.resplit = bool(args.resplit)
     if args.resplit_wait:
         cfg.resplit_wait = args.resplit_wait
+    if args.resplit_min_ratio is not None:
+        cfg.resplit_min_ratio = args.resplit_min_ratio
+    if args.resplit_cov_frac is not None:
+        cfg.resplit_cov_frac = args.resplit_cov_frac
     if args.pips_iter:
         cfg.num_pips_iter = args.pips_iter
     if args.grow_gate_rel is not None:
@@ -151,9 +157,7 @@ def main():
         if args.hyp_panel:
             panel = s.hypothesis_panel(dep, m, width=vis.shape[1] // 4)
             if panel is not None:
-                pad = np.full((panel.shape[0], vis.shape[1] - panel.shape[1], 3),
-                              (32, 30, 28), np.uint8)
-                vis = np.vstack([vis, np.hstack([panel, pad])])
+                vis = np.vstack([vis, s.fit_panel(panel, vis.shape[1])])
         bar = np.full((30, vis.shape[1], 3), (28, 24, 20), np.uint8)
         fps = 1000.0 / max(np.median(times[-30:]), 1e-6)
         d = s.diag

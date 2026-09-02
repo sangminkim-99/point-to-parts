@@ -156,8 +156,8 @@ class Config:
     # 54-gaussian slivers through as parts.
     min_group_frac: float = 0.02
     # which grouping candidates to generate; drop one to ablate it
-    # groupings: str = "labels,coassoc,winsets,merge"
-    groupings: str = "labels"
+    groupings: str = "labels,coassoc,winsets,merge"
+    # groupings: str = "labels"
     # (25, 10) -> (12, 3): split at frame 25 not 31, energy 0.02 -> 0.003,
     # because splitting earlier leaves more frames for each model to grow.
     min_frames_before_split: int = 12
@@ -169,7 +169,11 @@ class Config:
     # the required group count wins even at ratio 0.00, and every object
     # fragments to max_hyp pieces.
     resplit_min_ratio: float = 1.02
-    resplit_min_cov: float = 0.30
+    # Relative to the coverage the accepted split itself reached. An absolute
+    # 0.30 was calibrated on sim (first split 0.82-0.94); on a real sequence
+    # 87% of gaussians are undecided, so coverage cannot exceed ~0.13 and the
+    # floor was unreachable.
+    resplit_cov_frac: float = 0.5
     regroup_every: int = 3
     pose_log_max: int = 120
     # per-part tracking
@@ -410,7 +414,8 @@ class StreamingPartDiscovery:
             self._try_split()
             self.last_split_ms = (time.perf_counter() - t0) * 1e3
 
-    def _try_split(self, min_groups=2, min_ratio=0.0, min_cov=0.0):
+    def _try_split(self, min_groups=2, min_ratio=0.0, min_cov=0.0,
+                   max_groups=None):
         """Offer the accumulated evidence to the model selection. Commit only a
         grouping that beats treating the object as one body."""
         cfg = self.cfg
@@ -462,6 +467,20 @@ class StreamingPartDiscovery:
                     best = e
                     break
 
+        # A floor without a ceiling let a 5-group candidate take the model from
+        # 2 parts to 6 in one step; discovery should add one part at a time.
+        def kept(lb):
+            fl = max(cfg.min_group,
+                     int(cfg.min_group_frac * max(1, int((lb >= 0).sum()))))
+            return [g for g in sorted(set(lb[lb >= 0].tolist()))
+                    if (lb == g).sum() >= fl]
+
+        if max_groups is not None and len(kept(best[1])) > max_groups:
+            for e in scored:
+                if min_groups <= len(kept(e[1])) <= max_groups:
+                    best = e
+                    break
+
         self.last_scored = [(nm, len(set(lb[lb >= 0].tolist())), r, c)
                             for nm, lb, r, c in scored]
         name, lab, ratio, cov = best
@@ -470,7 +489,8 @@ class StreamingPartDiscovery:
                     int(cfg.min_group_frac * max(1, int((lab >= 0).sum()))))
         groups = [g for g in groups if (lab == g).sum() >= floor]
         self.split_tries = getattr(self, "split_tries", 0) + 1
-        if len(groups) < min_groups or ratio < min_ratio or cov < min_cov:
+        if (len(groups) < min_groups or ratio < min_ratio or cov < min_cov
+                or (max_groups is not None and len(groups) > max_groups)):
             self.last_split_why = (
                 f"best '{name}' ratio {ratio:.3f} cov {cov:.2f} -> "
                 f"{len(groups)} group(s) >= {floor} gaussians "
@@ -552,18 +572,24 @@ class StreamingPartDiscovery:
         tot, cnt = 0.0, 0
         for rec in self.pose_log[::3]:
             P = rec["P"]
-            if P.shape[1] != labels_full.shape[0]:
+            # The cloud grows during SPLIT, so demanding an exact width skipped
+            # EVERY record and returned ratio 0.000 for every candidate --
+            # no re-split could ever clear its floor. Gaussians are appended,
+            # never reordered, so the common prefix is aligned.
+            n = min(P.shape[1], labels_full.shape[0])
+            if n < 20:
                 continue
-            union = labels_full >= 0
+            lf = labels_full[:n]
+            union = lf >= 0
             if union.sum() < 20:
                 continue
-            base = float(P[:, union].sum(axis=1).max())
+            base = float(P[:, :n][:, union].sum(axis=1).max())
             split = 0.0
             for g in gs:
-                m = labels_full == g
+                m = lf == g
                 if m.sum() < 10:
                     continue
-                split += float(P[:, m].sum(axis=1).max())
+                split += float(P[:, :n][:, m].sum(axis=1).max())
             if base > 1e-9:
                 tot += split / base
                 cnt += 1
@@ -584,12 +610,14 @@ class StreamingPartDiscovery:
             pts[g] = gm[m]
         for rec in self.pose_log[::2]:
             P, Ts = rec["P"], rec["T"]
-            if P.shape[1] != labels_full.shape[0]:
+            n = min(P.shape[1], labels_full.shape[0])
+            if n < 20:
                 continue
             for g in gs:
-                m = labels_full == g
-                seq[g].append(np.asarray(Ts[int(np.argmax(P[:, m].sum(axis=1)))])
-                              if m.sum() >= 10 else None)
+                m = (labels_full[:n] == g)
+                seq[g].append(
+                    np.asarray(Ts[int(np.argmax(P[:, :n][:, m].sum(axis=1)))])
+                    if m.sum() >= 10 else None)
         parent = {g: g for g in gs}
 
         def find(x):
@@ -801,9 +829,11 @@ class StreamingPartDiscovery:
             since = i - getattr(self, "last_split_frame", 0)
             if since >= cfg.resplit_wait and i % cfg.regroup_every == 0:
                 t0 = time.perf_counter()
+                prev_cov = float(getattr(self, "split_info", {}).get("coverage", 0.0))
                 self._try_split(min_groups=len(self.parts) + 1,
+                                max_groups=len(self.parts) + 1,
                                 min_ratio=cfg.resplit_min_ratio,
-                                min_cov=cfg.resplit_min_cov)
+                                min_cov=cfg.resplit_cov_frac * prev_cov)
                 self.last_split_ms = (time.perf_counter() - t0) * 1e3
 
         # ---- online part modelling ----
@@ -1006,6 +1036,20 @@ class StreamingPartDiscovery:
         print(f"[stream] frame {i}: re-seeded {len(new_idx)} tracks on a part "
               f"({len(self.anchor_xyz)} total)")
         return True
+
+    @staticmethod
+    def fit_panel(panel, width):
+        """Scale a panel down to `width` and pad the remainder. Six parts make
+        the strip wider than the view, and np.full then gets a negative size."""
+        import cv2
+        if panel.shape[1] > width:
+            h = max(1, int(panel.shape[0] * width / panel.shape[1]))
+            panel = cv2.resize(panel, (width, h))
+        if panel.shape[1] == width:
+            return panel
+        pad = np.full((panel.shape[0], width - panel.shape[1], 3),
+                      (32, 30, 28), np.uint8)
+        return np.hstack([panel, pad])
 
     def hypothesis_panel(self, depth, mask=None, width=200, r_max=0.05):
         """What each motion explains: its RGB render on top, its residual below.

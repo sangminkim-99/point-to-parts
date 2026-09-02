@@ -183,10 +183,8 @@ class RealSenseMultiPart:
                             panel = self.stream.hypothesis_panel(
                                 depth, mask, width=disp.shape[1] // 4)
                             if panel is not None:
-                                pad = np.full(
-                                    (panel.shape[0], disp.shape[1] - panel.shape[1], 3),
-                                    (32, 30, 28), np.uint8)
-                                disp = np.vstack([disp, np.hstack([panel, pad])])
+                                disp = np.vstack(
+                                    [disp, self.stream.fit_panel(panel, disp.shape[1])])
 
                     fps = 1000.0 / max(np.median(self.times[-30:]), 1e-6) if self.times else 0
                     t = self.stream.last_timings
