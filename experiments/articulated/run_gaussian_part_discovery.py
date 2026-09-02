@@ -86,6 +86,8 @@ def main():
                          "0 picks it automatically from --gauss-target.")
     ap.add_argument("--gauss-target", type=int, default=3000,
                     help="gaussians the automatic stride aims for")
+    ap.add_argument("--gauss-stride-max", type=int, default=2,
+                    help="coarsest stride the automatic choice may use")
     ap.add_argument("--inlier-thres", type=float, default=0.008)
     ap.add_argument("--max-hyp", type=int, default=4)
     ap.add_argument("--hyp-mode", choices=["baselines", "window"], default="window",
@@ -243,7 +245,12 @@ def main():
     # coverage from 1.4/2 to 1.8/2. The stride is a density knob, so set it by
     # density.
     if args.gauss_stride <= 0:
-        gs = 4
+        # Only ever make the cloud DENSER than the fixed default, never sparser.
+        # Starting the search at 4 let a large object be coarsened, and that
+        # destroyed the subtlest sequence in the benchmark: RBO cabinet03
+        # articulates only 48 mm in total, and going from 17k gaussians to 4.3k
+        # took it from 3/3 at 92.5% to 1/3 at 55.6%.
+        gs = args.gauss_stride_max
         while gs > 1:
             n_est = int((obj0[::gs, ::gs] > 0).sum())
             if n_est >= args.gauss_target:
