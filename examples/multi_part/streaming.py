@@ -91,6 +91,33 @@ def sample_superpoint(sampler, rgb, depth, mask, K, n):
     return pts if pts.shape[0] >= 5 else sample_points(mask, depth, n)
 
 
+def clean_mask(mask, depth, jump=0.15, grow=0):
+    """Drop mask pixels sitting on a depth discontinuity.
+
+    A hand-drawn or propagated mask always leaks a few pixels of background at
+    the silhouette. Measured on a real take, that put points 1.20 m deep into a
+    0.55 m object, stretched the cloud to 0.69 m along z against a true 0.28,
+    and left 93% of gaussians undecided; removing them took the first split from
+    16% coverage to 86%.
+    """
+    import cv2
+    m = (mask > 0) & (depth > 0)
+    if jump <= 0 or not m.any():
+        return (m.astype(np.uint8) * 255) if mask.dtype == np.uint8 else m
+    d = np.where(m, depth, np.nan).astype(np.float32)
+    k = np.ones((3, 3), np.uint8)
+    filled = np.where(np.isnan(d), 0, d)
+    hi = cv2.dilate(filled, k)
+    lo = -cv2.dilate(np.where(np.isnan(d), -1e3, -filled), k)
+    edge = m & ((hi - lo) > jump)
+    if grow > 0 and edge.any():
+        edge = cv2.dilate(edge.astype(np.uint8), k, iterations=grow) > 0
+    out = m & ~edge
+    if out.sum() < 0.2 * m.sum():       # the whole object is a slope: keep it
+        out = m
+    return out.astype(np.uint8) * 255
+
+
 def sample_points(mask, depth, n, border=4):
     """Pick n pixels inside the mask that have valid depth."""
     m = (mask > 0) & (depth > 0.05)
@@ -208,6 +235,10 @@ class Config:
     score_round: int = 3
     merge_eps: float = 0.002
     merge_tol: float = 0.012
+    # Metres of depth jump that marks a mask pixel as silhouette leakage.
+    # Measured: 0.05 also eats a thin part's own edge (sim eyeglasses 3 -> 2
+    # parts); 0.25 lets the background back in (take01 to 5 parts).
+    mask_depth_jump: float = 0.15
 
 
 class StreamingPartDiscovery:
@@ -238,6 +269,7 @@ class StreamingPartDiscovery:
         cfg = self.cfg
         H, W = depth.shape
         self.H, self.W = H, W
+        mask = clean_mask(mask, depth, cfg.mask_depth_jump)
 
         # a thin object at a fixed stride yields a few hundred gaussians, and
         # then nothing is ever decisively assigned
@@ -278,6 +310,7 @@ class StreamingPartDiscovery:
         i = self.n
         self.n += 1
         cfg = self.cfg
+        mask = clean_mask(mask, depth, cfg.mask_depth_jump)
 
         tracks, _, vis = self.tracker.track_once(
             Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K))
