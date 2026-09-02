@@ -219,3 +219,5 @@ __marimo__/
 
 .vscode/
 .ini
+# large experiment outputs (videos, figures, reports)
+debug/
