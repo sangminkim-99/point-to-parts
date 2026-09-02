@@ -34,6 +34,7 @@ from point2pose.pipeline.components.gaussian_part_assignment import (
     GaussianPartAssignment,
 )
 from point2pose.pipeline.components.joint_model import JointModel
+from scipy.spatial.transform import Rotation as _R
 
 
 def se3_pow(T, s):
@@ -46,6 +47,48 @@ def se3_pow(T, s):
         return np.real(expm(np.real(logm(np.asarray(T, dtype=np.float64))) * s))
     except Exception:
         return np.asarray(T)
+
+
+def build_sampler(cfg):
+    """Point2Pose's own sampler, so the few points we get are worth tracking.
+
+    pipeline_test2.yaml runs `super_point_balanced` at 20 points; 20 RANDOM
+    points is a different thing entirely -- measured, it never separates the
+    eyeglasses and shrinks the storage parts to a few hundred gaussians.
+    """
+    try:
+        from point2pose.modules.sampler.super_point_balanced_sampler import (
+            SuperPointBalancedSampler)
+        return SuperPointBalancedSampler({
+            "num_points": cfg.n_points, "density_per_kpx": -1,
+            "fps_oversample_factor": 3, "min_points": 5, "max_points": 50,
+            "edge_margin_px": 5, "remove_convex_hull": False,
+            "inflate_points": False, "cell_size": -1,
+            "crop_to_mask": True, "crop_pad_px": 3,
+            "super_point_max_num_keypoints": 512, "debug_level": 0,
+        })
+    except Exception as exc:
+        print(f"[stream] SuperPoint sampler unavailable ({exc}); using random")
+        return None
+
+
+def sample_superpoint(sampler, rgb, depth, mask, K, n):
+    """Run the SuperPoint sampler over one mask; falls back to random."""
+    import torch as _t
+    from point2pose.data_types.frame import Frame
+    from point2pose.data_types.sampler_context import SamplerContext
+
+    if sampler is None:
+        return sample_points(mask, depth, n)
+    m = _t.as_tensor((mask > 0).astype(np.uint8))[None, None]
+    f = Frame(id=0, rgb=rgb, depth=depth, mask=m, intrinsics=K)
+    try:
+        pts = sampler.sample(SamplerContext(frame=f, min_depth=0.1, max_depth=10.0), 0)
+    except Exception as exc:
+        print(f"[stream] SuperPoint sample failed ({exc}); using random")
+        return sample_points(mask, depth, n)
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    return pts if pts.shape[0] >= 5 else sample_points(mask, depth, n)
 
 
 def sample_points(mask, depth, n, border=4):
@@ -82,6 +125,7 @@ class Part:
     joint_values: list = field(default_factory=list)
     d_pose: np.ndarray = None           # last inter-frame increment
     track_idx: np.ndarray = None        # sparse tracks sitting on this part
+    view_dirs: list = None              # viewing directions already keyframed
 
 
 @dataclass
@@ -89,9 +133,9 @@ class Config:
     max_hyp: int = 4
     gauss_target: int = 3000
     gauss_stride_max: int = 2
-    n_points: int = 400
-    inlier_thres: float = 0.008
-    min_inliers: int = 10
+    n_points: int = 20
+    inlier_thres: float = 0.01
+    min_inliers: int = 3
     depth_sigma: float = 0.02
     win_steps: int = 20
     ransac_iters: int = 200
@@ -113,13 +157,21 @@ class Config:
     pose_log_max: int = 120
     # per-part tracking
     track_rmax: float = 0.05
-    max_step: float = 0.2
+    # pipeline_test2.yaml pose_jump_guard_trans_thres
+    max_step: float = 0.15
     grow_every: int = 2
-    grow_gate: float = 0.015
+    # pipeline_test2.yaml map_growth_max_mean_residual
+    grow_gate: float = 0.006
     # a pose slightly off the surface is still informative about the joint, and
     # the fit re-evaluates both joint types anyway
     joint_gate: float = 0.035
     grow_max: int = 1500
+    # Point2Pose's live sampling criterion, per part (pipeline_test2.yaml:
+    # rotation_threshold max_angle_deg 15, sampler num_points 20 / max 50).
+    key_angle_deg: float = 15.0
+    key_min_pts: int = 8
+    key_points: int = 20
+    key_max_points: int = 400
     exclusive_mask: bool = True
     # Off: measured, masking a part's back face out costs more than the
     # thickness it saves -- laptop lid 23.6 -> 33.4 mm, eyeglasses temple 38 -> 168.
@@ -170,7 +222,9 @@ class StreamingPartDiscovery:
             self.cloud, cfg.max_hyp, depth_sigma=cfg.depth_sigma)
         self.assign.init_coassoc(min(cfg.co_sample, len(self.cloud)))
 
-        pts0 = sample_points(mask, depth, cfg.n_points)
+        self.sampler = build_sampler(cfg)
+        pts0 = sample_superpoint(self.sampler, rgb, depth, mask, self.K,
+                                 cfg.n_points)
         f0 = Frame(id=0, rgb=rgb, depth=depth, intrinsics=self.K)
         self.tracker.add_query_points(f0, pts0)
         self.tracker.initialize(f0)
@@ -513,6 +567,7 @@ class StreamingPartDiscovery:
             tidx = part.track_idx
             if tidx is not None and tidx.size >= 6 and self.reg is not None:
                 cu, cok, cvi = self.cur_tracks
+                tidx = tidx[tidx < len(cok)]        # see _draw_tracks
                 sel_t = tidx[self.anchor_ok[tidx] & cok[tidx] & cvi[tidx]]
                 if sel_t.size >= 6:
                     c = self.reg._RANSAC(p0=self.anchor_xyz[sel_t],
@@ -577,23 +632,39 @@ class StreamingPartDiscovery:
                 elif jm.kind is not None:
                     part.joint_values.append(jm.value_of(A))
 
+        # ---- keyframes, after Point2Pose's own sampling criterion ----
+        for j, part in enumerate(self.parts):
+            if part.view_dirs is None:
+                part.view_dirs = [np.array([0., 0., 1.])]
+            u = part.pose[:3, :3] @ part.view_dirs[0]
+            # a viewpoint already covered is never sampled twice; comparing only
+            # against the LAST keyframe re-seeds forever once a part oscillates
+            ang = np.degrees(np.arccos(np.clip(
+                [u @ v for v in part.view_dirs], -1.0, 1.0)))
+            new_view = bool(np.all(ang >= cfg.key_angle_deg))
+            # or the part still shows a surface but has run out of live tracks
+            n_live = 0
+            if part.track_idx is not None:
+                _, cok, cvi = self.cur_tracks
+                ti = part.track_idx[part.track_idx < len(cok)]
+                n_live = int((cok[ti] & cvi[ti]).sum()) if ti.size else 0
+            starved = (n_live < cfg.key_min_pts
+                       and occ[j] is not None and occ[j].sum() > 200)
+            if not (new_view or starved):
+                continue
+            if part.energy > cfg.grow_gate and not starved:
+                continue        # do not anchor through a pose that has slipped
+            if len(self.anchor_xyz) >= cfg.key_max_points:
+                continue
+            if self._reseed(part, rgb, depth, mask, i, occ[j]):
+                part.view_dirs.append(u)
+                # grow the dense model at the same moment: the surface that
+                # justified new tracks is the surface the model is missing
+                self._grow(rgb, depth, mask)
+
         # ---- online part modelling ----
         if cfg.grow_every > 0 and i % cfg.grow_every == 0:
-            poses = [p.pose for p in self.parts]
-            ws = [p.weights for p in self.parts]
-            ok_g = [p.energy < cfg.grow_gate for p in self.parts]
-            n_new, owner = a.grow_parts(rgb, depth, self.K, mask, poses, ws,
-                                        stride=self.gauss_stride,
-                                        max_new=cfg.grow_max, grow_ok=ok_g)
-            if n_new:
-                for j, p in enumerate(self.parts):
-                    p.weights = np.concatenate(
-                        [p.weights, (owner == j).astype(np.float32)])
-                gm = self.cloud.means.detach().cpu().numpy()
-                for p in self.parts:
-                    p.box = self._fit_box(p.weights > 0.5)
-                    # the model grew, so which tracks sit on this part can change
-                    p.track_idx = self._tracks_on(gm, p.weights)
+            self._grow(rgb, depth, mask)
 
     def _tracks_on(self, gm, w):
         """Which sparse tracks sit on this part, by nearest gaussian in the
@@ -711,11 +782,80 @@ class StreamingPartDiscovery:
             self._draw_tracks(out, self.parts, pal)
         return out
 
-    def hypothesis_panel(self, depth, mask=None, width=200, r_max=0.05):
-        """One thumbnail per hypothesis: where its render disagrees with the depth.
+    def _grow(self, rgb, depth, mask):
+        """Add gaussians for object surface no part explains yet."""
+        cfg, a = self.cfg, self.assign
+        poses = [p.pose for p in self.parts]
+        ws = [p.weights for p in self.parts]
+        ok_g = [p.energy < cfg.grow_gate for p in self.parts]
+        n_new, owner = a.grow_parts(rgb, depth, self.K, mask, poses, ws,
+                                    stride=self.gauss_stride,
+                                    max_new=cfg.grow_max, grow_ok=ok_g)
+        if not n_new:
+            return 0
+        for j, p in enumerate(self.parts):
+            p.weights = np.concatenate(
+                [p.weights, (owner == j).astype(np.float32)])
+        gm = self.cloud.means.detach().cpu().numpy()
+        for p in self.parts:
+            p.box = self._fit_box(p.weights > 0.5)
+            # the model grew, so which tracks sit on this part can change
+            p.track_idx = self._tracks_on(gm, p.weights)
+        return n_new
 
-        This is the method's actual question made visible -- blue is surface the
-        hypothesis explains, red is surface it does not.
+    def _reseed(self, part, rgb, depth, mask, i, occ_j):
+        """Sample fresh tracks on the surface this part shows now.
+
+        A part that has turned loses the tracks it was seeded with -- measured
+        offline, that is where a thin fast-rotating part's pose gave out. New
+        points are anchored through the part's current pose, exactly as grown
+        gaussians are.
+        """
+        from point2pose.data_types.frame import Frame
+
+        cfg = self.cfg
+        region = (occ_j & (mask > 0) & (depth > 0.05)) if occ_j is not None else None
+        if region is None or region.sum() < 200:
+            return False
+        pts = sample_superpoint(self.sampler, rgb, depth,
+                                region.astype(np.uint8), self.K, cfg.key_points)
+        if pts.shape[0] < 8:
+            return False
+        xyz, ok = lift(pts, depth, self.K)
+        if ok.sum() < 8:
+            return False
+
+        f = Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K)
+        try:
+            new_idx = self.tracker.add_query_points(f, pts)
+        except Exception as exc:
+            print(f"[stream] re-seed failed: {exc}")
+            return False
+        new_idx = np.asarray(new_idx).reshape(-1)
+
+        T = part.pose
+        anchor = (xyz - T[:3, 3]) @ T[:3, :3]        # camera -> anchor frame
+        self.anchor_xyz = np.concatenate([self.anchor_xyz, anchor.astype(np.float32)])
+        self.anchor_ok = np.concatenate([self.anchor_ok, ok])
+        # every earlier frame in the window predates these tracks
+        for j2 in list(self.past):
+            p_, o_, v_ = self.past[j2]
+            pad = np.zeros((len(new_idx), 3), np.float32)
+            self.past[j2] = (np.concatenate([p_, pad]),
+                             np.concatenate([o_, np.zeros(len(new_idx), bool)]),
+                             np.concatenate([v_, np.zeros(len(new_idx), bool)]))
+        part.track_idx = (new_idx if part.track_idx is None
+                          else np.concatenate([part.track_idx, new_idx]))
+        print(f"[stream] frame {i}: re-seeded {len(new_idx)} tracks on a part "
+              f"({len(self.anchor_xyz)} total)")
+        return True
+
+    def hypothesis_panel(self, depth, mask=None, width=200, r_max=0.05):
+        """Per hypothesis: what its gaussians look like, and where they disagree.
+
+        Top row is the gsplat RGB render at that pose, bottom row the depth
+        residual -- blue is surface the hypothesis explains, red is surface it
+        does not.
         """
         import cv2
 
@@ -732,18 +872,29 @@ class StreamingPartDiscovery:
             if any(np.allclose(T, U, atol=1e-6) for U in seen):
                 continue
             seen.append(np.asarray(T))
-            _, dep_r, alpha = self.cloud.render(T, self.K, depth.shape[0],
-                                                depth.shape[1])
+            col, dep_r, alpha = self.cloud.render(T, self.K, depth.shape[0],
+                                                  depth.shape[1])
+            a_np = (alpha > 0.3).cpu().numpy()
+
+            # what the hypothesis says the object looks like
+            rgb_t = (col.clamp(0, 1) * 255).byte().cpu().numpy()
+            rgb_t = cv2.cvtColor(rgb_t, cv2.COLOR_RGB2BGR)
+            rgb_t[~a_np] = (32, 30, 28)
+
+            # where it disagrees with the depth actually measured
             vis = (alpha > 0.3) & (obs > 0) & mk
             res = (dep_r - obs).abs().clamp(max=r_max) / r_max
-            img = torch.where(vis, res, torch.ones_like(res)).cpu().numpy()
-            g = cv2.applyColorMap((img * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-            g[~vis.cpu().numpy()] = (32, 30, 28)
-            h = int(g.shape[0] * width / g.shape[1])
-            g = cv2.resize(g, (width, h))
-            cv2.putText(g, f"h{k}  {100*share[k]:.0f}%", (6, 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
-            tiles.append(g)
+            err = cv2.applyColorMap(
+                (res.cpu().numpy() * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+            err[~vis.cpu().numpy()] = (32, 30, 28)
+
+            h = int(rgb_t.shape[0] * width / rgb_t.shape[1])
+            rgb_t = cv2.resize(rgb_t, (width, h))
+            err = cv2.resize(err, (width, h))
+            cv2.putText(rgb_t, f"h{k}  {100 * share[k]:.0f}%", (6, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1,
+                        cv2.LINE_AA)
+            tiles.append(np.vstack([rgb_t, err]))
         if not tiles:
             return None
         return np.hstack(tiles)
@@ -766,7 +917,10 @@ class StreamingPartDiscovery:
         if parts:
             for j, p in enumerate(parts):
                 if p.track_idx is not None:
-                    owner[p.track_idx] = j
+                    # tracks re-seeded this frame are not in the tracker's output
+                    # until the next one
+                    ti = p.track_idx[p.track_idx < len(t2d)]
+                    owner[ti] = j
 
         for i in range(len(t2d)):
             x, y = int(t2d[i, 0]), int(t2d[i, 1])

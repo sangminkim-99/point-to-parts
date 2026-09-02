@@ -257,7 +257,7 @@ def main():
     ap.add_argument("--serial", default=None, help="RealSense serial number")
     ap.add_argument("--n-points", type=int, default=None)
     ap.add_argument("--hyp-every", type=int, default=None)
-    ap.add_argument("--tapir-res", type=int, default=480)
+    ap.add_argument("--tapir-res", type=int, default=512)
     ap.add_argument("--pips-iter", type=int, default=None)
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")

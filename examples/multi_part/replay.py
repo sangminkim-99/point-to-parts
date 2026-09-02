@@ -29,7 +29,7 @@ def main():
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--n-points", type=int, default=None)
     ap.add_argument("--hyp-every", type=int, default=None)
-    ap.add_argument("--tapir-res", type=int, default=480)
+    ap.add_argument("--tapir-res", type=int, default=512)
     ap.add_argument("--co-sample", type=int, default=None)
     ap.add_argument("--min-inliers", type=int, default=None)
     ap.add_argument("--pips-iter", type=int, default=None)
