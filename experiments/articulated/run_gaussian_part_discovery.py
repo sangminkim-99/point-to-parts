@@ -120,6 +120,9 @@ def main():
                     help="cluster a co-association matrix instead of carrying "
                          "hypothesis slots across frames")
     ap.add_argument("--no-coassoc", dest="coassoc", action="store_false")
+    ap.add_argument("--coverage-weight", type=float, default=0.3,
+                    help="how much a grouping is rewarded for labelling more of "
+                         "the object, added to the split ratio")
     ap.add_argument("--merge-rigid", type=int, default=1,
                     help="also offer a grouping in which groups that never move "
                          "relative to each other are merged")
@@ -526,10 +529,10 @@ def main():
         collects nearly all of it; one that splits a rigid body does not.
         """
         if not pose_log:
-            return -1.0
+            return 0.0, 0.0
         gs = [g for g in set(labels_full.tolist()) if g >= 0]
         if len(gs) < 1:
-            return -1.0
+            return 0.0, 0.0
         # Score the split against NOT splitting. Asking only "how well does each
         # group explain the posteriors" rewards a single group, which is why the
         # laptop collapsed to one part as soon as depth noise was added. The
@@ -543,8 +546,7 @@ def main():
             union = labels_full >= 0
             if union.sum() < 20:
                 continue
-            m_all = P[:, union].sum(axis=1)
-            base = float(m_all.max())
+            base = float(P[:, union].sum(axis=1).max())
             split = 0.0
             for g in gs:
                 m = labels_full == g
@@ -554,26 +556,35 @@ def main():
             if base > 1e-9:
                 tot += split / base
                 cnt += 1
-        return tot / max(cnt, 1)
+        # Scaled by how much of the object the grouping actually labels. The
+        # ratio alone is relative to whatever subset a candidate chose, so a
+        # grouping that labels only the easy third of the gaussians scores a
+        # smaller, easier problem and wins -- that is how winner-set grouping
+        # came to over-segment the simulated pliers 5 ways. Making the
+        # denominator global instead swings the other way and rewards ONE group
+        # covering everything, which lost the scissors blade entirely (1/2 at
+        # 56%). Relative split times coverage keeps both honest.
+        cov = float((labels_full >= 0).mean())
+        return tot / max(cnt, 1), cov
 
     # both groupings are computed, then the better-scoring one is kept: the hard
     # log-odds path wins on scissors and pliers, co-association on laptop and
     # eyeglasses, and neither dominates.
     cand = []
     lab_hard = assign.labels()
-    cand.append(("labels", lab_hard, np.arange(len(cloud)), grouping_score(lab_hard)))
+    cand.append(("labels", lab_hard, np.arange(len(cloud))) + (grouping_score(lab_hard),))
     if args.coassoc:
         lab_co, sub_co = assign.coassoc_labels(args.co_frac, args.min_group,
                                                max_k=args.co_max_k)
         full = np.full(len(cloud), -1, dtype=int)
         full[sub_co] = lab_co
-        cand.append(("coassoc", lab_co, sub_co, grouping_score(full)))
+        cand.append(("coassoc", lab_co, sub_co) + (grouping_score(full),))
     if args.winsets:
         lab_ws, sub_ws = assign.winset_labels(min_members=args.winset_min_members,
                                               thresh=args.winset_thresh,
                                               min_group=args.min_group)
         if (lab_ws >= 0).any():
-            cand.append(("winsets", lab_ws, sub_ws, grouping_score(lab_ws)))
+            cand.append(("winsets", lab_ws, sub_ws) + (grouping_score(lab_ws),))
     def merge_rigid_groups(labels_full, tol=0.012):
         """Merge groups that never move relative to each other.
 
@@ -650,9 +661,17 @@ def main():
                     len(set(full[full >= 0].tolist())):
                 merged.append((nm + "+merge", mf[sb], sb, grouping_score(mf)))
         cand.extend(merged)
-    cand.sort(key=lambda x: -x[3])
+    # ties go to the grouping with fewer parts: merging two groups that pick the
+    # same hypothesis leaves `split` unchanged, so a correct merge scores exactly
+    # the same as the over-segmented version it replaces
+    def combined(e):
+        r, c = e[3]
+        return r + args.coverage_weight * c
+    cand.sort(key=lambda x: (-combined(x), len(set(x[1][x[1] >= 0].tolist()))))
     print("[g] grouping selection: " +
-          "  ".join(f"{n}={sc:.3f}" for n, _, _, sc in cand))
+          "  ".join(f"{n}={sc[0]:.3f}x{sc[1]:.2f}"
+                    f"[{len(set(lb[lb >= 0].tolist()))}]"
+                    for n, lb, _, sc in cand))
     chosen, lab, sub, _ = cand[0]
     print(f"[g] using '{chosen}' grouping")
     gt_lab_full = gt_lab
