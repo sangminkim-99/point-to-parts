@@ -250,6 +250,184 @@ class GaussianPartAssignment:
             if (bestval < 1e5).any() else float("nan"),
         }
 
+    # ------------------------------------------------------------------ #
+    #  M-step: refine each hypothesis against the dense model
+    # ------------------------------------------------------------------ #
+
+    def refine_pose(self, T, weights, K, H, W, obs_depth, iters=6, huber=0.02,
+                    obs_mask=None):
+        """Projective ICP of the gaussians onto the observed depth.
+
+        The plan's section 3.1 EM loop needs this M-step, and every RBO failure
+        traced to hypothesis quality rather than assignment: a single sparse
+        RANSAC hypothesis matched all three parts to within 6-25 mm. Refining a
+        group's transform against the dense surface it is supposed to explain
+        attacks the problem where it actually is.
+
+        `weights` is a soft membership over gaussians (N,) in [0,1].
+        """
+        Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
+        obs = torch.as_tensor(obs_depth, dtype=torch.float32, device=self.device)
+        if obs_mask is not None:
+            # Without this the ground plane is a valid ICP target and drags the
+            # part onto it: the moving scissor blade came out 300 mm off while
+            # the static part was exact.
+            mk = torch.as_tensor(obs_mask > 0, device=self.device)
+            obs = torch.where(mk, obs, torch.zeros_like(obs))
+        P0 = self.cloud.means
+        T = torch.as_tensor(np.asarray(T), dtype=torch.float32, device=self.device).clone()
+        w0 = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+        if float(w0.sum()) < 10:
+            return T.cpu().numpy()
+
+        for _ in range(iters):
+            p = P0 @ T[:3, :3].T + T[:3, 3]
+            z = p[:, 2]
+            u = (p[:, 0] * Kt[0, 0] / z + Kt[0, 2]).round().long()
+            v = (p[:, 1] * Kt[1, 1] / z + Kt[1, 2]).round().long()
+            ok = (z > 1e-3) & (u >= 0) & (u < W) & (v >= 0) & (v < H) & (w0 > 0.05)
+            if int(ok.sum()) < 10:
+                break
+            zo = obs[v[ok].clamp(0, H - 1), u[ok].clamp(0, W - 1)]
+            good = zo > 0
+            if int(good.sum()) < 10:
+                break
+            idx = torch.where(ok)[0][good]
+            src = p[idx]
+            # the observed surface point along the same ray
+            zt = zo[good]
+            tgt = torch.stack([
+                (u[idx].float() - Kt[0, 2]) * zt / Kt[0, 0],
+                (v[idx].float() - Kt[1, 2]) * zt / Kt[1, 1],
+                zt], dim=1)
+
+            r = torch.linalg.norm(tgt - src, dim=1)
+            wt = w0[idx] * torch.clamp(huber / torch.clamp(r, min=1e-6), max=1.0)
+            if float(wt.sum()) < 1e-6:
+                break
+            wn = (wt / wt.sum())[:, None]
+            cs = (src * wn).sum(0)
+            ct = (tgt * wn).sum(0)
+            Hm = ((src - cs) * wn).T @ (tgt - ct)
+            try:
+                U, _, Vt = torch.linalg.svd(Hm)
+            except Exception:
+                break
+            d = torch.sign(torch.det(Vt.T @ U.T))
+            Rc = Vt.T @ torch.diag(torch.tensor([1.0, 1.0, float(d)],
+                                                device=self.device)) @ U.T
+            dT = torch.eye(4, device=self.device)
+            dT[:3, :3] = Rc
+            dT[:3, 3] = ct - Rc @ cs
+            T = dT @ T
+        return T.cpu().numpy()
+
+    def fit_error(self, T, weights, K, H, W, obs_depth, obs_mask=None):
+        """Median depth residual of a weighted gaussian set under transform T."""
+        R = self.residuals([T], K, H, W, obs_depth, obs_mask=obs_mask)[0]
+        w = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+        ok = (R < 1e5) & (w > 0.05)
+        if int(ok.sum()) < 10:
+            return float("inf")
+        return float(R[ok].median())
+
+    def soft_membership(self, R, tau=None):
+        """Posterior over hypotheses per gaussian, (Hy, N)."""
+        tau = self.depth_sigma if tau is None else tau
+        r = R.clone()
+        r[~torch.isfinite(r)] = 1e6
+        return torch.softmax(-r / max(tau, 1e-6), dim=0)
+
+    def residuals(self, hypotheses, K, H, W, obs_depth, obs_mask=None):
+        """Per-gaussian depth residual under each hypothesis, (Hy, N)."""
+        obs = torch.as_tensor(obs_depth, dtype=torch.float32, device=self.device)
+        if obs_mask is not None:
+            mk = torch.as_tensor(obs_mask > 0, device=self.device)
+            obs = torch.where(mk, obs, torch.zeros_like(obs))
+        Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
+        out = []
+        for T in hypotheses:
+            Tt = torch.as_tensor(np.asarray(T), dtype=torch.float32, device=self.device)
+            p = self.cloud.means @ Tt[:3, :3].T + Tt[:3, 3]
+            z = p[:, 2]
+            u = (p[:, 0] * Kt[0, 0] / z + Kt[0, 2]).round().long()
+            v = (p[:, 1] * Kt[1, 1] / z + Kt[1, 2]).round().long()
+            ok = (z > 1e-3) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            zo = torch.zeros_like(z)
+            zo[ok] = obs[v[ok].clamp(0, H - 1), u[ok].clamp(0, W - 1)]
+            r = torch.full_like(z, 1e6)
+            g = ok & (zo > 0)
+            r[g] = torch.abs(z[g] - zo[g])
+            out.append(r)
+        return torch.stack(out)
+
+    # ------------------------------------------------------------------ #
+    #  Growth: surfaces that appear later must enter the model
+    # ------------------------------------------------------------------ #
+
+    def grow(self, rgb, depth, K, mask, hypotheses, T_anchor, tol=0.03,
+             stride=3, max_new=4000):
+        """Add gaussians for object pixels no hypothesis explains.
+
+        Without this the model is whatever the first frame happened to see, and a
+        drawer interior or a newly revealed face can never be represented -- the
+        plan calls these out specifically as how unmodelled geometry should enter.
+        New points are anchored through the dominant hypothesis; which part they
+        belong to is left to the usual accumulation.
+        """
+        H, W = depth.shape
+        Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
+        covered = torch.zeros((H, W), dtype=torch.bool, device=self.device)
+        obs = torch.as_tensor(depth, dtype=torch.float32, device=self.device)
+        for T in hypotheses:
+            Tt = torch.as_tensor(np.asarray(T), dtype=torch.float32, device=self.device)
+            p = self.cloud.means @ Tt[:3, :3].T + Tt[:3, 3]
+            z = p[:, 2]
+            u = (p[:, 0] * Kt[0, 0] / z + Kt[0, 2]).round().long()
+            v = (p[:, 1] * Kt[1, 1] / z + Kt[1, 2]).round().long()
+            ok = (z > 1e-3) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            if not ok.any():
+                continue
+            uu, vv, zz = u[ok], v[ok], z[ok]
+            zo = obs[vv, uu]
+            hit = (zo > 0) & (torch.abs(zz - zo) < tol)
+            covered[vv[hit], uu[hit]] = True
+
+        m = torch.as_tensor(mask > 0, device=self.device) & (obs > 0) & ~covered
+        sel = torch.zeros_like(m)
+        sel[::stride, ::stride] = True
+        m = m & sel
+        n_new = int(m.sum())
+        if n_new == 0:
+            return 0
+        vs, us = torch.where(m)
+        if n_new > max_new:
+            pick = torch.randperm(n_new, device=self.device)[:max_new]
+            vs, us = vs[pick], us[pick]
+            n_new = max_new
+        z = obs[vs, us]
+        pc = torch.stack([(us.float() - Kt[0, 2]) * z / Kt[0, 0],
+                          (vs.float() - Kt[1, 2]) * z / Kt[1, 1], z], dim=1)
+        Ta = torch.as_tensor(np.asarray(T_anchor), dtype=torch.float32,
+                             device=self.device)
+        # anchor-frame position: R^T (p_cam - t), written for row vectors
+        pa = (pc - Ta[:3, 3]) @ Ta[:3, :3]
+        cols = torch.as_tensor(rgb[vs.cpu().numpy(), us.cpu().numpy()],
+                               dtype=torch.float32, device=self.device) / 255.0
+        foot = (z / float(Kt[0, 0])) * 1.2
+
+        c = self.cloud
+        c.means = torch.cat([c.means, pa], 0)
+        c.colors = torch.cat([c.colors, cols], 0)
+        c.scales = torch.cat([c.scales, foot[:, None].repeat(1, 3)], 0)
+        c.opacities = torch.cat([c.opacities, torch.ones(n_new, device=self.device)], 0)
+        q = torch.zeros((n_new, 4), device=self.device); q[:, 0] = 1.0
+        c.quats = torch.cat([c.quats, q], 0)
+        self.logodds = torch.cat(
+            [self.logodds, torch.zeros((n_new, self.logodds.shape[1]),
+                                       device=self.device)], 0)
+        return n_new
+
     def init_coassoc(self, n_sample=4000, seed=0):
         """Evidence accumulation: count how often each pair of gaussians is put in
         the same group, and cluster that at the end.

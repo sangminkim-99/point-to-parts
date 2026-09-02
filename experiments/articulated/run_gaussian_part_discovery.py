@@ -33,6 +33,7 @@ from point2pose.modules.tracker.tapir_tracker import TapirTracker
 from point2pose.pipeline.components.gaussian_part_assignment import (
     GaussianCloud, GaussianPartAssignment,
 )
+from scipy.spatial.transform import Rotation as _R
 
 PAL = np.array([[245, 135, 66], [60, 130, 214], [100, 190, 90],
                 [220, 100, 170], [230, 200, 80]], np.uint8)
@@ -106,6 +107,14 @@ def main():
                          "hypothesis slots across frames")
     ap.add_argument("--no-coassoc", dest="coassoc", action="store_false")
     ap.add_argument("--co-sample", type=int, default=4000)
+    ap.add_argument("--em-iters", type=int, default=1,
+                    help="M-step rounds per frame: refine each hypothesis against "
+                         "the dense model, then re-assign")
+    ap.add_argument("--grow-every", type=int, default=0,
+                    help="add gaussians for unexplained object pixels every N "
+                         "frames (0 = never). Without it the model is whatever "
+                         "the first frame saw.")
+    ap.add_argument("--grow-tol", type=float, default=0.03)
     ap.add_argument("--co-max-k", type=int, default=5)
     ap.add_argument("--co-frac", type=float, default=0.5,
                     help="fraction of co-decided frames a pair must share a group in")
@@ -217,6 +226,9 @@ def main():
     past, rel_to_anchor = {}, {}
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     writer, hist = None, []
+    track_hist = {}        # frame -> (xyz, ok, visible) of the sparse tracks
+    pose_log = []          # per-frame refined transform of every hypothesis
+    T_anchor_gt = {p: r.get_gt_pose(a, p) for p in parts}
 
     for n, i in enumerate(frames):
         rgb, dep = r.get_color(i), r.get_depth(i)
@@ -226,6 +238,7 @@ def main():
         use = np.where(anchor_ok & cur_ok & vis)[0]
 
         past[i] = (cur.copy(), cur_ok.copy(), vis.copy())
+        track_hist[int(i)] = (cur.copy(), cur_ok.copy(), vis.copy())
         order.append(i)
 
         # ---- anchor->current dominant motion, maintained every frame so any
@@ -319,8 +332,32 @@ def main():
         if om is None:
             continue
         if args.mode == "pointwise":
-            st = assign.step_pointwise(hyps[:args.max_hyp], K, H, W, dep,
-                                       obs_mask=om)
+            hy = list(hyps[:args.max_hyp])
+            # EM: assign softly, then refine each hypothesis against the surface
+            # it is supposed to explain, then assign again with the refined ones
+            for _ in range(max(0, args.em_iters)):
+                Rm = assign.residuals(hy, K, H, W, dep, obs_mask=om)
+                P = assign.soft_membership(Rm)
+                hy = [assign.refine_pose(T, P[k], K, H, W, dep, obs_mask=om)
+                      for k, T in enumerate(hy)]
+            st = assign.step_pointwise(hy, K, H, W, dep, obs_mask=om)
+            hyps = hy + hyps[len(hy):]
+            # the refined transforms ARE the per-part 6-DoF poses; keep them so
+            # they can be scored against ground truth once groups are known
+            # keep each refined hypothesis together with WHICH gaussians it
+            # explains, so a part can later pick its own pose per frame instead
+            # of trusting a slot index whose meaning changes every frame
+            Pm = assign.soft_membership(
+                assign.residuals(hy, K, H, W, dep, obs_mask=om))
+            pose_log.append({
+                "frame": int(i),
+                "T": [np.asarray(T) for T in hy],
+                "P": Pm.detach().cpu().numpy(),
+            })
+            if args.grow_every > 0 and n % args.grow_every == 0 and n > 0:
+                added = assign.grow(rgb, dep, K, om, hy, hy[0],
+                                    tol=args.grow_tol, stride=args.gauss_stride)
+                st["grown"] = int(added)
         else:
             st = assign.step(hyps[:args.max_hyp], K, H, W, dep, rgb, obs_mask=om)
         st["n_hypotheses"] = int(n_real)
@@ -428,8 +465,217 @@ def main():
               f"purity {100*pur:5.1f}%")
     print(f"[g] GT parts covered {len(covered)}/{len(parts)} {sorted(covered)}   "
           f"groups {len(rows)}")
+
+    # ---- per-part 6-DoF tracking pass ----
+    # Reading a pose out of hypothesis slot h is meaningless: the slot means a
+    # different motion every frame, which is why the pose error was excellent at
+    # the median and catastrophic at p90. Once the groups are known, each part is
+    # tracked in its own right -- its membership is fixed, and its pose is
+    # refined frame to frame, warm-started from the previous estimate.
+    # sparse tracks are needed again for per-part hypotheses, so keep them
+    part_tracks = {}
+    if rows:
+        import torch as _T
+        lab_full = lab if not args.coassoc else None
+        for row in rows:
+            h = row["hypothesis"]
+            if args.coassoc:
+                w = np.zeros(len(cloud), dtype=np.float32)
+                w[sub[lab == h]] = 1.0
+            else:
+                w = (lab == h).astype(np.float32)
+            if w.sum() < 20:
+                continue
+            # For each frame take the hypothesis that best explains THIS group --
+            # that is the coarse initialisation the sparse side is good at -- then
+            # refine it densely. Tracking from identity instead failed outright on
+            # the moving parts (330 mm error) because projective association from
+            # a stale pose lands on the wrong surface.
+            # which sparse tracks sit on this part? nearest-gaussian lookup in
+            # the anchor frame, so the part gets its own hypothesis generator
+            part_track_idx = None
+            gm = cloud.means.detach().cpu().numpy()
+            mem = gm[w > 0.5]
+            if mem.shape[0] >= 10 and anchor_xyz.shape[0] > 0:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(mem)
+                dist, _ = tree.query(anchor_xyz, k=1)
+                thr = max(0.01, float(np.percentile(dist, 20)) * 2.0)
+                part_track_idx = np.where(dist < thr)[0]
+
+            track = []
+            T_prev = None
+            for rec in pose_log:
+                Pm = rec["P"]
+                if Pm.shape[1] != w.shape[0]:
+                    continue
+                score = (Pm * w[None, :]).sum(axis=1)
+                k = int(np.argmax(score))
+                T0 = rec["T"][k] if score[k] > 0 else (
+                    T_prev if T_prev is not None else np.eye(4))
+                dep_i = r.get_depth(rec["frame"])
+                om_i = object_mask(rec["frame"])
+                if om_i is None:
+                    continue
+                # Refine from BOTH the previous pose and the hypothesis, and keep
+                # whichever ends up explaining the surface better. Incremental
+                # tracking alone diverged late in the sequence (331 mm on the last
+                # third of scissors) once the part had moved far from its anchor;
+                # the hypothesis alone is coarse. Either can rescue the other.
+                cands = [T0]
+                if T_prev is not None:
+                    cands.append(T_prev)
+                # A hypothesis fitted to THIS part's own tracks. The global
+                # hypotheses are dominated by the biggest surface, so a small
+                # thin part undergoing a large rotation never gets a good
+                # initialisation from them -- which is exactly where tracking
+                # still diverged (scissors blade, eyeglasses temple).
+                if part_track_idx is not None and part_track_idx.size >= 6:
+                    th = track_hist.get(int(rec["frame"]))
+                    if th is not None:
+                        cu, cok, cvi = th
+                        sel_t = part_track_idx[
+                            anchor_ok[part_track_idx] & cok[part_track_idx]
+                            & cvi[part_track_idx]]
+                        if sel_t.size >= 6:
+                            rem = np.ones(sel_t.size, bool)
+                            c = reg._RANSAC(p0=anchor_xyz[sel_t],
+                                            tgt_pcd=cu[sel_t], w=None,
+                                            remaining=rem, init_pose=None)
+                            if c is not None:
+                                cands.append(c["T"])
+                best_T, best_e = None, float("inf")
+                for Tc in cands:
+                    Tr = assign.refine_pose(Tc, w, K, H, W, dep_i, iters=8,
+                                            obs_mask=om_i)
+                    e = assign.fit_error(Tr, w, K, H, W, dep_i, obs_mask=om_i)
+                    if e < best_e:
+                        best_T, best_e = Tr, e
+                T = best_T if best_T is not None else np.eye(4)
+                T_prev = T
+                track.append((int(rec["frame"]), T.copy()))
+            part_tracks[row["dominant_gt"]] = track
+
+        print("[g] per-part 6-DoF tracking (fixed membership, warm-started):")
+        for gtp, track in part_tracks.items():
+            te, re_ = [], []
+            for (i, T) in track:
+                Tgt = r.get_gt_pose(i, gtp) @ np.linalg.inv(T_anchor_gt[gtp])
+                E = np.linalg.inv(Tgt) @ T
+                te.append(float(np.linalg.norm(E[:3, 3])))
+                re_.append(float(np.degrees(
+                    np.linalg.norm(_R.from_matrix(E[:3, :3]).as_rotvec()))))
+            te, re_ = np.array(te), np.array(re_)
+            fr = np.array([i for (i, _) in track])
+            # where in the sequence does it break? A part cannot be tracked before
+            # it has moved enough to be distinguishable, so the early frames are
+            # reported separately rather than folded into one number.
+            n3 = max(1, len(te) // 3)
+            seg = [(f"first {n3}", te[:n3], re_[:n3]),
+                   (f"middle", te[n3:2*n3], re_[n3:2*n3]),
+                   (f"last {len(te)-2*n3}", te[2*n3:], re_[2*n3:])]
+            print(f"   {gtp:8s}: median {1000*np.median(te):6.1f} mm {np.median(re_):5.2f} deg"
+                  f"   p90 {1000*np.percentile(te,90):6.1f} mm {np.percentile(re_,90):5.2f} deg")
+            for nm_, t_, r_ in seg:
+                if t_.size:
+                    print(f"       {nm_:10s} median {1000*np.median(t_):6.1f} mm "
+                          f"{np.median(r_):5.2f} deg   worst {1000*t_.max():6.1f} mm")
+            for row in rows:
+                if row["dominant_gt"] == gtp:
+                    row["track_trans_mm"] = float(np.median(te) * 1000)
+                    row["track_rot_deg"] = float(np.median(re_))
+
+    # ---- pose read straight off the hypothesis slots, for comparison ----
+    if pose_log and rows and False:
+        print("[g] per-part pose error against ground truth:")
+        for row in rows:
+            h = row["hypothesis"]
+            gtp = row["dominant_gt"]
+            te, re_ = [], []
+            for rec in pose_log:
+                if h >= len(rec["T"]):
+                    continue
+                Test = np.asarray(rec["T"][h])
+                Tgt = r.get_gt_pose(rec["frame"], gtp) @ np.linalg.inv(T_anchor_gt[gtp])
+                E = np.linalg.inv(Tgt) @ Test
+                te.append(float(np.linalg.norm(E[:3, 3])))
+                re_.append(float(np.degrees(
+                    np.linalg.norm(_R.from_matrix(E[:3, :3]).as_rotvec()))))
+            if te:
+                te, re_ = np.array(te), np.array(re_)
+                row["trans_err_mm"] = float(np.median(te) * 1000)
+                row["rot_err_deg"] = float(np.median(re_))
+                print(f"   {gtp:8s} (hyp {h}): median {1000*np.median(te):6.1f} mm  "
+                      f"{np.median(re_):5.2f} deg   "
+                      f"p90 {1000*np.percentile(te,90):6.1f} mm "
+                      f"{np.percentile(re_,90):5.2f} deg")
     if rows:
         print(f"[g] mean purity {100*np.mean([x['purity'] for x in rows]):.1f}%")
+    # ---- demo video: dense part model + oriented box + pose axes per part ----
+    if part_tracks:
+        from experiments.articulated.demo_part_discovery import fit_oriented_box
+        from point2pose.utils.visualization import draw_oriented_3d_box
+        gm = cloud.means.detach().cpu().numpy()
+        boxes, members = {}, {}
+        for row in rows:
+            h = row["hypothesis"]; gtp = row["dominant_gt"]
+            if args.coassoc:
+                w = np.zeros(len(cloud), bool); w[sub[lab == h]] = True
+            else:
+                w = (lab == h)
+            members[gtp] = w
+            try:
+                boxes[gtp] = fit_oriented_box(gm[w])
+            except Exception:
+                boxes[gtp] = None
+        pose_at = {g: dict(t) for g, t in part_tracks.items()}
+
+        dw = None
+        demo_path = os.path.splitext(args.out)[0] + "_demo.mp4"
+        for i in frames:
+            im = cv2.cvtColor(r.get_color(i), cv2.COLOR_RGB2BGR).copy()
+            for k, (gtp, w) in enumerate(members.items()):
+                T = pose_at.get(gtp, {}).get(int(i))
+                if T is None:
+                    continue
+                col = tuple(int(x) for x in PAL[k % len(PAL)])
+                q = gm[w] @ np.asarray(T)[:3, :3].T + np.asarray(T)[:3, 3]
+                ok = q[:, 2] > 1e-3
+                u = (q[ok, 0] * K[0, 0] / q[ok, 2] + K[0, 2]).astype(int)
+                v = (q[ok, 1] * K[1, 1] / q[ok, 2] + K[1, 2]).astype(int)
+                for uu, vv in zip(u, v):
+                    if 0 <= uu < W and 0 <= vv < H:
+                        cv2.circle(im, (uu, vv), 1, col, -1)
+                if boxes.get(gtp) is not None:
+                    try:
+                        im = draw_oriented_3d_box(K, im, np.asarray(T), boxes[gtp],
+                                                  line_color=col, linewidth=2)
+                    except Exception:
+                        pass
+                # pose axes at the part centroid
+                c = gm[w].mean(0)
+                org = np.asarray(T)[:3, :3] @ c + np.asarray(T)[:3, 3]
+                for ax, acol in zip(np.eye(3) * 0.05,
+                                    [(60, 60, 235), (60, 220, 60), (235, 160, 60)]):
+                    tip = np.asarray(T)[:3, :3] @ (c + ax) + np.asarray(T)[:3, 3]
+                    if org[2] > 1e-3 and tip[2] > 1e-3:
+                        p0 = (int(org[0]*K[0,0]/org[2]+K[0,2]), int(org[1]*K[1,1]/org[2]+K[1,2]))
+                        p1 = (int(tip[0]*K[0,0]/tip[2]+K[0,2]), int(tip[1]*K[1,1]/tip[2]+K[1,2]))
+                        cv2.arrowedLine(im, p0, p1, acol, 2, cv2.LINE_AA, tipLength=0.3)
+            bar = np.full((30, W, 3), (26, 22, 18), np.uint8)
+            cv2.putText(bar, f"frame {i:4d}   {len(members)} parts tracked   "
+                             f"dense model + 6-DoF pose",
+                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (235, 235, 235), 1,
+                        cv2.LINE_AA)
+            canvas = np.vstack([im, bar])
+            if dw is None:
+                dw = cv2.VideoWriter(demo_path, cv2.VideoWriter_fourcc(*"mp4v"), 15,
+                                     (canvas.shape[1], canvas.shape[0]))
+            dw.write(canvas)
+        if dw:
+            dw.release()
+            print(f"[g] wrote {demo_path}")
+
     json.dump({"sequence": os.path.basename(args.seq_dir), "gt_parts": parts,
                "groups": rows, "covered": sorted(covered),
                "history": hist},
