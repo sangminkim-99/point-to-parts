@@ -112,6 +112,12 @@ class GaussianPartAssignment:
         self._slot_members = [None] * n_hypotheses
         self.n_slots = n_hypotheses
         self.coassoc_weight = "none"
+        # ceiling on a winner set, as a fraction of the cloud. 0.5 assumes at
+        # least three parts: for a TWO-part object one part legitimately covers
+        # about half the cloud, and a 0.5 ceiling throws away exactly the sets
+        # that matter. Measured on RBO pliers, where the median recorded set is
+        # 38.9% of the cloud against ~2% on a three-drawer cabinet.
+        self.winset_max_frac = 0.5
 
     def _residual(self, T, K, H, W, obs_depth, obs_rgb):
         rgb, depth, alpha = self.cloud.render(T, K, H, W)
@@ -241,7 +247,7 @@ class GaussianPartAssignment:
         if getattr(self, "co_idx", None) is not None:
             self.accumulate_coassoc_soft(R, bestval < 1e5,
                                          weight_mode=self.coassoc_weight)
-        self.record_winsets(wins)
+        self.record_winsets(wins, max_frac=self.winset_max_frac)
         self.last_wins = [w.detach().cpu().numpy() for w in wins]
         self.last_slots = list(slot_of)
         return {
@@ -713,7 +719,8 @@ class GaussianPartAssignment:
     # ------------------------------------------------------------------ #
     #  Grouping by recurring winner sets
     # ------------------------------------------------------------------ #
-    def record_winsets(self, wins, min_group=100, max_frac=0.5):
+    def record_winsets(self, wins, min_group=None, max_frac=0.5,
+                       min_frac=0.02, min_abs=25):
         """Keep every decisive winner set that is substantial but not the whole
         object.
 
@@ -732,6 +739,14 @@ class GaussianPartAssignment:
         if not hasattr(self, "winsets"):
             self.winsets = []
         n = len(self.cloud)
+        # The floor has to scale with the cloud, not be an absolute count. At a
+        # fixed 100 gaussians the admissible window is 0.6-50% of a 17k-gaussian
+        # RBO cabinet but 15-50% of a 648-gaussian pair of pliers -- nearly shut.
+        # Measured: on the five RBO pliers sequences winner-set grouping was
+        # never once selected, while on the folding rules (1.3k-2k gaussians) it
+        # won every sequence it solved.
+        if min_group is None:
+            min_group = max(min_abs, int(min_frac * n))
         for w in wins:
             c = int(w.sum())
             if c < min_group or c > max_frac * n:
@@ -739,12 +754,14 @@ class GaussianPartAssignment:
             self.winsets.append(
                 torch.where(w)[0].detach().cpu().numpy().astype(np.int32))
 
-    def winset_labels(self, min_members=3, thresh=0.5, min_group=100,
-                      core_frac=0.5):
+    def winset_labels(self, min_members=3, thresh=0.5, min_group=None,
+                      core_frac=0.5, min_frac=0.02, min_abs=25):
         """Cluster the recorded winner sets by Jaccard overlap; each cluster's
         core is a part. Returns (labels over all gaussians, indices kept)."""
         sets = getattr(self, "winsets", [])
         n = len(self.cloud)
+        if min_group is None:
+            min_group = max(min_abs, int(min_frac * n))
         if len(sets) < 2 * min_members:
             return np.full(n, -1, dtype=int), np.arange(n)
         M = np.zeros((len(sets), n), dtype=bool)

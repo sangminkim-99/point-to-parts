@@ -81,7 +81,11 @@ def main():
     ap.add_argument("--out", default="debug/multi-parts/runs/gauss/out.mp4")
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--n-points", type=int, default=400)
-    ap.add_argument("--gauss-stride", type=int, default=2)
+    ap.add_argument("--gauss-stride", type=int, default=0,
+                    help="depth subsampling stride for the gaussian cloud. "
+                         "0 picks it automatically from --gauss-target.")
+    ap.add_argument("--gauss-target", type=int, default=3000,
+                    help="gaussians the automatic stride aims for")
     ap.add_argument("--inlier-thres", type=float, default=0.008)
     ap.add_argument("--max-hyp", type=int, default=4)
     ap.add_argument("--hyp-mode", choices=["baselines", "window"], default="window",
@@ -146,6 +150,10 @@ def main():
                          "sets, and let the GT-free score choose")
     ap.add_argument("--winset-min-members", type=int, default=3)
     ap.add_argument("--winset-thresh", type=float, default=0.5)
+    ap.add_argument("--winset-max-frac", type=float, default=0.5,
+                    help="largest winner set kept, as a fraction of the cloud")
+    ap.add_argument("--winset-min-frac", type=float, default=0.02,
+                    help="smallest winner set kept, as a fraction of the cloud")
     ap.add_argument("--coassoc-weight", choices=["none", "decisive", "disagree"],
                     default="none",
                     help="weight each frame's co-association evidence by how far "
@@ -227,11 +235,29 @@ def main():
     if obj0 is None or obj0.sum() < 200:
         raise SystemExit("no usable object mask on the anchor frame")
 
+    # Choose the sampling stride from how many gaussians the object actually
+    # yields, not from a fixed number. A stride tuned on a 17k-gaussian RBO
+    # cabinet leaves a pair of pliers with 648: too sparse for anything to be
+    # decisively assigned, and the grouping then labels 14% of the object.
+    # Measured: dropping the stride to 1 on the five RBO pliers sequences took
+    # coverage from 1.4/2 to 1.8/2. The stride is a density knob, so set it by
+    # density.
+    if args.gauss_stride <= 0:
+        gs = 4
+        while gs > 1:
+            n_est = int((obj0[::gs, ::gs] > 0).sum())
+            if n_est >= args.gauss_target:
+                break
+            gs -= 1
+        args.gauss_stride = gs
+        print(f"[g] gaussian stride {gs} (target {args.gauss_target}, "
+              f"object is {int((obj0 > 0).sum())} px)")
     cloud = GaussianCloud.from_depth(rgb0, d0, K, obj0, stride=args.gauss_stride)
     assign = GaussianPartAssignment(cloud, args.max_hyp,
                                     depth_sigma=args.depth_sigma,
                                     color_weight=args.color_weight)
     assign.coassoc_weight = args.coassoc_weight
+    assign.winset_max_frac = args.winset_max_frac
     if args.coassoc:
         assign.init_coassoc(args.co_sample)
     print(f"[g] {len(cloud)} gaussians, GT parts {parts}, {len(frames)} frames")
@@ -592,9 +618,18 @@ def main():
         full[sub_co] = lab_co
         cand.append(("coassoc", lab_co, sub_co) + (grouping_score(full),))
     if args.winsets:
+        _ws = getattr(assign, "winsets", [])
+        if _ws:
+            _sz = np.array([len(x) for x in _ws])
+            print(f"[g] winner sets recorded: {len(_ws)} over {len(hist)} frames "
+                  f"({len(_ws)/max(len(hist),1):.2f}/frame), size median "
+                  f"{int(np.median(_sz))} of {len(cloud)} "
+                  f"({100*np.median(_sz)/len(cloud):.1f}%)")
+        else:
+            print(f"[g] winner sets recorded: NONE over {len(hist)} frames")
         lab_ws, sub_ws = assign.winset_labels(min_members=args.winset_min_members,
                                               thresh=args.winset_thresh,
-                                              min_group=args.min_group)
+                                              min_frac=args.winset_min_frac)
         if (lab_ws >= 0).any():
             cand.append(("winsets", lab_ws, sub_ws) + (grouping_score(lab_ws),))
     def merge_rigid_groups(labels_full, tol=0.012):
