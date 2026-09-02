@@ -131,12 +131,13 @@ def main():
                          "and part count break the tie. At 2 a harmful merge ties "
                          "with the grouping it damages and wins on fewer parts, "
                          "costing RBO cabinet02 a drawer.")
-    ap.add_argument("--merge-eps", type=float, default=0.0,
-                    help="how much score a merged grouping may give up and still "
-                         "be preferred over the over-segmented one. Zero: at 0.03 "
-                         "the merge cost a whole part on RBO cabinet02 (3/3 at "
-                         "85.9%% became 2/3 at 73.4%%) by absorbing a real drawer. "
-                         "An exact tie is still taken, via the sort tie-break.")
+    ap.add_argument("--merge-eps", type=float, default=0.002,
+                    help="how much split ratio a merged grouping may give up and "
+                         "still be preferred. The window is narrow and measured: "
+                         "collapsing the simulated pliers from 5 groups to 2 costs "
+                         "0.001, while the merge that absorbs a real RBO drawer "
+                         "(cabinet02, 3/3 at 85.9%% -> 2/3 at 73.4%%) costs 0.004. "
+                         "At 0.03 the harmful merge wins.")
     ap.add_argument("--merge-tol", type=float, default=0.012,
                     help="median point displacement below which two groups are "
                          "treated as one rigid body, metres")
@@ -705,7 +706,8 @@ def main():
     best_name = cand[0][0]
     if not best_name.endswith("+merge"):
         for e in cand[1:]:
-            if e[0] == best_name + "+merge" and combined(e) >= combined(cand[0]):
+            if e[0] == best_name + "+merge" and \
+                    combined(e)[0] >= combined(cand[0])[0] - args.merge_eps:
                 print("[g] taking the merged variant (same score, fewer parts)")
                 cand = [e] + [c for c in cand if c is not e]
                 break
