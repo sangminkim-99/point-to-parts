@@ -9,6 +9,7 @@ axes and joint axis.
     Left click   add a positive point
     Right click  add a negative point
     s            start
+    h            toggle the per-hypothesis residual strip
     r            reset
     q            quit
 
@@ -52,6 +53,7 @@ class RealSenseMultiPart:
         self.stream = None
         self.sam = None
         self.times = []
+        self.show_hyp = True
 
         cv2.startWindowThread()
         cv2.namedWindow("multi-part", cv2.WINDOW_AUTOSIZE)
@@ -177,6 +179,14 @@ class RealSenseMultiPart:
                         self.stream.step(rgb, depth, mask)
                         self.times.append(self.stream.last_timings["total_ms"])
                         disp = self.stream.render(disp)
+                        if self.show_hyp:
+                            panel = self.stream.hypothesis_panel(
+                                depth, mask, width=disp.shape[1] // 4)
+                            if panel is not None:
+                                pad = np.full(
+                                    (panel.shape[0], disp.shape[1] - panel.shape[1], 3),
+                                    (32, 30, 28), np.uint8)
+                                disp = np.vstack([disp, np.hstack([panel, pad])])
 
                     fps = 1000.0 / max(np.median(self.times[-30:]), 1e-6) if self.times else 0
                     t = self.stream.last_timings
@@ -196,6 +206,8 @@ class RealSenseMultiPart:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
+                if key == ord("h"):
+                    self.show_hyp = not self.show_hyp
                 if key == ord("r"):
                     self.points, self.labels = [], []
                     self.started = False

@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 
 from point2pose.pipeline.components.gaussian_part_assignment import (
     GaussianCloud,
@@ -306,6 +307,8 @@ class StreamingPartDiscovery:
 
         # the whole object still reads as one body: show the dominant motion
         self.whole_pose = np.asarray(hy[int(Pm.sum(dim=1).argmax())])
+        self.last_hyp_set = list(hy)
+        self.last_share = (Pm.sum(dim=1) / max(float(Pm.sum()), 1e-6)).cpu().numpy()
 
         if (i >= cfg.min_frames_before_split
                 and i % cfg.regroup_every == 0):
@@ -472,7 +475,11 @@ class StreamingPartDiscovery:
                if p.pose is not None else None for p in self.parts]
 
         R = a.residuals(hyps, self.K, H, W, depth, obs_mask=mask)
-        Pm = a.soft_membership(R).detach().cpu().numpy()
+        Pm_t = a.soft_membership(R)
+        Pm = Pm_t.detach().cpu().numpy()
+        self.last_hyp_set = list(hyps)
+        self.last_share = (Pm_t.sum(dim=1)
+                           / max(float(Pm_t.sum()), 1e-6)).cpu().numpy()
 
         for j, part in enumerate(self.parts):
             w = part.weights
@@ -703,6 +710,43 @@ class StreamingPartDiscovery:
         if show_tracks:
             self._draw_tracks(out, self.parts, pal)
         return out
+
+    def hypothesis_panel(self, depth, mask=None, width=200, r_max=0.05):
+        """One thumbnail per hypothesis: where its render disagrees with the depth.
+
+        This is the method's actual question made visible -- blue is surface the
+        hypothesis explains, red is surface it does not.
+        """
+        import cv2
+
+        hs = getattr(self, "last_hyp_set", None)
+        if not hs:
+            return None
+        share = getattr(self, "last_share", np.zeros(len(hs)))
+        obs = torch.as_tensor(depth, dtype=torch.float32,
+                              device=self.assign.device)
+        mk = (torch.as_tensor(mask > 0, device=obs.device)
+              if mask is not None else torch.ones_like(obs, dtype=torch.bool))
+        tiles, seen = [], []
+        for k, T in enumerate(hs):
+            if any(np.allclose(T, U, atol=1e-6) for U in seen):
+                continue
+            seen.append(np.asarray(T))
+            _, dep_r, alpha = self.cloud.render(T, self.K, depth.shape[0],
+                                                depth.shape[1])
+            vis = (alpha > 0.3) & (obs > 0) & mk
+            res = (dep_r - obs).abs().clamp(max=r_max) / r_max
+            img = torch.where(vis, res, torch.ones_like(res)).cpu().numpy()
+            g = cv2.applyColorMap((img * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+            g[~vis.cpu().numpy()] = (32, 30, 28)
+            h = int(g.shape[0] * width / g.shape[1])
+            g = cv2.resize(g, (width, h))
+            cv2.putText(g, f"h{k}  {100*share[k]:.0f}%", (6, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+            tiles.append(g)
+        if not tiles:
+            return None
+        return np.hstack(tiles)
 
     def _draw_tracks(self, out, parts, pal):
         """The sparse point tracks, coloured by the part they belong to.

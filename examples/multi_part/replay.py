@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--co-sample", type=int, default=None)
     ap.add_argument("--min-inliers", type=int, default=None)
     ap.add_argument("--pips-iter", type=int, default=None)
+    ap.add_argument("--hyp-panel", type=int, default=1,
+                    help="strip of per-hypothesis render-vs-depth residuals")
     ap.add_argument("--min-frames", type=int, default=None)
     ap.add_argument("--regroup-every", type=int, default=None)
     ap.add_argument("--checkpoint",
@@ -104,6 +106,12 @@ def main():
             breakdown.setdefault(k, []).append(v)
 
         vis = s.render(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy())
+        if args.hyp_panel:
+            panel = s.hypothesis_panel(dep, m, width=vis.shape[1] // 4)
+            if panel is not None:
+                pad = np.full((panel.shape[0], vis.shape[1] - panel.shape[1], 3),
+                              (32, 30, 28), np.uint8)
+                vis = np.vstack([vis, np.hstack([panel, pad])])
         bar = np.full((30, vis.shape[1], 3), (28, 24, 20), np.uint8)
         fps = 1000.0 / max(np.median(times[-30:]), 1e-6)
         label = (f"{s.state}  parts {len(s.parts)}  "

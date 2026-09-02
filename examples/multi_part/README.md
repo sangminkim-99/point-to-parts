@@ -18,7 +18,7 @@ Live:
 
 ```bash
 python -m examples.multi_part.realsense_multipart --n-points 224
-# left click the object, 's' to start, 'r' to reset, 'q' to quit
+# left click the object, 's' start, 'h' hypothesis strip, 'r' reset, 'q' quit
 ```
 
 On a recorded sequence, which is also how the numbers below were measured:
@@ -68,6 +68,15 @@ the sparse tracks are **not** only used before the split: after it, each part fi
 its own RANSAC hypothesis from the tracks that sit on it, which is what a thin,
 fast-rotating part depends on — offline, removing it is where the scissors blade
 and the eyeglasses temple diverged.
+
+## The hypothesis strip
+
+Pressing `h` shows one thumbnail per distinct motion hypothesis: its gaussians
+rasterised at that pose, coloured by how far the render lands from the observed
+depth. Blue is surface the hypothesis explains, red is surface it does not, and
+the percentage is its share of the posterior. This is the method's question made
+visible &mdash; a part separates exactly when one hypothesis goes blue over it and
+the others go red.
 
 ## TAPIR refinement iterations
 
