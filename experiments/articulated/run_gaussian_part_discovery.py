@@ -120,6 +120,12 @@ def main():
                     help="cluster a co-association matrix instead of carrying "
                          "hypothesis slots across frames")
     ap.add_argument("--no-coassoc", dest="coassoc", action="store_false")
+    ap.add_argument("--merge-rigid", type=int, default=1,
+                    help="also offer a grouping in which groups that never move "
+                         "relative to each other are merged")
+    ap.add_argument("--merge-tol", type=float, default=0.012,
+                    help="median point displacement below which two groups are "
+                         "treated as one rigid body, metres")
     ap.add_argument("--winsets", type=int, default=1,
                     help="also group by clustering the recurring decisive winner "
                          "sets, and let the GT-free score choose")
@@ -568,6 +574,82 @@ def main():
                                               min_group=args.min_group)
         if (lab_ws >= 0).any():
             cand.append(("winsets", lab_ws, sub_ws, grouping_score(lab_ws)))
+    def merge_rigid_groups(labels_full, tol=0.012):
+        """Merge groups that never move relative to each other.
+
+        Clustering recurring winner sets recovers all three RBO drawers but cuts
+        the object into more pieces than there are parts (6 groups for 3 on
+        cabinet01) -- a surface can win under two hypotheses that mean the same
+        motion. Two groups are the same rigid body exactly when the transforms
+        that best explain them move their points identically, which is a
+        ground-truth-free test on quantities already computed.
+        """
+        gs = sorted(g for g in set(labels_full.tolist()) if g >= 0)
+        if len(gs) < 2 or not pose_log:
+            return labels_full
+        gmeans = cloud.means.detach().cpu().numpy()
+        pts = {}
+        for g in gs:
+            m = np.where(labels_full == g)[0]
+            if m.size > 400:
+                m = m[np.linspace(0, m.size - 1, 400).astype(int)]
+            pts[g] = gmeans[m]
+        seq = {g: [] for g in gs}
+        for rec in pose_log[::2]:
+            P, Ts = rec["P"], rec["T"]
+            if P.shape[1] != labels_full.shape[0]:
+                continue
+            for g in gs:
+                m = labels_full == g
+                if m.sum() < 10:
+                    seq[g].append(None)
+                    continue
+                seq[g].append(np.asarray(Ts[int(np.argmax(P[:, m].sum(axis=1)))]))
+        parent = {g: g for g in gs}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i, a_ in enumerate(gs):
+            for b_ in gs[i + 1:]:
+                X = np.concatenate([pts[a_], pts[b_]], 0)
+                d = []
+                for Ta, Tb in zip(seq[a_], seq[b_]):
+                    if Ta is None or Tb is None:
+                        continue
+                    pa = X @ Ta[:3, :3].T + Ta[:3, 3]
+                    pb = X @ Tb[:3, :3].T + Tb[:3, 3]
+                    d.append(float(np.linalg.norm(pa - pb, axis=1).mean()))
+                if d and float(np.median(d)) < tol:
+                    ra, rb = find(a_), find(b_)
+                    if ra != rb:
+                        parent[rb] = ra
+        remap, nxt = {}, 0
+        out = np.full_like(labels_full, -1)
+        for g in gs:
+            r = find(g)
+            if r not in remap:
+                remap[r] = nxt
+                nxt += 1
+            out[labels_full == g] = remap[r]
+        if nxt < len(gs):
+            print(f"[g] merged {len(gs)} groups into {nxt} "
+                  f"(groups moving identically are one body)")
+        return out
+
+    if args.merge_rigid:
+        merged = []
+        for nm, lb, sb, sc in cand:
+            full = np.full(len(cloud), -1, dtype=int)
+            full[sb] = lb
+            mf = merge_rigid_groups(full, tol=args.merge_tol)
+            if (mf >= 0).any() and len(set(mf[mf >= 0].tolist())) < \
+                    len(set(full[full >= 0].tolist())):
+                merged.append((nm + "+merge", mf[sb], sb, grouping_score(mf)))
+        cand.extend(merged)
     cand.sort(key=lambda x: -x[3])
     print("[g] grouping selection: " +
           "  ".join(f"{n}={sc:.3f}" for n, _, _, sc in cand))
