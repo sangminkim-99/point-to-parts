@@ -331,6 +331,92 @@ class GaussianPartAssignment:
             return float("inf")
         return float(R[ok].median())
 
+    def fit_energy(self, T, weights, K, H, W, obs_depth, obs_mask=None,
+                   r_max=0.05, obs_rgb=None, color_w=0.0):
+        """Truncated residual energy over ALL of a part's gaussians.
+
+        `fit_error` is a median over the gaussians that happened to land on
+        valid depth, so a pose that slides most of the part off the observed
+        surface and parks a sliver of it on a neighbouring part scores
+        beautifully. That is exactly how the laptop lid -- correctly segmented
+        at 94% -- ended up 800 mm and 80 deg away: the candidate that abandoned
+        the part won the comparison. Counting a miss as a full `r_max` makes
+        losing support as expensive as fitting badly.
+
+        `color_w` adds the gaussians' own colour against the observed pixel.
+        Depth alone cannot orient a flat part: a laptop lid is a slab, and every
+        in-plane rotation of it fits the depth equally well, which is why the
+        translation came out within 30 mm while the rotation stayed 8-25 deg off.
+        """
+        e = self.fit_energy_batch([T], weights, K, H, W, obs_depth,
+                                  obs_mask=obs_mask, r_max=r_max,
+                                  obs_rgb=obs_rgb, color_w=color_w)
+        return float(e[0])
+
+    def fit_energy_batch(self, Ts, weights, K, H, W, obs_depth, obs_mask=None,
+                         r_max=0.05, chunk=64, obs_rgb=None, color_w=0.0):
+        """`fit_energy` for many poses at once, over a part's members only.
+
+        A joint reduces the pose to a scalar, and a scalar can be scanned
+        exhaustively -- but only if scoring a sample is cheap. Restricting to the
+        part's own gaussians and batching over poses makes a 120-sample sweep of
+        the whole joint range cost about as much as a handful of ICP starts.
+        """
+        Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
+        obs = torch.as_tensor(obs_depth, dtype=torch.float32, device=self.device)
+        if obs_mask is not None:
+            mk = torch.as_tensor(obs_mask > 0, device=self.device)
+            obs = torch.where(mk, obs, torch.zeros_like(obs))
+        w = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+        sel = w[:len(self.cloud)] > 0.05
+        if int(sel.sum()) < 10:
+            return np.full(len(Ts), float("inf"))
+        P = self.cloud.means[sel]
+        C = self.cloud.colors[sel] if color_w > 0 else None
+        rgbt = None
+        if color_w > 0 and obs_rgb is not None:
+            rgbt = torch.as_tensor(obs_rgb, dtype=torch.float32,
+                                   device=self.device) / 255.0
+        out = []
+        for i in range(0, len(Ts), chunk):
+            Tb = torch.as_tensor(np.stack([np.asarray(t) for t in Ts[i:i + chunk]]),
+                                 dtype=torch.float32, device=self.device)
+            p = torch.einsum("gij,nj->gni", Tb[:, :3, :3], P) + Tb[:, None, :3, 3]
+            z = p[..., 2]
+            u = (p[..., 0] * Kt[0, 0] / z + Kt[0, 2]).round().long()
+            v = (p[..., 1] * Kt[1, 1] / z + Kt[1, 2]).round().long()
+            ok = (z > 1e-3) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            uc, vc = u.clamp(0, W - 1), v.clamp(0, H - 1)
+            zo = obs[vc, uc]
+            r = torch.full_like(z, r_max)
+            g = ok & (zo > 0)
+            r[g] = torch.clamp(torch.abs(z[g] - zo[g]), max=r_max)
+            if rgbt is not None:
+                dc = torch.abs(rgbt[vc, uc] - C[None]).mean(-1)
+                r = r + color_w * r_max * torch.clamp(dc / 0.25, max=1.0) * g
+            out.append(r.mean(dim=1))
+        return torch.cat(out).cpu().numpy()
+
+    def occupancy(self, T, weights, K, H, W, dilate=1):
+        """Boolean image of the pixels a part covers under transform T."""
+        Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
+        Tt = torch.as_tensor(np.asarray(T), dtype=torch.float32, device=self.device)
+        w = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+        p = self.cloud.means @ Tt[:3, :3].T + Tt[:3, 3]
+        z = p[:, 2]
+        u = (p[:, 0] * Kt[0, 0] / z + Kt[0, 2]).round().long()
+        v = (p[:, 1] * Kt[1, 1] / z + Kt[1, 2]).round().long()
+        ok = (z > 1e-3) & (u >= 0) & (u < W) & (v >= 0) & (v < H) & (w > 0.05)
+        img = torch.zeros((H, W), dtype=torch.bool, device=self.device)
+        if int(ok.sum()) == 0:
+            return img.cpu().numpy()
+        img[v[ok], u[ok]] = True
+        if dilate > 0:
+            f = torch.nn.functional.max_pool2d(
+                img[None, None].float(), 2 * dilate + 1, stride=1, padding=dilate)
+            img = f[0, 0] > 0
+        return img.cpu().numpy()
+
     def soft_membership(self, R, tau=None):
         """Posterior over hypotheses per gaussian, (Hy, N)."""
         tau = self.depth_sigma if tau is None else tau
@@ -427,6 +513,130 @@ class GaussianPartAssignment:
             [self.logodds, torch.zeros((n_new, self.logodds.shape[1]),
                                        device=self.device)], 0)
         return n_new
+
+    def grow_parts(self, rgb, depth, K, mask, poses, weights, tol=0.02,
+                   stride=3, max_new=1500, max_total=300000, grow_ok=None):
+        """Attach newly revealed surface to the part it is adjacent to.
+
+        `grow` anchors new points through the *first* hypothesis, which is fine
+        for reporting unmodelled geometry but useless for tracking: a laptop lid
+        rotating 130 degrees turns its back face to the camera, and that face is
+        not in the model at all. The lid's own gaussians then sit roughly one lid
+        thickness behind the observed surface, so even the ground-truth pose only
+        reaches a residual of ~10 mm and projective ICP has nothing to lock onto.
+        Once the parts are known, an unexplained pixel can be given to the part it
+        borders in the image and anchored through that part's current pose, so the
+        model of each part fills in as the object articulates.
+
+        Returns (n_new, owner) with `owner` the part index of each new gaussian.
+        """
+        import cv2
+        H, W = depth.shape
+        if len(self.cloud) >= max_total:
+            return 0, None
+        Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
+        obs = torch.as_tensor(depth, dtype=torch.float32, device=self.device)
+        lab = torch.full((H, W), -1, dtype=torch.long, device=self.device)
+        res = torch.full((H, W), 1e9, dtype=torch.float32, device=self.device)
+        for k, (T, w) in enumerate(zip(poses, weights)):
+            if T is None:
+                continue
+            wt = torch.as_tensor(w, dtype=torch.float32, device=self.device)
+            sel = wt[:len(self.cloud)] > 0.5
+            if int(sel.sum()) < 10:
+                continue
+            Tt = torch.as_tensor(np.asarray(T), dtype=torch.float32, device=self.device)
+            p = self.cloud.means[sel] @ Tt[:3, :3].T + Tt[:3, 3]
+            z = p[:, 2]
+            u = (p[:, 0] * Kt[0, 0] / z + Kt[0, 2]).round().long()
+            v = (p[:, 1] * Kt[1, 1] / z + Kt[1, 2]).round().long()
+            ok = (z > 1e-3) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            if not ok.any():
+                continue
+            uu, vv, zz = u[ok], v[ok], z[ok]
+            zo = obs[vv, uu]
+            d = torch.abs(zz - zo)
+            hit = (zo > 0) & (d < tol)
+            uu, vv, d = uu[hit], vv[hit], d[hit]
+            better = d < res[vv, uu]
+            res[vv[better], uu[better]] = d[better]
+            lab[vv[better], uu[better]] = k
+
+        cov = (lab >= 0).cpu().numpy()
+        if not cov.any():
+            return 0, None
+        m = (torch.as_tensor(mask > 0, device=self.device) & (obs > 0)
+             & (lab < 0))
+        sel = torch.zeros_like(m)
+        sel[::stride, ::stride] = True
+        m = m & sel
+        n_new = int(m.sum())
+        if n_new == 0:
+            return 0, None
+
+        # nearest covered pixel decides which part a new surface joins: a face
+        # that has just come into view borders the part it belongs to
+        _, near = cv2.distanceTransformWithLabels(
+            (~cov).astype(np.uint8), cv2.DIST_L2, 3,
+            labelType=cv2.DIST_LABEL_PIXEL)
+        ys, xs = np.where(cov)
+        # DIST_LABEL_PIXEL numbers the zero pixels 1..n in raster order
+        order = np.argsort(ys * W + xs)
+        ys, xs = ys[order], xs[order]
+        labn = lab.cpu().numpy()
+
+        vs, us = torch.where(m)
+        if n_new > max_new:
+            pick = torch.randperm(n_new, device=self.device)[:max_new]
+            vs, us = vs[pick], us[pick]
+            n_new = max_new
+        vn, un = vs.cpu().numpy(), us.cpu().numpy()
+        li = near[vn, un] - 1
+        li = np.clip(li, 0, len(ys) - 1)
+        owner = labn[ys[li], xs[li]]
+
+        # Only parts whose pose is currently trusted may absorb new surface.
+        # Growing through a pose that has already slipped writes the error into
+        # the model permanently -- measured on the laptop lid, whose residual at
+        # the ground-truth pose doubled over the sequence when growth was
+        # ungated.
+        if grow_ok is not None:
+            keep = np.array([bool(grow_ok[o]) if 0 <= o < len(grow_ok) else False
+                             for o in owner])
+            if not keep.any():
+                return 0, None
+            owner = owner[keep]
+            kt = torch.as_tensor(keep, device=self.device)
+            vs, us = vs[kt], us[kt]
+            vn, un = vs.cpu().numpy(), us.cpu().numpy()
+            n_new = int(keep.sum())
+
+        z = obs[vs, us]
+        pc = torch.stack([(us.float() - Kt[0, 2]) * z / Kt[0, 0],
+                          (vs.float() - Kt[1, 2]) * z / Kt[1, 1], z], dim=1)
+        cols = torch.as_tensor(rgb[vn, un], dtype=torch.float32,
+                               device=self.device) / 255.0
+        foot = (z / float(Kt[0, 0])) * 1.2
+
+        pa = torch.zeros_like(pc)
+        for k, T in enumerate(poses):
+            if T is None:
+                continue
+            g = torch.as_tensor(owner == k, device=self.device)
+            if not g.any():
+                continue
+            Ta = torch.as_tensor(np.asarray(T), dtype=torch.float32,
+                                 device=self.device)
+            pa[g] = ((pc[g] - Ta[:3, 3]) @ Ta[:3, :3]).float()
+
+        c = self.cloud
+        c.means = torch.cat([c.means, pa], 0)
+        c.colors = torch.cat([c.colors, cols], 0)
+        c.scales = torch.cat([c.scales, foot[:, None].repeat(1, 3)], 0)
+        c.opacities = torch.cat([c.opacities, torch.ones(n_new, device=self.device)], 0)
+        q = torch.zeros((n_new, 4), device=self.device); q[:, 0] = 1.0
+        c.quats = torch.cat([c.quats, q], 0)
+        return n_new, owner
 
     def init_coassoc(self, n_sample=4000, seed=0):
         """Evidence accumulation: count how often each pair of gaussians is put in

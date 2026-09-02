@@ -39,6 +39,20 @@ PAL = np.array([[245, 135, 66], [60, 130, 214], [100, 190, 90],
                 [220, 100, 170], [230, 200, 80]], np.uint8)
 
 
+from point2pose.pipeline.components.joint_model import JointModel
+
+
+def _se3_pow(T, s):
+    """T raised to a real power, along its own screw axis."""
+    from scipy.linalg import logm, expm
+    if abs(s - 1.0) < 1e-9:
+        return np.asarray(T)
+    try:
+        return np.real(expm(np.real(logm(np.asarray(T, dtype=np.float64))) * s))
+    except Exception:
+        return np.asarray(T)
+
+
 def sample_points(mask, depth, n, border=4):
     m = cv2.erode(mask.astype(np.uint8), np.ones((border, border), np.uint8))
     ys, xs = np.where((m > 0) & (depth > 0.05))
@@ -123,6 +137,24 @@ def main():
                          "not a part, it is a stray assignment")
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
+    ap.add_argument("--track-grow", type=int, default=2,
+                    help="grow each part's dense model every N tracked frames")
+    ap.add_argument("--track-grow-tol", type=float, default=0.02)
+    ap.add_argument("--track-grow-max", type=int, default=1500)
+    ap.add_argument("--track-color", type=float, default=0.0,
+                    help="weight of the colour term in the tracking energy. Off: "
+                         "measured, it makes the laptop lid 25x worse (1125 mm vs "
+                         "44 mm). The lid's colours are its screen face, and once "
+                         "the back turns to the camera every colour disagrees, so "
+                         "the energy starts preferring poses that hide the part.")
+    ap.add_argument("--exclusive-mask", type=int, default=1)
+    ap.add_argument("--joint-tol", type=float, default=0.02,
+                    help="how far off the joint manifold a pose may be and still "
+                         "be used to refine the joint, metres")
+    ap.add_argument("--track-grow-gate", type=float, default=0.015,
+                    help="only grow a part whose tracking energy is below this")
+    ap.add_argument("--track-rmax", type=float, default=0.05,
+                    help="truncation of the per-part tracking energy, metres")
     args = ap.parse_args()
 
     r = open_sequence(args.seq_dir)
@@ -527,10 +559,16 @@ def main():
     # tracked in its own right -- its membership is fixed, and its pose is
     # refined frame to frame, warm-started from the previous estimate.
     # sparse tracks are needed again for per-part hypotheses, so keep them
-    part_tracks = {}
+    part_tracks, part_members, part_joints = {}, {}, {}
     if rows:
         import torch as _T
-        lab_full = lab if not args.coassoc else None
+        # Build every part's fixed membership first, then walk the sequence once
+        # with all parts together. Tracking them independently let two parts
+        # settle on the same surface: the laptop lid, segmented correctly at 94%,
+        # registered itself onto the base and came out 800 mm away. Parts are
+        # mutually exclusive in the image, so each one is refined against the
+        # object mask minus what the others already occupy.
+        infos = []
         for row in rows:
             h = row["hypothesis"]
             if args.coassoc:
@@ -540,11 +578,6 @@ def main():
                 w = (lab == h).astype(np.float32)
             if w.sum() < 20:
                 continue
-            # For each frame take the hypothesis that best explains THIS group --
-            # that is the coarse initialisation the sparse side is good at -- then
-            # refine it densely. Tracking from identity instead failed outright on
-            # the moving parts (330 mm error) because projective association from
-            # a stale pose lands on the wrong surface.
             # which sparse tracks sit on this part? nearest-gaussian lookup in
             # the anchor frame, so the part gets its own hypothesis generator
             part_track_idx = None
@@ -556,21 +589,52 @@ def main():
                 dist, _ = tree.query(anchor_xyz, k=1)
                 thr = max(0.01, float(np.percentile(dist, 20)) * 2.0)
                 part_track_idx = np.where(dist < thr)[0]
+            infos.append({"row": row, "w": w, "tidx": part_track_idx,
+                          "T_prev": None, "track": []})
+        # Parts are ordered biggest first and each is jointed to the biggest
+        # OTHER part. Making the largest part the sole parent is wrong: on the
+        # laptop the lid carries more gaussians than the base, so it became the
+        # reference and the part that actually needed constraining had no joint
+        # at all. A joint constrains a pair, and either end can be the reference.
+        infos.sort(key=lambda d: -float(d["w"].sum()))
+        for j, inf in enumerate(infos):
+            inf["parent"] = 1 if j == 0 else 0
+            inf["joint"] = JointModel() if len(infos) > 1 else None
+            inf["jv"] = []
 
-            track = []
-            T_prev = None
-            for rec in pose_log:
-                Pm = rec["P"]
-                if Pm.shape[1] != w.shape[0]:
-                    continue
-                score = (Pm * w[None, :]).sum(axis=1)
+        nrec, n_grown = 0, 0
+        for rec in pose_log:
+            dep_i = r.get_depth(rec["frame"])
+            om_i = object_mask(rec["frame"])
+            if om_i is None:
+                continue
+            om_b = om_i > 0
+            rgb_i = r.get_color(rec["frame"]) if args.track_color > 0 else None
+            occ = [assign.occupancy(inf["T_prev"], inf["w"], K, H, W, dilate=2)
+                   if inf["T_prev"] is not None else None for inf in infos]
+            Pm = rec["P"]
+            for j, inf in enumerate(infos):
+                w = inf["w"]
+                # the object mask minus the pixels the OTHER parts hold, keeping
+                # anything this part itself already covers
+                others = None
+                for k2, o in enumerate(occ):
+                    if k2 == j or o is None:
+                        continue
+                    others = o if others is None else (others | o)
+                om_j = om_i
+                if args.exclusive_mask and others is not None:
+                    if occ[j] is not None:
+                        others = others & (~occ[j])
+                    cand_m = om_b & (~others)
+                    if cand_m.sum() >= 200:
+                        om_j = cand_m.astype(np.uint8)
+
+                score = (Pm * w[None, :Pm.shape[1]]).sum(axis=1)
                 k = int(np.argmax(score))
+                T_prev = inf["T_prev"]
                 T0 = rec["T"][k] if score[k] > 0 else (
                     T_prev if T_prev is not None else np.eye(4))
-                dep_i = r.get_depth(rec["frame"])
-                om_i = object_mask(rec["frame"])
-                if om_i is None:
-                    continue
                 # Refine from BOTH the previous pose and the hypothesis, and keep
                 # whichever ends up explaining the surface better. Incremental
                 # tracking alone diverged late in the sequence (331 mm on the last
@@ -579,18 +643,59 @@ def main():
                 cands = [T0]
                 if T_prev is not None:
                     cands.append(T_prev)
+                    # constant velocity. A part swinging fast (the laptop lid
+                    # covers 130 deg) leaves the projective-ICP basin in one
+                    # step, and its own sparse tracks are gone by then because
+                    # the face they sit on has rotated away from the camera.
+                    dT = inf.get("dT")
+                    if dT is not None:
+                        # fractional powers of the last increment: the lid turns
+                        # at a near-constant rate, so the right pose lies on the
+                        # screw through dT, but not always at exactly one step
+                        for sfac in (0.5, 1.0, 1.5, 2.0):
+                            cands.append(_se3_pow(dT, sfac) @ T_prev)
+                # every hypothesis, not only the best-scoring one: once a part's
+                # tracks are lost its own membership score is meaningless, but
+                # another group's hypothesis may still carry the right motion
+                for Th in rec["T"]:
+                    cands.append(np.asarray(Th))
+                # ---- the joint turns a 6-DoF search into a scalar one ----
+                jm = inf["joint"]
+                Tp = infos[inf["parent"]]["T_prev"] if jm is not None else None
+                if jm is not None and jm.kind is not None and Tp is not None:
+                    vs_ = inf["jv"]
+                    span = max(max(vs_) - min(vs_), 1e-3)
+                    pred = vs_[-1] + (vs_[-1] - vs_[-2] if len(vs_) > 1 else 0.0)
+                    # A local sweep around the predicted value AND a scan of the
+                    # joint's whole physical range. Deriving the scan range from
+                    # the motion seen so far cannot work: the laptop lid is only
+                    # 15 degrees into a 130-degree swing when its joint is first
+                    # fitted, so a range-relative grid never reaches where the
+                    # part actually is once tracking slips.
+                    full = (np.linspace(-np.pi, np.pi, 121)
+                            if jm.kind == "revolute"
+                            else np.linspace(-0.6, 0.6, 121))
+                    grid = np.concatenate([
+                        pred + np.linspace(-1.0, 1.0, 41) * max(span, 0.1), full])
+                    Tg = [Tp @ jm.at(float(v)) for v in grid]
+                    eg = assign.fit_energy_batch(Tg, w, K, H, W, dep_i,
+                                                 obs_mask=om_j,
+                                                 r_max=args.track_rmax,
+                                                 obs_rgb=rgb_i,
+                                                 color_w=args.track_color)
+                    for oi in np.argsort(eg)[:3]:
+                        cands.append(Tg[int(oi)])
                 # A hypothesis fitted to THIS part's own tracks. The global
                 # hypotheses are dominated by the biggest surface, so a small
                 # thin part undergoing a large rotation never gets a good
                 # initialisation from them -- which is exactly where tracking
                 # still diverged (scissors blade, eyeglasses temple).
-                if part_track_idx is not None and part_track_idx.size >= 6:
+                tidx = inf["tidx"]
+                if tidx is not None and tidx.size >= 6:
                     th = track_hist.get(int(rec["frame"]))
                     if th is not None:
                         cu, cok, cvi = th
-                        sel_t = part_track_idx[
-                            anchor_ok[part_track_idx] & cok[part_track_idx]
-                            & cvi[part_track_idx]]
+                        sel_t = tidx[anchor_ok[tidx] & cok[tidx] & cvi[tidx]]
                         if sel_t.size >= 6:
                             rem = np.ones(sel_t.size, bool)
                             c = reg._RANSAC(p0=anchor_xyz[sel_t],
@@ -598,17 +703,100 @@ def main():
                                             remaining=rem, init_pose=None)
                             if c is not None:
                                 cands.append(c["T"])
-                best_T, best_e = None, float("inf")
-                for Tc in cands:
+                best_T, best_e, best_i = None, float("inf"), -1
+                dbg = []
+                for ci, Tc in enumerate(cands):
                     Tr = assign.refine_pose(Tc, w, K, H, W, dep_i, iters=8,
-                                            obs_mask=om_i)
-                    e = assign.fit_error(Tr, w, K, H, W, dep_i, obs_mask=om_i)
+                                            huber=0.04, obs_mask=om_j)
+                    # truncated energy over ALL the part's gaussians, not a median
+                    # over the survivors: otherwise the candidate that abandons the
+                    # part scores best (see fit_energy).
+                    e = assign.fit_energy(Tr, w, K, H, W, dep_i, obs_mask=om_j,
+                                          r_max=args.track_rmax, obs_rgb=rgb_i,
+                                          color_w=args.track_color)
+                    dbg.append((ci, e, float(np.linalg.norm(Tr[:3, 3]))))
                     if e < best_e:
-                        best_T, best_e = Tr, e
+                        best_T, best_e, best_i = Tr, e, ci
+                if best_T is not None:
+                    # coarse-to-fine: the wide huber above buys the basin, a
+                    # tight one buys the accuracy
+                    Tf = assign.refine_pose(best_T, w, K, H, W, dep_i, iters=8,
+                                            huber=0.006, obs_mask=om_j)
+                    ef = assign.fit_energy(Tf, w, K, H, W, dep_i, obs_mask=om_j,
+                                           r_max=args.track_rmax, obs_rgb=rgb_i,
+                                           color_w=args.track_color)
+                    if ef < best_e:
+                        best_T, best_e = Tf, ef
                 T = best_T if best_T is not None else np.eye(4)
-                T_prev = T
-                track.append((int(rec["frame"]), T.copy()))
-            part_tracks[row["dominant_gt"]] = track
+                inf["e"] = best_e
+                jm = inf["joint"]
+                Tp = infos[inf["parent"]]["T_prev"] if jm is not None else None
+                if jm is not None and Tp is not None and best_e < args.track_grow_gate:
+                    A = np.linalg.inv(Tp) @ T
+                    jm.add(A)
+                    # refit as evidence accumulates: the type and the axis both
+                    # sharpen once the part has actually swung
+                    if jm.kind is None or len(jm.A) % 4 == 0:
+                        was = jm.kind
+                        if jm.fit():
+                            inf["jv"] = [jm.value_of(a_) for a_ in jm.A]
+                            if jm.kind != was:
+                                print(f"[g]   part {j} joint: {jm.kind} axis "
+                                      f"{np.round(jm.axis, 3)} after "
+                                      f"{len(jm.A)} frames")
+                    elif jm.kind is not None:
+                        inf["jv"].append(jm.value_of(A))
+                if T_prev is not None:
+                    inf["dT"] = T @ np.linalg.inv(T_prev)
+                if os.environ.get("TRACK_DEBUG") and eval(os.environ.get("TRACK_DEBUG_F", "rec['frame'] % 10 == 0")):
+                    try:
+                        gtp_ = inf["row"]["dominant_gt"]
+                        Tg = r.get_gt_pose(rec["frame"], gtp_) @ np.linalg.inv(
+                            T_anchor_gt[gtp_])
+                        eg = assign.fit_energy(Tg, w, K, H, W, dep_i,
+                                               obs_mask=om_j, r_max=args.track_rmax)
+                        egf = assign.fit_energy(Tg, w, K, H, W, dep_i,
+                                                obs_mask=om_i, r_max=args.track_rmax)
+                        dbg.append(("gt", eg, float(np.linalg.norm(Tg[:3, 3]))))
+                        dbg.append(("gtfull", egf, 0.0))
+                    except Exception as ex:
+                        pass
+                    print(f"   [dbg] f{rec['frame']:3d} part{j} pick {best_i} "
+                          + "  ".join(f"c{c}:e={e:.4f},|t|={t:.3f}"
+                                      for c, e, t in dbg))
+                inf["T_prev"] = T
+                inf["track"].append((int(rec["frame"]), T.copy()))
+
+            # ---- online part modelling ----
+            # Every part now has a pose for this frame, so any object pixel none
+            # of them explains is newly revealed surface. Give it to the part it
+            # borders and anchor it through that part's pose: the model of each
+            # part fills in as the object articulates, which is what lets a face
+            # that was hidden at the anchor frame ever be tracked.
+            if args.track_grow > 0 and nrec % args.track_grow == 0:
+                poses = [inf["T_prev"] for inf in infos]
+                ws = [inf["w"] for inf in infos]
+                ok_g = [inf.get("e", 1e9) < args.track_grow_gate for inf in infos]
+                n_new, owner = assign.grow_parts(
+                    r.get_color(rec["frame"]), dep_i, K, om_i, poses, ws,
+                    tol=args.track_grow_tol, stride=args.gauss_stride,
+                    max_new=args.track_grow_max, grow_ok=ok_g)
+                if n_new:
+                    for j, inf in enumerate(infos):
+                        add = (owner == j).astype(np.float32)
+                        inf["w"] = np.concatenate([inf["w"], add])
+                    n_grown += n_new
+            nrec += 1
+
+        if args.track_grow > 0:
+            print(f"[g] part modelling grew the cloud by {n_grown} gaussians "
+                  f"({len(cloud)} total)")
+        for inf in infos:
+            gtp_ = inf["row"]["dominant_gt"]
+            part_tracks[gtp_] = inf["track"]
+            # the grown membership and the fitted joint, for the demo
+            part_members[gtp_] = inf["w"] > 0.5
+            part_joints[gtp_] = (inf["joint"], infos[inf["parent"]]["row"]["dominant_gt"])
 
         print("[g] per-part 6-DoF tracking (fixed membership, warm-started):")
         for gtp, track in part_tracks.items():
@@ -677,6 +865,12 @@ def main():
                 w = np.zeros(len(cloud), bool); w[sub[lab == h]] = True
             else:
                 w = (lab == h)
+            # prefer the membership as it stands after online growth: that is
+            # the model the tracker actually used, and showing the frozen
+            # first-frame one hides the part modelling entirely
+            w = part_members.get(gtp, w)
+            if w.shape[0] < gm.shape[0]:
+                w = np.concatenate([w, np.zeros(gm.shape[0] - w.shape[0], bool)])
             members[gtp] = w
             try:
                 boxes[gtp] = fit_oriented_box(gm[w])
@@ -716,9 +910,31 @@ def main():
                         p0 = (int(org[0]*K[0,0]/org[2]+K[0,2]), int(org[1]*K[1,1]/org[2]+K[1,2]))
                         p1 = (int(tip[0]*K[0,0]/tip[2]+K[0,2]), int(tip[1]*K[1,1]/tip[2]+K[1,2]))
                         cv2.arrowedLine(im, p0, p1, acol, 2, cv2.LINE_AA, tipLength=0.3)
+            # the estimated joint axis, drawn through the parent's pose
+            for k, (gtp, w) in enumerate(members.items()):
+                jm, par = part_joints.get(gtp, (None, None))
+                if jm is None or jm.kind is None or par == gtp:
+                    continue
+                Tp = pose_at.get(par, {}).get(int(i))
+                if Tp is None:
+                    continue
+                Tp = np.asarray(Tp)
+                base = jm.point if jm.kind == "revolute" else gm[w].mean(0)
+                seg = np.stack([base - jm.axis * 0.12, base + jm.axis * 0.12])
+                q = seg @ Tp[:3, :3].T + Tp[:3, 3]
+                if (q[:, 2] > 1e-3).all():
+                    pu = (q[:, 0] * K[0, 0] / q[:, 2] + K[0, 2]).astype(int)
+                    pv = (q[:, 1] * K[1, 1] / q[:, 2] + K[1, 2]).astype(int)
+                    cv2.line(im, (pu[0], pv[0]), (pu[1], pv[1]), (255, 255, 255),
+                             4, cv2.LINE_AA)
+                    cv2.line(im, (pu[0], pv[0]), (pu[1], pv[1]), (40, 40, 40),
+                             2, cv2.LINE_AA)
+                    cv2.putText(im, jm.kind[:4], (pu[1], pv[1]),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (30, 30, 30), 1,
+                                cv2.LINE_AA)
             bar = np.full((30, W, 3), (26, 22, 18), np.uint8)
             cv2.putText(bar, f"frame {i:4d}   {len(members)} parts tracked   "
-                             f"dense model + 6-DoF pose",
+                             f"dense model + 6-DoF pose + joint axis",
                         (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (235, 235, 235), 1,
                         cv2.LINE_AA)
             canvas = np.vstack([im, bar])
