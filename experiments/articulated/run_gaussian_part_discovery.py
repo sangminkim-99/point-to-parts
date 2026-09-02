@@ -120,6 +120,11 @@ def main():
                     help="cluster a co-association matrix instead of carrying "
                          "hypothesis slots across frames")
     ap.add_argument("--no-coassoc", dest="coassoc", action="store_false")
+    ap.add_argument("--coassoc-weight", choices=["none", "decisive"],
+                    default="none",
+                    help="weight each frame's co-association evidence by how far "
+                         "its posterior is from a single hypothesis owning "
+                         "everything")
     ap.add_argument("--co-sample", type=int, default=4000)
     ap.add_argument("--em-iters", type=int, default=1,
                     help="M-step rounds per frame: refine each hypothesis against "
@@ -200,6 +205,7 @@ def main():
     assign = GaussianPartAssignment(cloud, args.max_hyp,
                                     depth_sigma=args.depth_sigma,
                                     color_weight=args.color_weight)
+    assign.coassoc_weight = args.coassoc_weight
     if args.coassoc:
         assign.init_coassoc(args.co_sample)
     print(f"[g] {len(cloud)} gaussians, GT parts {parts}, {len(frames)} frames")
@@ -408,16 +414,17 @@ def main():
                     novel = all(
                         np.linalg.norm(T_n[:3, 3] - U[:3, 3]) > 0.01 or
                         np.linalg.norm(T_n[:3, :3] - U[:3, :3]) > 0.03 for U in hy)
-                    if novel and e_n < args.dense_hyp_tol:
+                    st_dense = 1 if (novel and e_n < args.dense_hyp_tol) else 0
+                    if st_dense:
                         hy = hy[:max(1, args.max_hyp - 1)] + [T_n]
-                        st_dense = 1
-                    else:
-                        st_dense = 0
+                    st_diag = (int(un.sum()), float(e_n), int(novel))
                 else:
                     st_dense = 0
+                    st_diag = (int(un.sum()), -1.0, -1)
             st = assign.step_pointwise(hy, K, H, W, dep, obs_mask=om)
             if args.dense_hyp:
                 st["dense_hyp"] = st_dense
+                st["dense_diag"] = st_diag
             hyps = hy + hyps[len(hy):]
             # the refined transforms ARE the per-part 6-DoF poses; keep them so
             # they can be scored against ground truth once groups are known

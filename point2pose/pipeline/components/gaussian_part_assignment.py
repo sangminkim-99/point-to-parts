@@ -111,6 +111,7 @@ class GaussianPartAssignment:
         # every gaussian in one group no matter how diverse the hypotheses were.
         self._slot_members = [None] * n_hypotheses
         self.n_slots = n_hypotheses
+        self.coassoc_weight = "none"
 
     def _residual(self, T, K, H, W, obs_depth, obs_rgb):
         rgb, depth, alpha = self.cloud.render(T, K, H, W)
@@ -238,7 +239,8 @@ class GaussianPartAssignment:
                 continue
             self.logodds[wins[k], sl] += 1.0
         if getattr(self, "co_idx", None) is not None:
-            self.accumulate_coassoc_soft(R, bestval < 1e5)
+            self.accumulate_coassoc_soft(R, bestval < 1e5,
+                                         weight_mode=self.coassoc_weight)
         self.last_wins = [w.detach().cpu().numpy() for w in wins]
         self.last_slots = list(slot_of)
         return {
@@ -658,7 +660,7 @@ class GaussianPartAssignment:
         self.co_same = torch.zeros((m, m), dtype=torch.float32, device=self.device)
         self.co_seen = torch.zeros((m, m), dtype=torch.float32, device=self.device)
 
-    def accumulate_coassoc_soft(self, R, valid, tau=None):
+    def accumulate_coassoc_soft(self, R, valid, tau=None, weight_mode="none"):
         """Soft co-association from the residual matrix R (Hy, N).
 
         A hard winner-takes-all vote gated on a margin recorded almost nothing:
@@ -675,8 +677,24 @@ class GaussianPartAssignment:
         r[~torch.isfinite(r)] = 1e6
         P = torch.softmax(-r / max(tau, 1e-6), dim=0)          # (Hy, M)
         P = P * v[None, :]
-        self.co_same += P.T @ P
-        self.co_seen += v[:, None] * v[None, :]
+        # A frame in which one hypothesis explains nearly every gaussian carries
+        # no information about which surfaces move together -- it pushes EVERY
+        # pair towards "same" and so shrinks the gap the clustering depends on.
+        # Measured on RBO cabinet01: only 10% of gaussians are decisive in the
+        # median frame, and the resulting same-part / cross-part affinity gap is
+        # 0.035. Weighting each frame by how far its posterior is from a single
+        # hypothesis owning everything lets the informative frames dominate.
+        wf = 1.0
+        if weight_mode == "decisive":
+            n_v = float(v.sum())
+            if n_v < 1:
+                return
+            conc = float((P.sum(dim=1) / n_v).max())
+            wf = max(0.0, 1.0 - conc)
+            if wf <= 1e-3:
+                return
+        self.co_same += wf * (P.T @ P)
+        self.co_seen += wf * (v[:, None] * v[None, :])
 
     def coassoc_labels(self, min_frac=0.5, min_group=50, max_k=5, adaptive=True):
         """Cluster the co-association matrix.
