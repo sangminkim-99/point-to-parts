@@ -94,7 +94,8 @@ class Config:
     depth_sigma: float = 0.02
     win_steps: int = 20
     ransac_iters: int = 200
-    # 4 costs 260 ms at 224 points, 1 costs 45 ms.
+    # 4 costs 260 ms at 224 points, 1 costs 45 ms -- but 1 also costs quality:
+    # tracking energy ~10x worse, and pliers' joint comes out prismatic not revolute.
     num_pips_iter: int = 1
     # Not free to raise: after the split each part still fits its own RANSAC
     # from its own tracks, which a thin fast-rotating part depends on.

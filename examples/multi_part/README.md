@@ -69,6 +69,33 @@ its own RANSAC hypothesis from the tracks that sit on it, which is what a thin,
 fast-rotating part depends on — offline, removing it is where the scissors blade
 and the eyeglasses temple diverged.
 
+## TAPIR refinement iterations
+
+`num_pips_iter` defaults to 1. It is the single biggest speed lever and it is not
+free:
+
+| | pips=4 | pips=2 | pips=1 (default) |
+|---|---|---|---|
+| pliers | 3.5 fps, energy 0.0027/0.0017, both revolute | 4.4 fps, 0.0031/0.0019 | 5.8 fps, 0.026/0.019, one joint and it comes out prismatic |
+| storage | 4.1 fps, 0.037/0.005 | 5.5 fps, 0.038/0.004 | 8.2 fps, 0.046/0.038, one part shrinks to 537 gaussians |
+| eyeglasses | 3.1 fps, **3 parts** | 4.5 fps, 2 parts | 5.4 fps, 2 parts |
+
+Tracking energy is roughly 10x worse at 1 than at 4, and eyeglasses already loses
+a part at 2. Raise it with `--pips-iter 4` when the result matters more than the
+frame rate. The offline benchmark in `experiments/articulated/` leaves it at the
+TAPIR default of 4.
+
+## Environment
+
+gsplat compiles its CUDA kernels on first use (about 80 s, then cached), which
+needs the toolchain visible:
+
+```bash
+export CUDA_HOME=$CONDA_PREFIX
+export CPATH=$CONDA_PREFIX/targets/x86_64-linux/include:$CONDA_PREFIX/include
+export TORCH_CUDA_ARCH_LIST=8.9   # your GPU's compute capability
+```
+
 ## Why part discovery used to appear so late
 
 A split attempt is not per-frame work and has nothing to do with the number of
