@@ -94,34 +94,18 @@ class Config:
     depth_sigma: float = 0.02
     win_steps: int = 20
     ransac_iters: int = 200
-    # Point tracking is the dominant cost -- TAPIR runs about 0.55 ms per query
-    # point, so 400 points is 226 ms/frame. Skipping frames is possible but it is
-    # NOT free: the sparse tracks are used after the split as well, both for the
-    # global hypotheses and for the per-part RANSAC fit that a thin, fast-rotating
-    # part depends on. 1 = every frame; raise it only against a measured cost.
+    # 4 costs 260 ms at 224 points, 1 costs 45 ms.
+    num_pips_iter: int = 1
+    # Not free to raise: after the split each part still fits its own RANSAC
+    # from its own tracks, which a thin fast-rotating part depends on.
     hyp_every: int = 1
     win_min_span: int = 4
-    # A split attempt is dominated by agglomerative clustering of the
-    # co-association matrix, and that cost is roughly cubic in the sample count:
-    # measured in situ, one attempt costs 660-860 ms at 4000 and 46-52 ms at
-    # 1000. At 4000 every attempt stalls the stream for the best part of a
-    # second, which is the real reason part discovery felt so late -- the old
-    # gate (no attempt before frame 25, then once every 10) was hiding that cost
-    # rather than fixing it.
-    #
-    # Measured at 1000 against 4000 on pliers, storage and eyeglasses: the same
-    # number of parts, the same joint types, comparable tracking energies. The
-    # one real difference is on storage, where co-association wins the selection:
-    # its initial grouping covers 5% of the cloud instead of 19%, because only
-    # sampled gaussians can be labelled. The final parts come out similar only
-    # because online growth fills the rest back in.
+    # Clustering this is ~cubic: a split attempt costs 660-860 ms at 4000 and
+    # 46-52 ms at 1000, for the same parts on pliers, storage and eyeglasses.
     co_sample: int = 1000
     min_group: int = 30
-    # when to try splitting
-    # With a cheap attempt the gate can be tight. Measured on pliers, moving
-    # from (25, 10) to (12, 3) pulled the split from frame 31 to 25 AND improved
-    # the parts -- tracking energy went from 0.02-0.04 to 0.0027/0.0017 -- because
-    # splitting earlier leaves more frames for each part's model to grow.
+    # (25, 10) -> (12, 3): split at frame 25 not 31, energy 0.02 -> 0.003,
+    # because splitting earlier leaves more frames for each model to grow.
     min_frames_before_split: int = 12
     regroup_every: int = 3
     pose_log_max: int = 120
@@ -135,6 +119,9 @@ class Config:
     joint_gate: float = 0.035
     grow_max: int = 1500
     exclusive_mask: bool = True
+    # Off: measured, masking a part's back face out costs more than the
+    # thickness it saves -- laptop lid 23.6 -> 33.4 mm, eyeglasses temple 38 -> 168.
+    visibility: bool = False
     score_round: int = 3
     merge_eps: float = 0.002
     merge_tol: float = 0.012
@@ -158,9 +145,7 @@ class StreamingPartDiscovery:
         self.assign = None
         self.last_timings = {}
 
-    # ------------------------------------------------------------------ #
-    #  Anchor frame
-    # ------------------------------------------------------------------ #
+    # ---- anchor frame ----
     def start(self, rgb, depth, mask):
         """Lift the first masked frame to gaussians and seed the point tracks."""
         from point2pose.data_types.frame import Frame
@@ -169,8 +154,8 @@ class StreamingPartDiscovery:
         H, W = depth.shape
         self.H, self.W = H, W
 
-        # stride from how many gaussians the object actually yields: a thin object
-        # at a fixed stride gives a few hundred, and nothing is then decisive
+        # a thin object at a fixed stride yields a few hundred gaussians, and
+        # then nothing is ever decisively assigned
         gs = cfg.gauss_stride_max
         while gs > 1 and int((mask[::gs, ::gs] > 0).sum()) < cfg.gauss_target:
             gs -= 1
@@ -198,9 +183,7 @@ class StreamingPartDiscovery:
         self.whole_box = self._fit_box(np.ones(len(self.cloud), bool))
         return self
 
-    # ------------------------------------------------------------------ #
-    #  One frame
-    # ------------------------------------------------------------------ #
+    # ---- one frame ----
     def step(self, rgb, depth, mask):
         from point2pose.data_types.frame import Frame
 
@@ -222,6 +205,7 @@ class StreamingPartDiscovery:
         t_track = time.perf_counter()
 
         self.cur_tracks = (cur, cur_ok, vis)
+        self.cur_tracks_2d = tracks
         if cfg.hyp_every <= 1 or i % cfg.hyp_every == 0 \
                 or not getattr(self, "_last_hyps", None):
             hyps = self._hypotheses(i, cur, cur_ok, vis)
@@ -245,7 +229,6 @@ class StreamingPartDiscovery:
         }
         return self.state
 
-    # ------------------------------------------------------------------ #
     def _hypotheses(self, i, cur, cur_ok, vis):
         """Rigid-motion candidates, all expressed anchor -> current."""
         cfg = self.cfg
@@ -300,9 +283,7 @@ class StreamingPartDiscovery:
             hyps.append(hyps[-1])
         return hyps
 
-    # ------------------------------------------------------------------ #
-    #  RIGID: accumulate evidence, and try to split from time to time
-    # ------------------------------------------------------------------ #
+    # ---- RIGID: accumulate evidence, try to split from time to time ----
     def _step_rigid(self, rgb, depth, mask, hyps, i):
         cfg = self.cfg
         a = self.assign
@@ -478,9 +459,7 @@ class StreamingPartDiscovery:
             out[labels_full == g] = remap[r]
         return out
 
-    # ------------------------------------------------------------------ #
-    #  SPLIT: forward-only per-part tracking
-    # ------------------------------------------------------------------ #
+    # ---- SPLIT: forward-only per-part tracking ----
     def _step_split(self, rgb, depth, mask, hyps, i):
         cfg = self.cfg
         a = self.assign
@@ -521,11 +500,8 @@ class StreamingPartDiscovery:
                     cands.append(se3_pow(part.d_pose, s) @ part.pose)
             cands.extend(np.asarray(T) for T in hyps)
 
-            # A hypothesis fitted to THIS part's own sparse tracks. The global
-            # hypotheses are dominated by the biggest surface, so a small thin
-            # part undergoing a large rotation never gets a good initialisation
-            # from them -- measured offline, that is exactly where the scissors
-            # blade and the eyeglasses temple diverged.
+            # The global hypotheses are dominated by the biggest surface, so a
+            # thin fast-rotating part needs one fitted to its own tracks.
             tidx = part.track_idx
             if tidx is not None and tidx.size >= 6 and self.reg is not None:
                 cu, cok, cvi = self.cur_tracks
@@ -561,18 +537,22 @@ class StreamingPartDiscovery:
                 if cfg.max_step > 0 and part.pose is not None:
                     if np.linalg.norm(np.asarray(Tc)[:3, 3] - part.pose[:3, 3]) > cfg.max_step:
                         continue
+                # visibility from the candidate itself: only the part's own
+                # front face is comparable against the observed depth
+                vz = a.self_visible(Tc, w, self.K, H, W) if cfg.visibility else None
                 Tr = a.refine_pose(Tc, w, self.K, H, W, depth, iters=8,
-                                   huber=0.04, obs_mask=om)
+                                   huber=0.04, obs_mask=om, visible=vz)
                 e = a.fit_energy(Tr, w, self.K, H, W, depth, obs_mask=om,
-                                 r_max=cfg.track_rmax)
+                                 r_max=cfg.track_rmax, visible=vz)
                 if e < best_e:
                     best_T, best_e = Tr, e
             if best_T is None:
                 continue
+            vz = a.self_visible(best_T, w, self.K, H, W) if cfg.visibility else None
             Tf = a.refine_pose(best_T, w, self.K, H, W, depth, iters=8,
-                               huber=0.006, obs_mask=om)
+                               huber=0.006, obs_mask=om, visible=vz)
             ef = a.fit_energy(Tf, w, self.K, H, W, depth, obs_mask=om,
-                              r_max=cfg.track_rmax)
+                              r_max=cfg.track_rmax, visible=vz)
             if ef < best_e:
                 best_T, best_e = Tf, ef
 
@@ -618,7 +598,6 @@ class StreamingPartDiscovery:
         thr = max(0.01, float(np.percentile(dist, 20)) * 2.0)
         return np.where(dist < thr)[0]
 
-    # ------------------------------------------------------------------ #
     def _fit_box(self, sel):
         """Oriented box around a set of gaussians, in the anchor frame."""
         try:
@@ -636,8 +615,7 @@ class StreamingPartDiscovery:
         except Exception:
             return None
 
-    # ------------------------------------------------------------------ #
-    def render(self, bgr, palette=None):
+    def render(self, bgr, palette=None, show_tracks=True):
         """Draw the current state onto a BGR image."""
         import cv2
         from point2pose.utils.visualization import draw_oriented_3d_box
@@ -668,6 +646,8 @@ class StreamingPartDiscovery:
                                                line_color=(200, 200, 200), linewidth=2)
                 except Exception:
                     pass
+            if show_tracks:
+                self._draw_tracks(out, None, pal)
             return out
 
         for j, p in enumerate(self.parts):
@@ -719,4 +699,38 @@ class StreamingPartDiscovery:
                 cv2.line(out, (pu[0], pv[0]), (pu[1], pv[1]), (30, 30, 30), 2, cv2.LINE_AA)
                 cv2.putText(out, jm.kind, (pu[1] + 6, pv[1]),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (30, 30, 30), 1, cv2.LINE_AA)
+        if show_tracks:
+            self._draw_tracks(out, self.parts, pal)
         return out
+
+    def _draw_tracks(self, out, parts, pal):
+        """The sparse point tracks, coloured by the part they belong to.
+
+        Worth seeing: these are what the hypotheses are fitted from, and after the
+        split each part fits its own RANSAC from the tracks that sit on it. A part
+        whose tracks have gone invisible is a part whose pose is running on the
+        dense model alone.
+        """
+        import cv2
+
+        t2d = getattr(self, "cur_tracks_2d", None)
+        if t2d is None:
+            return
+        _, ok, vis = self.cur_tracks
+        owner = np.full(len(t2d), -1, dtype=int)
+        if parts:
+            for j, p in enumerate(parts):
+                if p.track_idx is not None:
+                    owner[p.track_idx] = j
+
+        for i in range(len(t2d)):
+            x, y = int(t2d[i, 0]), int(t2d[i, 1])
+            if not (0 <= x < out.shape[1] and 0 <= y < out.shape[0]):
+                continue
+            col = pal[owner[i] % len(pal)] if owner[i] >= 0 else (190, 190, 190)
+            if vis[i] and ok[i]:
+                cv2.circle(out, (x, y), 3, (20, 20, 20), -1)
+                cv2.circle(out, (x, y), 2, col, -1)
+            else:
+                # hollow: the tracker says this point is occluded or lost
+                cv2.circle(out, (x, y), 3, col, 1)

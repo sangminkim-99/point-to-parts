@@ -264,7 +264,7 @@ class GaussianPartAssignment:
     # ------------------------------------------------------------------ #
 
     def refine_pose(self, T, weights, K, H, W, obs_depth, iters=6, huber=0.02,
-                    obs_mask=None):
+                    obs_mask=None, visible=None):
         """Projective ICP of the gaussians onto the observed depth.
 
         The plan's section 3.1 EM loop needs this M-step, and every RBO failure
@@ -286,6 +286,10 @@ class GaussianPartAssignment:
         P0 = self.cloud.means
         T = torch.as_tensor(np.asarray(T), dtype=torch.float32, device=self.device).clone()
         w0 = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+        if visible is not None:
+            # computed once from the starting pose: within one ICP the pose
+            # moves little, and a render per iteration is not worth 0.25 ms each
+            w0 = w0 * visible[:w0.shape[0]].float()
         if float(w0.sum()) < 10:
             return T.cpu().numpy()
 
@@ -340,8 +344,35 @@ class GaussianPartAssignment:
             return float("inf")
         return float(R[ok].median())
 
+    def self_visible(self, T, weights, K, H, W, tol=0.006, alpha_thr=0.3):
+        """Which of a part's gaussians its own front face does not hide.
+
+        The point-wise residual has no z-buffer, so a gaussian on the back of a
+        part is compared against the front face's depth and charged for the
+        thickness. Measured: a model 10 mm behind the surface reads 11.2 mm
+        point-wise and 7.9 mm rasterised.
+        """
+        w = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+        sel = w[:len(self.cloud)] > 0.05
+        out = torch.zeros(len(self.cloud), dtype=torch.bool, device=self.device)
+        if int(sel.sum()) < 10:
+            return out
+        _, dep_r, alpha = self.cloud.render(T, K, H, W, subset=sel)
+        Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
+        Tt = torch.as_tensor(np.asarray(T), dtype=torch.float32, device=self.device)
+        p = self.cloud.means[sel] @ Tt[:3, :3].T + Tt[:3, 3]
+        z = p[:, 2]
+        u = (p[:, 0] * Kt[0, 0] / z + Kt[0, 2]).round().long()
+        v = (p[:, 1] * Kt[1, 1] / z + Kt[1, 2]).round().long()
+        ok = (z > 1e-3) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        uc, vc = u.clamp(0, W - 1), v.clamp(0, H - 1)
+        # in front of, or on, the surface this part renders at that pixel
+        vis = ok & (alpha[vc, uc] > alpha_thr) & (z <= dep_r[vc, uc] + tol)
+        out[torch.where(sel)[0]] = vis
+        return out
+
     def fit_energy(self, T, weights, K, H, W, obs_depth, obs_mask=None,
-                   r_max=0.05, obs_rgb=None, color_w=0.0):
+                   r_max=0.05, obs_rgb=None, color_w=0.0, visible=None):
         """Truncated residual energy over ALL of a part's gaussians.
 
         `fit_error` is a median over the gaussians that happened to land on
@@ -359,11 +390,13 @@ class GaussianPartAssignment:
         """
         e = self.fit_energy_batch([T], weights, K, H, W, obs_depth,
                                   obs_mask=obs_mask, r_max=r_max,
-                                  obs_rgb=obs_rgb, color_w=color_w)
+                                  obs_rgb=obs_rgb, color_w=color_w,
+                                  visible=visible)
         return float(e[0])
 
     def fit_energy_batch(self, Ts, weights, K, H, W, obs_depth, obs_mask=None,
-                         r_max=0.05, chunk=64, obs_rgb=None, color_w=0.0):
+                         r_max=0.05, chunk=64, obs_rgb=None, color_w=0.0,
+                         visible=None):
         """`fit_energy` for many poses at once, over a part's members only.
 
         A joint reduces the pose to a scalar, and a scalar can be scanned
@@ -378,6 +411,10 @@ class GaussianPartAssignment:
             obs = torch.where(mk, obs, torch.zeros_like(obs))
         w = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
         sel = w[:len(self.cloud)] > 0.05
+        if visible is not None:
+            # drop only gaussians the part's own front face hides; ones that
+            # missed the surface entirely still count, as a full r_max
+            sel = sel & visible[:len(self.cloud)]
         if int(sel.sum()) < 10:
             return np.full(len(Ts), float("inf"))
         P = self.cloud.means[sel]
@@ -406,8 +443,26 @@ class GaussianPartAssignment:
             out.append(r.mean(dim=1))
         return torch.cat(out).cpu().numpy()
 
-    def occupancy(self, T, weights, K, H, W, dilate=1):
-        """Boolean image of the pixels a part covers under transform T."""
+    def occupancy(self, T, weights, K, H, W, dilate=1, alpha_thr=0.3):
+        """Boolean image of the pixels a part covers under transform T.
+
+        Rasterised: splatting gaussian centres and dilating leaves holes between
+        samples, which the mutual-exclusion mask then hands to another part.
+        """
+        w = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+        sel = w[:len(self.cloud)] > 0.05
+        if int(sel.sum()) >= 10:
+            _, _, alpha = self.cloud.render(T, K, H, W, subset=sel)
+            img = alpha > alpha_thr
+            if dilate > 0:
+                f = torch.nn.functional.max_pool2d(
+                    img[None, None].float(), 2 * dilate + 1, stride=1, padding=dilate)
+                img = f[0, 0] > 0
+            return img.cpu().numpy()
+        return self._occupancy_points(T, weights, K, H, W, dilate)
+
+    def _occupancy_points(self, T, weights, K, H, W, dilate=1):
+        """Fallback for a part too small to rasterise."""
         Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
         Tt = torch.as_tensor(np.asarray(T), dtype=torch.float32, device=self.device)
         w = torch.as_tensor(weights, dtype=torch.float32, device=self.device)

@@ -31,6 +31,8 @@ def main():
     ap.add_argument("--hyp-every", type=int, default=None)
     ap.add_argument("--tapir-res", type=int, default=480)
     ap.add_argument("--co-sample", type=int, default=None)
+    ap.add_argument("--min-inliers", type=int, default=None)
+    ap.add_argument("--pips-iter", type=int, default=None)
     ap.add_argument("--min-frames", type=int, default=None)
     ap.add_argument("--regroup-every", type=int, default=None)
     ap.add_argument("--checkpoint",
@@ -65,12 +67,17 @@ def main():
         cfg.hyp_every = args.hyp_every
     if args.co_sample:
         cfg.co_sample = args.co_sample
+    if args.min_inliers:
+        cfg.min_inliers = args.min_inliers
+    if args.pips_iter:
+        cfg.num_pips_iter = args.pips_iter
     if args.min_frames:
         cfg.min_frames_before_split = args.min_frames
     if args.regroup_every:
         cfg.regroup_every = args.regroup_every
     tracker = TapirTracker({"checkpoint_path": args.checkpoint,
                             "resize_height": args.tapir_res, "resize_width": args.tapir_res,
+                            "num_pips_iter": cfg.num_pips_iter,
                             "visible_threshold": 0.5, "device": "cuda"})
     reg = SVDClusterRANSACRegister({
         "ransac_iters": cfg.ransac_iters, "sample_size": 4,

@@ -39,6 +39,8 @@ class RealSenseMultiPart:
             self.cfg.n_points = args.n_points
         if args.hyp_every:
             self.cfg.hyp_every = args.hyp_every
+        if args.pips_iter:
+            self.cfg.num_pips_iter = args.pips_iter
 
         self.rs = rs
         self._init_realsense(args.serial)
@@ -220,6 +222,7 @@ class RealSenseMultiPart:
                             "checkpoint_path": self.args.checkpoint,
                             "resize_height": self.args.tapir_res,
                             "resize_width": self.args.tapir_res,
+                            "num_pips_iter": self.cfg.num_pips_iter,
                             "visible_threshold": 0.5, "device": "cuda"})
                         reg = SVDClusterRANSACRegister({
                             "ransac_iters": self.cfg.ransac_iters, "sample_size": 4,
@@ -243,6 +246,7 @@ def main():
     ap.add_argument("--n-points", type=int, default=None)
     ap.add_argument("--hyp-every", type=int, default=None)
     ap.add_argument("--tapir-res", type=int, default=480)
+    ap.add_argument("--pips-iter", type=int, default=None)
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
     ap.add_argument("--sam-checkpoint",

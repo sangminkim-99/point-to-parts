@@ -199,6 +199,12 @@ def main():
                     help="largest translation a part may move between two tracked "
                          "frames, metres; 0 disables the guard")
     ap.add_argument("--exclusive-mask", type=int, default=1)
+    ap.add_argument("--visibility", type=int, default=0,
+                    help="mask out gaussians the part's own front face hides. "
+                         "Off: measured, it removes the gaussians that carry the "
+                         "fit on a thin part -- laptop lid 23.6 -> 33.4 mm, "
+                         "eyeglasses temple 38 -> 168 mm. Rasterised occupancy, "
+                         "which is always on, is the gsplat win.")
     ap.add_argument("--joint-tol", type=float, default=0.02,
                     help="how far off the joint manifold a pose may be and still "
                          "be used to refine the joint, metres")
@@ -961,25 +967,31 @@ def main():
                         d = float(np.linalg.norm(np.asarray(Tc)[:3, 3] - T_prev[:3, 3]))
                         if d > args.max_step:
                             continue
+                    vz = (assign.self_visible(Tc, w, K, H, W)
+                          if args.visibility else None)
                     Tr = assign.refine_pose(Tc, w, K, H, W, dep_i, iters=8,
-                                            huber=0.04, obs_mask=om_j)
+                                            huber=0.04, obs_mask=om_j,
+                                            visible=vz)
                     # truncated energy over ALL the part's gaussians, not a median
                     # over the survivors: otherwise the candidate that abandons the
                     # part scores best (see fit_energy).
                     e = assign.fit_energy(Tr, w, K, H, W, dep_i, obs_mask=om_j,
                                           r_max=args.track_rmax, obs_rgb=rgb_i,
-                                          color_w=args.track_color)
+                                          color_w=args.track_color, visible=vz)
                     dbg.append((ci, e, float(np.linalg.norm(Tr[:3, 3]))))
                     if e < best_e:
                         best_T, best_e, best_i = Tr, e, ci
                 if best_T is not None:
                     # coarse-to-fine: the wide huber above buys the basin, a
                     # tight one buys the accuracy
+                    vz = (assign.self_visible(best_T, w, K, H, W)
+                          if args.visibility else None)
                     Tf = assign.refine_pose(best_T, w, K, H, W, dep_i, iters=8,
-                                            huber=0.006, obs_mask=om_j)
+                                            huber=0.006, obs_mask=om_j,
+                                            visible=vz)
                     ef = assign.fit_energy(Tf, w, K, H, W, dep_i, obs_mask=om_j,
                                            r_max=args.track_rmax, obs_rgb=rgb_i,
-                                           color_w=args.track_color)
+                                           color_w=args.track_color, visible=vz)
                     if ef < best_e:
                         best_T, best_e = Tf, ef
                 T = best_T if best_T is not None else np.eye(4)
