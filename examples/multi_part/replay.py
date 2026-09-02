@@ -32,7 +32,16 @@ def main():
     ap.add_argument("--tapir-res", type=int, default=512)
     ap.add_argument("--co-sample", type=int, default=None)
     ap.add_argument("--min-inliers", type=int, default=None)
+    ap.add_argument("--inlier-thres", type=float, default=None)
+    ap.add_argument("--groupings", default=None,
+                    help="subset of labels,coassoc,winsets,merge")
+    ap.add_argument("--min-group", type=int, default=None)
+    ap.add_argument("--min-group-frac", type=float, default=None)
+    ap.add_argument("--resplit", type=int, default=None)
+    ap.add_argument("--resplit-wait", type=int, default=None)
     ap.add_argument("--pips-iter", type=int, default=None)
+    ap.add_argument("--grow-gate-rel", type=float, default=None)
+    ap.add_argument("--outside-w", type=float, default=None)
     ap.add_argument("--view", type=int, default=1,
                     help="show a live cv2 window; 'q' quits, 'space' pauses")
     ap.add_argument("--hyp-panel", type=int, default=1,
@@ -88,8 +97,24 @@ def main():
         cfg.co_sample = args.co_sample
     if args.min_inliers:
         cfg.min_inliers = args.min_inliers
+    if args.inlier_thres:
+        cfg.inlier_thres = args.inlier_thres
+    if args.groupings:
+        cfg.groupings = args.groupings
+    if args.min_group:
+        cfg.min_group = args.min_group
+    if args.min_group_frac is not None:
+        cfg.min_group_frac = args.min_group_frac
+    if args.resplit is not None:
+        cfg.resplit = bool(args.resplit)
+    if args.resplit_wait:
+        cfg.resplit_wait = args.resplit_wait
     if args.pips_iter:
         cfg.num_pips_iter = args.pips_iter
+    if args.grow_gate_rel is not None:
+        cfg.grow_gate_rel = args.grow_gate_rel
+    if args.outside_w is not None:
+        cfg.outside_w = args.outside_w
     if args.min_frames:
         cfg.min_frames_before_split = args.min_frames
     if args.regroup_every:
@@ -181,6 +206,8 @@ def main():
           f"{getattr(s, 'grow_blocked', 0)} blocked by the energy gate "
           f"(rel gate {cfg.grow_gate_rel}); part energies "
           f"{[round(p.energy, 4) for p in s.parts]}")
+    if getattr(s, "unmodelled", None) is not None:
+        print(f"[replay] unmodelled object surface: {100 * s.unmodelled:.0f}%")
     print(f"[replay] final state: {s.state}, {len(s.parts)} parts")
     for j, p in enumerate(s.parts):
         jm = p.joint

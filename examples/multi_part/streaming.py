@@ -139,7 +139,7 @@ class Config:
     min_inliers: int = 3
     depth_sigma: float = 0.02
     win_steps: int = 20
-    ransac_iters: int = 200
+    ransac_iters: int = 50
     # 4 costs 260 ms at 224 points, 1 costs 45 ms -- but 1 also costs quality:
     # tracking energy ~10x worse, and pliers' joint comes out prismatic not revolute.
     num_pips_iter: int = 1
@@ -151,13 +151,31 @@ class Config:
     # 46-52 ms at 1000, for the same parts on pliers, storage and eyeglasses.
     co_sample: int = 1000
     min_group: int = 30
+    # An absolute floor is the wrong unit: 30 is 3% of the 1000-gaussian
+    # co-association subsample but 0.1% of a 30k cloud, so the final filter let
+    # 54-gaussian slivers through as parts.
+    min_group_frac: float = 0.02
+    # which grouping candidates to generate; drop one to ablate it
+    # groupings: str = "labels,coassoc,winsets,merge"
+    groupings: str = "labels"
     # (25, 10) -> (12, 3): split at frame 25 not 31, energy 0.02 -> 0.003,
     # because splitting earlier leaves more frames for each model to grow.
     min_frames_before_split: int = 12
+    # part discovery was one-shot: once SPLIT, _try_split was never called
+    # again, so a third part could not be found no matter what moved
+    resplit: bool = True
+    resplit_wait: int = 12              # frames of evidence after a split
+    # A re-split has to earn its extra part. Without a floor the grouping with
+    # the required group count wins even at ratio 0.00, and every object
+    # fragments to max_hyp pieces.
+    resplit_min_ratio: float = 1.02
+    resplit_min_cov: float = 0.30
     regroup_every: int = 3
     pose_log_max: int = 120
     # per-part tracking
     track_rmax: float = 0.05
+    # extra penalty for rendering outside the live mask, as a multiple of r_max
+    outside_w: float = 0.0  # measured: helps 2 objects, badly hurts 3. off.
     # pipeline_test2.yaml pose_jump_guard_trans_thres
     max_step: float = 0.15
     grow_every: int = 2
@@ -335,7 +353,8 @@ class StreamingPartDiscovery:
                 continue
             sp, so, sv = self.past[j]
             u = np.where(so & sv & cur_ok & vis)[0]
-            if len(u) < 2 * cfg.min_inliers:
+            # if len(u) < 2 * cfg.min_inliers:
+            if len(u) < cfg.min_inliers:
                 continue
             rem = np.ones(len(u), bool)
             got = []
@@ -391,17 +410,20 @@ class StreamingPartDiscovery:
             self._try_split()
             self.last_split_ms = (time.perf_counter() - t0) * 1e3
 
-    def _try_split(self):
+    def _try_split(self, min_groups=2, min_ratio=0.0, min_cov=0.0):
         """Offer the accumulated evidence to the model selection. Commit only a
         grouping that beats treating the object as one body."""
         cfg = self.cfg
         a = self.assign
         n = len(self.cloud)
 
+        on = {t.strip() for t in cfg.groupings.split(",") if t.strip()}
         cand = []
-        lab_hard = a.labels()
-        cand.append(("labels", lab_hard))
+        if "labels" in on:
+            cand.append(("labels", a.labels()))
         try:
+            if "coassoc" not in on:
+                raise RuntimeError("disabled")
             lab_co, sub_co = a.coassoc_labels(0.5, cfg.min_group, max_k=5)
             full = np.full(n, -1, dtype=int)
             full[sub_co] = lab_co
@@ -409,6 +431,8 @@ class StreamingPartDiscovery:
         except Exception:
             pass
         try:
+            if "winsets" not in on:
+                raise RuntimeError("disabled")
             lab_ws, _ = a.winset_labels(min_members=3, thresh=0.5)
             if (lab_ws >= 0).any():
                 cand.append(("winsets", lab_ws))
@@ -416,13 +440,16 @@ class StreamingPartDiscovery:
             pass
 
         merged = []
-        for nm, lb in cand:
+        for nm, lb in (cand if "merge" in on else []):
             mf = self._merge_rigid(lb)
             if (mf >= 0).any() and \
                     len(set(mf[mf >= 0].tolist())) < len(set(lb[lb >= 0].tolist())):
                 merged.append((nm + "+merge", mf))
         cand.extend(merged)
 
+        if not cand:
+            self.last_split_why = f"no grouping candidates enabled ({cfg.groupings})"
+            return False
         scored = [(nm, lb) + self._grouping_score(lb) for nm, lb in cand]
         scored.sort(key=lambda x: (-round(x[2], cfg.score_round), -x[3],
                                    len(set(x[1][x[1] >= 0].tolist()))))
@@ -439,36 +466,82 @@ class StreamingPartDiscovery:
                             for nm, lb, r, c in scored]
         name, lab, ratio, cov = best
         groups = sorted(g for g in set(lab[lab >= 0].tolist()) if g >= 0)
-        groups = [g for g in groups if (lab == g).sum() >= cfg.min_group]
+        floor = max(cfg.min_group,
+                    int(cfg.min_group_frac * max(1, int((lab >= 0).sum()))))
+        groups = [g for g in groups if (lab == g).sum() >= floor]
         self.split_tries = getattr(self, "split_tries", 0) + 1
-        if len(groups) < 2:
+        if len(groups) < min_groups or ratio < min_ratio or cov < min_cov:
             self.last_split_why = (
                 f"best '{name}' ratio {ratio:.3f} cov {cov:.2f} -> "
-                f"{len(groups)} group(s) >= {cfg.min_group} gaussians")
+                f"{len(groups)} group(s) >= {floor} gaussians "
+                f"(need {min_groups} groups, ratio {min_ratio:.2f}, cov {min_cov:.2f})")
             if self.debug:
                 print(f"[split {self.split_tries}] " + "  ".join(
                     f"{nm}:r={r:.3f},c={c:.2f}[{ng}]"
                     for nm, ng, r, c in self.last_scored))
+                print("             " + self._why_no_split())
             return False
 
+        prev = list(self.parts)
         self.parts = []
         gm = self.cloud.means.detach().cpu().numpy()
         for j, g in enumerate(groups):
             w = (lab == g).astype(np.float32)
-            self.parts.append(Part(weights=w, box=self._fit_box(w > 0.5),
-                                   track_idx=self._tracks_on(gm, w)))
+            part = Part(weights=w, box=self._fit_box(w > 0.5),
+                        track_idx=self._tracks_on(gm, w))
+            # a re-split must not throw away the pose the old part had: the new
+            # group inherits from whichever part holds most of its gaussians
+            if prev:
+                ov = [float((w * q.weights[:len(w)]).sum()) for q in prev]
+                src = prev[int(np.argmax(ov))]
+                if max(ov) > 0:
+                    part.pose = src.pose.copy()
+                    part.d_pose = None if src.d_pose is None else src.d_pose.copy()
+                    part.view_dirs = None if src.view_dirs is None else list(src.view_dirs)
+            self.parts.append(part)
         # each part is jointed to the biggest OTHER part
         order = np.argsort([-p.weights.sum() for p in self.parts])
         self.parts = [self.parts[k] for k in order]
         for j, p in enumerate(self.parts):
             p.parent = 1 if j == 0 else 0
             p.joint = JointModel() if len(self.parts) > 1 else None
+        was = self.state
         self.state = self.SPLIT
+        self.last_split_frame = self.n
         self.split_info = {"grouping": name, "ratio": ratio, "coverage": cov,
                            "frame": self.n, "n_parts": len(self.parts)}
-        print(f"[stream] split at frame {self.n}: {len(self.parts)} parts "
-              f"from '{name}' (ratio {ratio:.3f}, coverage {cov:.2f})")
+        print(f"[stream] {'re-split' if was == self.SPLIT else 'split'} at frame "
+              f"{self.n}: {len(self.parts)} parts from '{name}' "
+              f"(ratio {ratio:.3f}, coverage {cov:.2f})")
         return True
+
+    def _why_no_split(self):
+        """Separate the three ways a split fails: one motion, one-sided
+        assignment, or evidence that never became decisive."""
+        hy = getattr(self, "last_hyp_set", None) or []
+        uniq, sep = [], 0.0
+        for T in hy:
+            T = np.asarray(T)
+            if all(np.linalg.norm(T[:3, 3] - U[:3, 3]) > 0.008 or
+                   np.linalg.norm(T[:3, :3] - U[:3, :3]) > 0.02 for U in uniq):
+                uniq.append(T)
+        for a_ in uniq:
+            for b_ in uniq:
+                D = np.linalg.inv(a_) @ b_
+                ang = np.degrees(np.arccos(np.clip(
+                    (np.trace(D[:3, :3]) - 1) / 2, -1, 1)))
+                sep = max(sep, ang + 100 * np.linalg.norm(D[:3, 3]))
+        share = getattr(self, "last_share", np.zeros(1))
+        lo = self.assign.logodds
+        top2 = lo.topk(2, dim=1).values
+        margin = (top2[:, 0] - top2[:, 1]).cpu().numpy()
+        lab = self.assign.labels()
+        sizes = {int(g): int((lab == g).sum()) for g in set(lab.tolist()) if g >= 0}
+        return (f"hyp {len(uniq)} distinct / {len(hy)} (sep {sep:.1f}) "
+                f"share {np.round(share, 2).tolist()} | "
+                f"margin med {np.median(margin):.2f} p90 {np.percentile(margin, 90):.2f} "
+                f"(need 1.0) | undecided {int((lab < 0).sum())}/{len(lab)} "
+                f"| groups {sizes}")
 
     def _grouping_score(self, labels_full):
         """How much better does splitting explain the recent posteriors than not
@@ -559,6 +632,17 @@ class StreamingPartDiscovery:
         occ = [a.occupancy(p.pose, p.weights, self.K, H, W, dilate=2)
                if p.pose is not None else None for p in self.parts]
 
+        # how much observed object surface no part explains -- the direction the
+        # per-gaussian energy is blind to, since it only sums over gaussians
+        seen = mask_b & (depth > 0)
+        cov = None
+        for o in occ:
+            if o is not None:
+                o_np = o.cpu().numpy() if hasattr(o, "cpu") else o
+                cov = o_np if cov is None else (cov | o_np)
+        self.unmodelled = (float((seen & ~cov).sum()) / max(1, int(seen.sum()))
+                           if cov is not None else 1.0)
+
         R = a.residuals(hyps, self.K, H, W, depth, obs_mask=mask)
         Pm_t = a.soft_membership(R)
         Pm = Pm_t.detach().cpu().numpy()
@@ -621,7 +705,8 @@ class StreamingPartDiscovery:
                     [pred + np.linspace(-1.0, 1.0, 41) * max(span, 0.1), full])
                 Tg = [Tp @ jm.at(float(v)) for v in grid]
                 eg = a.fit_energy_batch(Tg, w, self.K, H, W, depth,
-                                        obs_mask=om, r_max=cfg.track_rmax)
+                                        obs_mask=om, r_max=cfg.track_rmax,
+                                        outside_w=cfg.outside_w)
                 for oi in np.argsort(eg)[:3]:
                     cands.append(Tg[int(oi)])
 
@@ -637,7 +722,8 @@ class StreamingPartDiscovery:
                 Tr = a.refine_pose(Tc, w, self.K, H, W, depth, iters=8,
                                    huber=0.04, obs_mask=om, visible=vz)
                 e = a.fit_energy(Tr, w, self.K, H, W, depth, obs_mask=om,
-                                 r_max=cfg.track_rmax, visible=vz)
+                                 r_max=cfg.track_rmax, visible=vz,
+                                 outside_w=cfg.outside_w)
                 if e < best_e:
                     best_T, best_e = Tr, e
             if best_T is None:
@@ -646,7 +732,8 @@ class StreamingPartDiscovery:
             Tf = a.refine_pose(best_T, w, self.K, H, W, depth, iters=8,
                                huber=0.006, obs_mask=om, visible=vz)
             ef = a.fit_energy(Tf, w, self.K, H, W, depth, obs_mask=om,
-                              r_max=cfg.track_rmax, visible=vz)
+                              r_max=cfg.track_rmax, visible=vz,
+                              outside_w=cfg.outside_w)
             if ef < best_e:
                 best_T, best_e = Tf, ef
 
@@ -693,6 +780,31 @@ class StreamingPartDiscovery:
                 # grow the dense model at the same moment: the surface that
                 # justified new tracks is the surface the model is missing
                 self._grow(rgb, depth, mask)
+
+        # ---- keep accumulating, so a part can still split later ----
+        # The hypotheses that matter now are the parts' own poses; feeding the
+        # global set alone would keep voting for the pre-split motion.
+        if cfg.resplit:
+            hy = [np.asarray(p.pose) for p in self.parts if p.pose is not None]
+            for T in hyps:
+                if len(hy) >= cfg.max_hyp:
+                    break
+                hy.append(np.asarray(T))
+            hy = hy[:cfg.max_hyp]
+            a.step_pointwise(hy, self.K, H, W, depth, obs_mask=mask)
+            Pm2 = a.soft_membership(
+                a.residuals(hy, self.K, H, W, depth, obs_mask=mask))
+            self.pose_log.append({"frame": i, "T": hy,
+                                  "P": Pm2.detach().cpu().numpy()})
+            if len(self.pose_log) > cfg.pose_log_max:
+                self.pose_log.pop(0)
+            since = i - getattr(self, "last_split_frame", 0)
+            if since >= cfg.resplit_wait and i % cfg.regroup_every == 0:
+                t0 = time.perf_counter()
+                self._try_split(min_groups=len(self.parts) + 1,
+                                min_ratio=cfg.resplit_min_ratio,
+                                min_cov=cfg.resplit_min_cov)
+                self.last_split_ms = (time.perf_counter() - t0) * 1e3
 
         # ---- online part modelling ----
         if cfg.grow_every > 0 and i % cfg.grow_every == 0:
@@ -924,31 +1036,55 @@ class StreamingPartDiscovery:
                               device=self.assign.device)
         mk = (torch.as_tensor(mask > 0, device=obs.device)
               if mask is not None else torch.ones_like(obs, dtype=torch.bool))
+        # Render everything first: "no model here" is only meaningful against
+        # the union of all parts, not against one part that never owned it.
+        shots = [(label,) + self.cloud.render(T, self.K, depth.shape[0],
+                                              depth.shape[1], subset=subset)
+                 for label, T, subset in items]
+        any_drawn = torch.zeros_like(obs, dtype=torch.bool)
+        for _, _, _, alpha in shots:
+            any_drawn |= alpha > 0.3
+        gap = (~any_drawn & mk & (obs > 0)).cpu().numpy()
+
         tiles = []
-        for label, T, subset in items:
-            col, dep_r, alpha = self.cloud.render(T, self.K, depth.shape[0],
-                                                  depth.shape[1], subset=subset)
+        for label, col, dep_r, alpha in shots:
             a_np = (alpha > 0.3).cpu().numpy()
 
             rgb_t = (col.clamp(0, 1) * 255).byte().cpu().numpy()
             rgb_t = cv2.cvtColor(rgb_t, cv2.COLOR_RGB2BGR)
             rgb_t[~a_np] = (32, 30, 28)
 
-            vis = (alpha > 0.3) & (obs > 0) & mk
+            # Four states, not two. Painting everything the model does not cover
+            # as background reads as "no error" when it means "not measured".
+            drawn = alpha > 0.3
+            vis = drawn & (obs > 0) & mk
             res = (dep_r - obs).abs().clamp(max=r_max) / r_max
             err = cv2.applyColorMap(
                 (res.cpu().numpy() * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
             err[~vis.cpu().numpy()] = (32, 30, 28)
+            # model is here but the live mask says the object is not
+            err[(drawn & ~mk).cpu().numpy()] = (200, 60, 200)
+            # object is here and no part at all explains it
+            err[gap] = (95, 95, 95)
 
             h = int(rgb_t.shape[0] * width / rgb_t.shape[1])
             rgb_t = cv2.resize(rgb_t, (width, h))
             err = cv2.resize(err, (width, h))
             cv2.putText(rgb_t, label, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                         (255, 255, 255), 1, cv2.LINE_AA)
+            if not tiles:
+                cv2.putText(err, f"unmodelled {100 * gap.sum() / max(1, int((mk & (obs > 0)).sum())):.0f}%",
+                            (6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                            (230, 230, 230), 1, cv2.LINE_AA)
             tiles.append(np.vstack([rgb_t, err]))
         if not tiles:
             return None
-        return np.hstack(tiles)
+        strip = np.hstack(tiles)
+        cv2.putText(strip, "blue-red residual | magenta model-outside-mask | "
+                           "grey object-explained-by-no-part",
+                    (6, strip.shape[0] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                    (190, 190, 190), 1, cv2.LINE_AA)
+        return strip
 
     def _draw_tracks(self, out, parts, pal):
         """The sparse point tracks, coloured by the part they belong to.

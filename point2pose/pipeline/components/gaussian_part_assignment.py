@@ -374,7 +374,8 @@ class GaussianPartAssignment:
         return out
 
     def fit_energy(self, T, weights, K, H, W, obs_depth, obs_mask=None,
-                   r_max=0.05, obs_rgb=None, color_w=0.0, visible=None):
+                   r_max=0.05, obs_rgb=None, color_w=0.0, visible=None,
+                   outside_w=0.0):
         """Truncated residual energy over ALL of a part's gaussians.
 
         `fit_error` is a median over the gaussians that happened to land on
@@ -393,12 +394,12 @@ class GaussianPartAssignment:
         e = self.fit_energy_batch([T], weights, K, H, W, obs_depth,
                                   obs_mask=obs_mask, r_max=r_max,
                                   obs_rgb=obs_rgb, color_w=color_w,
-                                  visible=visible)
+                                  visible=visible, outside_w=outside_w)
         return float(e[0])
 
     def fit_energy_batch(self, Ts, weights, K, H, W, obs_depth, obs_mask=None,
                          r_max=0.05, chunk=64, obs_rgb=None, color_w=0.0,
-                         visible=None):
+                         visible=None, outside_w=0.0):
         """`fit_energy` for many poses at once, over a part's members only.
 
         A joint reduces the pose to a scalar, and a scalar can be scanned
@@ -408,6 +409,7 @@ class GaussianPartAssignment:
         """
         Kt = torch.as_tensor(np.asarray(K), dtype=torch.float32, device=self.device)
         obs = torch.as_tensor(obs_depth, dtype=torch.float32, device=self.device)
+        mk = None
         if obs_mask is not None:
             mk = torch.as_tensor(obs_mask > 0, device=self.device)
             obs = torch.where(mk, obs, torch.zeros_like(obs))
@@ -437,6 +439,11 @@ class GaussianPartAssignment:
             uc, vc = u.clamp(0, W - 1), v.clamp(0, H - 1)
             zo = obs[vc, uc]
             r = torch.full_like(z, r_max)
+            if outside_w > 0 and mk is not None:
+                # landing where the live mask says there is no object is a
+                # definite error; missing depth is merely unknown. Charging both
+                # the same lets a pose slide the part off the object for free.
+                r = torch.where(ok & ~mk[vc, uc], r * (1.0 + outside_w), r)
             g = ok & (zo > 0)
             r[g] = torch.clamp(torch.abs(z[g] - zo[g]), max=r_max)
             if rgbt is not None:
@@ -578,6 +585,10 @@ class GaussianPartAssignment:
         self.logodds = torch.cat(
             [self.logodds, torch.zeros((n_new, self.logodds.shape[1]),
                                        device=self.device)], 0)
+        # the slot membership masks are per-gaussian too; leaving them short
+        # makes `_bind_slots` compare tensors of different length once growth
+        # and hypothesis binding run in the same session
+        self._pad_slot_members(n_new)
         return n_new
 
     def grow_parts(self, rgb, depth, K, mask, poses, weights, tol=0.02,
@@ -707,6 +718,10 @@ class GaussianPartAssignment:
         self.logodds = torch.cat(
             [self.logodds, torch.zeros((n_new, self.logodds.shape[1]),
                                        device=self.device)], 0)
+        # the slot membership masks are per-gaussian too; leaving them short
+        # makes `_bind_slots` compare tensors of different length once growth
+        # and hypothesis binding run in the same session
+        self._pad_slot_members(n_new)
         return n_new, owner
 
     def init_coassoc(self, n_sample=4000, seed=0):
@@ -914,6 +929,15 @@ class GaussianPartAssignment:
         keep = {c for c in set(lab) if (lab == c).sum() >= min_group}
         out = np.array([c if c in keep else -1 for c in lab])
         return out, self.co_idx.cpu().numpy()
+
+    def _pad_slot_members(self, n_new):
+        """Extend every slot mask with n_new False entries after cloud growth."""
+        for s_ in range(len(self._slot_members)):
+            m = self._slot_members[s_]
+            if m is None:
+                continue
+            self._slot_members[s_] = torch.cat(
+                [m, torch.zeros(n_new, dtype=m.dtype, device=m.device)], 0)
 
     def _bind_slots(self, wins, min_overlap=0.2):
         """Map this frame's hypotheses onto persistent slots by winner overlap."""
