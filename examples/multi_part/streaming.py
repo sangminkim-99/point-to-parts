@@ -101,11 +101,29 @@ class Config:
     # part depends on. 1 = every frame; raise it only against a measured cost.
     hyp_every: int = 1
     win_min_span: int = 4
-    co_sample: int = 4000
+    # A split attempt is dominated by agglomerative clustering of the
+    # co-association matrix, and that cost is roughly cubic in the sample count:
+    # measured in situ, one attempt costs 660-860 ms at 4000 and 46-52 ms at
+    # 1000. At 4000 every attempt stalls the stream for the best part of a
+    # second, which is the real reason part discovery felt so late -- the old
+    # gate (no attempt before frame 25, then once every 10) was hiding that cost
+    # rather than fixing it.
+    #
+    # Measured at 1000 against 4000 on pliers, storage and eyeglasses: the same
+    # number of parts, the same joint types, comparable tracking energies. The
+    # one real difference is on storage, where co-association wins the selection:
+    # its initial grouping covers 5% of the cloud instead of 19%, because only
+    # sampled gaussians can be labelled. The final parts come out similar only
+    # because online growth fills the rest back in.
+    co_sample: int = 1000
     min_group: int = 30
     # when to try splitting
-    min_frames_before_split: int = 25
-    regroup_every: int = 10
+    # With a cheap attempt the gate can be tight. Measured on pliers, moving
+    # from (25, 10) to (12, 3) pulled the split from frame 31 to 25 AND improved
+    # the parts -- tracking energy went from 0.02-0.04 to 0.0027/0.0017 -- because
+    # splitting earlier leaves more frames for each part's model to grow.
+    min_frames_before_split: int = 12
+    regroup_every: int = 3
     pose_log_max: int = 120
     # per-part tracking
     track_rmax: float = 0.05
@@ -309,7 +327,9 @@ class StreamingPartDiscovery:
 
         if (i >= cfg.min_frames_before_split
                 and i % cfg.regroup_every == 0):
+            t0 = time.perf_counter()
             self._try_split()
+            self.last_split_ms = (time.perf_counter() - t0) * 1e3
 
     def _try_split(self):
         """Offer the accumulated evidence to the model selection. Commit only a

@@ -30,6 +30,9 @@ def main():
     ap.add_argument("--n-points", type=int, default=None)
     ap.add_argument("--hyp-every", type=int, default=None)
     ap.add_argument("--tapir-res", type=int, default=480)
+    ap.add_argument("--co-sample", type=int, default=None)
+    ap.add_argument("--min-frames", type=int, default=None)
+    ap.add_argument("--regroup-every", type=int, default=None)
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
     args = ap.parse_args()
@@ -60,6 +63,12 @@ def main():
         cfg.n_points = args.n_points
     if args.hyp_every:
         cfg.hyp_every = args.hyp_every
+    if args.co_sample:
+        cfg.co_sample = args.co_sample
+    if args.min_frames:
+        cfg.min_frames_before_split = args.min_frames
+    if args.regroup_every:
+        cfg.regroup_every = args.regroup_every
     tracker = TapirTracker({"checkpoint_path": args.checkpoint,
                             "resize_height": args.tapir_res, "resize_width": args.tapir_res,
                             "visible_threshold": 0.5, "device": "cuda"})
@@ -75,13 +84,15 @@ def main():
           f"{len(frames)} frames")
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    writer, times, breakdown = None, [], {}
+    writer, times, breakdown, split_costs = None, [], {}, []
     for i in frames[1:]:
         rgb, dep, m = r.get_color(i), r.get_depth(i), object_mask(i)
         if m is None:
             continue
         s.step(rgb, dep, m)
         times.append(s.last_timings["total_ms"])
+        if getattr(s, "last_split_ms", None):
+            split_costs.append(s.last_split_ms); s.last_split_ms = None
         for k, v in s.last_timings.items():
             breakdown.setdefault(k, []).append(v)
 
@@ -106,6 +117,9 @@ def main():
           f"{np.percentile(t, 90):.1f} ms p90  ->  {1000/np.median(t):.1f} fps")
     for k, v in breakdown.items():
         print(f"[replay]   {k:12s} median {np.median(v):7.1f} ms")
+    if split_costs:
+        print(f"[replay]   split attempt  median {np.median(split_costs):7.1f} ms "
+              f"({len(split_costs)} attempts)")
     print(f"[replay] final state: {s.state}, {len(s.parts)} parts")
     for j, p in enumerate(s.parts):
         jm = p.joint

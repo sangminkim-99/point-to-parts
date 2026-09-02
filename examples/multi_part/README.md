@@ -69,6 +69,40 @@ its own RANSAC hypothesis from the tracks that sit on it, which is what a thin,
 fast-rotating part depends on — offline, removing it is where the scissors blade
 and the eyeglasses temple diverged.
 
+## Why part discovery used to appear so late
+
+A split attempt is not per-frame work and has nothing to do with the number of
+hypotheses. It is the grouping: log-odds labels, agglomerative clustering of the
+co-association matrix, winner-set clustering, a rigid-merge variant of each, and
+the model selection over all of them. Measured, one attempt:
+
+| co-association sample | cost per attempt |
+|---|---|
+| 4000 | 660&ndash;860 ms |
+| 2000 | 192 ms |
+| 1000 | 46&ndash;52 ms |
+| 500 | 10 ms |
+
+At 4000 samples every attempt stalls the stream for most of a second, which is
+why the split used to be gated to "not before frame 25, then once every 10". That
+gate *was* the latency. Lowering the sample count to 1000 makes an attempt cheap
+enough to gate at (12, 3) instead, and on pliers that pulled the split from frame
+31 to 25 while also improving the result: tracking energy went from 0.02&ndash;0.04
+to 0.0027/0.0017, because splitting earlier leaves more frames for each part's
+model to grow.
+
+Checked at 1000 against 4000 on pliers, storage and eyeglasses: same part count,
+same joint types, comparable energies. The one real difference is storage, where
+co-association wins the selection — its initial grouping covers 5% of the cloud
+instead of 19%, since only sampled gaussians can be labelled, and the final parts
+match only because growth fills the rest back in.
+
+The per-frame assignment, by contrast, was never the problem. It is not
+rasterisation: the rendering path exists but is unused, because rendering the
+whole cloud under every hypothesis conflates them (on RBO one hypothesis then
+"explained" 97.8% of pixels). What runs is a point-wise projection of each
+gaussian under each hypothesis against the observed depth, and it costs 22 ms.
+
 ## How the state machine works
 
 **RIGID.** One body, one box. Every frame proposes rigid-motion hypotheses from a
