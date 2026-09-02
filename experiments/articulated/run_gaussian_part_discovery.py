@@ -126,6 +126,12 @@ def main():
     ap.add_argument("--merge-rigid", type=int, default=1,
                     help="also offer a grouping in which groups that never move "
                          "relative to each other are merged")
+    ap.add_argument("--merge-eps", type=float, default=0.0,
+                    help="how much score a merged grouping may give up and still "
+                         "be preferred over the over-segmented one. Zero: at 0.03 "
+                         "the merge cost a whole part on RBO cabinet02 (3/3 at "
+                         "85.9%% became 2/3 at 73.4%%) by absorbing a real drawer. "
+                         "An exact tie is still taken, via the sort tie-break.")
     ap.add_argument("--merge-tol", type=float, default=0.012,
                     help="median point displacement below which two groups are "
                          "treated as one rigid body, metres")
@@ -677,6 +683,21 @@ def main():
           "  ".join(f"{n}={sc[0]:.3f}x{sc[1]:.2f}"
                     f"[{len(set(lb[lb >= 0].tolist()))}]"
                     for n, lb, _, sc in cand))
+    # Prefer the merged variant of whatever wins unless the score clearly
+    # disagrees. The merge test is itself evidence -- it only fires when two
+    # groups never move apart -- and the score has no complexity term, so an
+    # over-segmented grouping edges out its own merge by a hair. A per-group
+    # penalty is not the fix: any penalty large enough to matter here also makes
+    # a single group beat the correct 2-group split on the simulated scissors.
+    best_name = cand[0][0]
+    if not best_name.endswith("+merge"):
+        for e in cand[1:]:
+            if e[0] == best_name + "+merge" and \
+                    combined(e) >= combined(cand[0]) - args.merge_eps:
+                print(f"[g] taking the merged variant ({combined(e):.3f} vs "
+                      f"{combined(cand[0]):.3f}, within tolerance)")
+                cand = [e] + [c for c in cand if c is not e]
+                break
     chosen, lab, sub, _ = cand[0]
     print(f"[g] using '{chosen}' grouping")
     gt_lab_full = gt_lab
