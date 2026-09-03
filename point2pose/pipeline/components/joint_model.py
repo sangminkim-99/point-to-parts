@@ -37,7 +37,10 @@ class JointModel:
     pose for any joint value.
     """
 
-    def __init__(self, min_obs=8, min_angle_deg=6.0, min_shift=0.02):
+    def __init__(self, min_obs=8, min_angle_deg=1.5, min_shift=0.004):
+        # Refusing to fit below 6 degrees or 2 cm hides exactly the case the
+        # wiggle demo is about. The fit is attempted far earlier and confidence()
+        # reports how little the joint has been exercised instead.
         self.A = []
         self.min_obs = int(min_obs)
         self.min_angle = np.radians(min_angle_deg)
@@ -46,6 +49,9 @@ class JointModel:
         self.axis = None          # unit direction, parent frame
         self.point = None         # a point on the axis (revolute only)
         self.A0 = None            # the relative transform at value 0
+        self.conf = None          # dict from confidence(); None until fitted
+        self.sigma = 0.003        # metres of observation noise, for the BIC
+        self.bic = {}             # per-candidate BIC, lowest wins
 
     def add(self, A):
         # a degenerate rotation block gives scipy a zero-norm quaternion
@@ -87,13 +93,29 @@ class JointModel:
         d = t[np.argmax(nrm)]
         return "prismatic", d / (np.linalg.norm(d) + 1e-12), np.zeros(3)
 
+    # Sturm, Stachniss & Burgard (JAIR 2011) count k = 6 for a rigid link,
+    # 9 for prismatic and 12 for revolute, and select on the lowest BIC.
+    K_PARAMS = {"rigid": 6, "prismatic": 9, "revolute": 12}
+
     def _score(self, model, A):
+        """Mean squared residual of a candidate over the history."""
         kind, axis, point = model
         keep = (self.kind, self.axis, self.point)
         self.kind, self.axis, self.point = kind, axis, point
-        r = float(np.mean([self.residual(a) for a in A]))
+        r = float(np.mean([self.residual(a) ** 2 for a in A]))
         self.kind, self.axis, self.point = keep
         return r
+
+    def _bic(self, kind, mse, n):
+        """BIC(M) = -2 log p + k log n, Gaussian noise, constants dropped.
+
+        A pure translation is explained perfectly by a revolute joint with a
+        very large radius -- Sturm et al. measure 1.7 mm for the drawer against
+        1.6 mm for the prismatic fit -- so residual alone can never separate
+        them. Revolute pays for its three extra parameters instead.
+        """
+        s2 = max(self.sigma, 1e-4) ** 2
+        return n * mse / s2 + self.K_PARAMS[kind] * np.log(max(n, 2))
 
     def fit(self):
         """Fit the axis from the accumulated relative transforms.
@@ -119,9 +141,73 @@ class JointModel:
             cands.append(m)
         if not cands:
             return False
-        best = min(cands, key=lambda m: self._score(m, A))
-        self.kind, self.axis, self.point = best
+        n = len(A)
+        rows = []
+        for m in cands:
+            mse = self._score(m, A)
+            rows.append((self._bic(m[0], mse, n), mse, m))
+        rows.sort(key=lambda x: x[0])
+        self.bic = {m[0]: b for b, _, m in rows}
+        self.kind, self.axis, self.point = rows[0][2]
+        self._confidence(A, ang, t, rows)
         return True
+
+    # --------------------------------------------------------- confidence --
+    def _confidence(self, A, ang, t, rows, boots=16,
+                    axis_scale_deg=8.0, min_range_deg=8.0, min_range_m=0.02):
+        """How sure the fit is, split into the three things that can be wrong.
+
+        A joint can be mis-typed, its axis can be loose, or it can simply not
+        have been exercised: 2 degrees of observed motion pins no axis however
+        small the residual. Reporting one number without the three would hide
+        which of them the human has to fix by moving the object more.
+        """
+        rng = np.random.default_rng(0)
+        # type: a BIC difference is approximately twice a log Bayes factor
+        b = np.array([x[0] for x in rows], dtype=np.float64)
+        w = np.exp(-0.5 * np.clip(b - b.min(), 0, 700))
+        type_p = float(w[0] / w.sum()) if w.size > 1 else 1.0
+
+        # axis: the spread of the axis over bootstrap resamples of the history
+        keep = (self.kind, self.axis, self.point)
+        axes = []
+        n = len(A)
+        for _ in range(boots if n >= 6 else 0):
+            i = rng.integers(0, n, n)
+            m = (self._fit_revolute(A[i], ang[i], t[i]) if self.kind == "revolute"
+                 else self._fit_prismatic(A[i], ang[i], t[i]))
+            if m is not None:
+                axes.append(m[1] * np.sign(np.dot(m[1], keep[1]) or 1.0))
+        self.kind, self.axis, self.point = keep
+        if len(axes) >= 4:
+            V = np.stack(axes)
+            mean = V.mean(0)
+            mean /= np.linalg.norm(mean) + 1e-12
+            axis_std = float(np.degrees(np.arccos(
+                np.clip(V @ mean, -1, 1)).std()))
+        else:
+            axis_std = float("nan")
+
+        # excitation: how far the joint has actually been moved
+        vals = np.array([self.value_of(a) for a in A])
+        span = float(vals.max() - vals.min()) if vals.size else 0.0
+        need = np.radians(min_range_deg) if self.kind == "revolute" else min_range_m
+        exc = float(np.clip(span / max(need, 1e-9), 0.0, 1.0))
+
+        axis_ok = 1.0 if axis_std != axis_std else \
+            float(np.exp(-axis_std / axis_scale_deg))
+        self.conf = {"type_p": type_p, "axis_std_deg": axis_std, "span": span,
+                     "excitation": exc, "n": int(n),
+                     "rmse": float(np.sqrt(rows[0][1])),
+                     "bic": dict(self.bic),
+                     "conf": float(type_p * axis_ok * exc)}
+        return self.conf
+
+    def confidence(self):
+        """The last fit's confidence, or zeros if it has never been fitted."""
+        return self.conf or {"type_p": 0.0, "axis_std_deg": float("nan"),
+                             "span": 0.0, "excitation": 0.0, "n": len(self.A),
+                             "rmse": float("nan"), "bic": {}, "conf": 0.0}
 
     # --------------------------------------------------------------- pose --
     def at(self, value):

@@ -77,6 +77,9 @@ class NaiveConfig:
     # six. Searching that scalar instead is what survives occlusion.
     joint_track: bool = True
     joint_min_obs: int = 12
+    # The object is "controllable" once a joint is identified well enough to
+    # command a target q; that moment, not the runtime, is the online claim.
+    joint_conf: float = 0.6
     joint_tol: float = 1.3              # x the free fit's residual before falling back
     joint_grid: int = 61
     # A thin object leaves most SuperPoint picks on invalid depth -- pliers01
@@ -86,6 +89,14 @@ class NaiveConfig:
     reseed_points: int = 24
     reseed_every: int = 6
     max_points: int = 400
+    # Re-seeding anchors new tracks through the pose held at that moment, so a
+    # pose that is even slightly off writes the error into them; they then
+    # disagree with the older tracks, the outlier share rises and the part
+    # splits again. Fresh tracks therefore carry no split evidence until they
+    # have been watched, and no part re-seeds through a pose it cannot trust.
+    track_grace: int = 12               # frames before a track may vote
+    reseed_max_resid: float = 0.012     # metres; pose must explain the old ones
+    reseed_gap: int = 20                # frames between re-seeds of one part
     sampler: str = "super_point_balanced"
     sampler_cell: int = -1
     sampler_nms: float = 0.0
@@ -114,8 +125,11 @@ class NaivePart:
     resid: float = 0.0
     sigma: float = 0.004                # robust noise scale of this part's fit
     out_frac: float = 0.0
+    n_mature: int = 0
     on_joint: bool = False
+    box: object = None                  # oriented box in the anchor frame
     born: int = 0
+    last_seed: int = -999
     energy: float = float("inf")
     over: int = 0                       # consecutive frames above split_res
 
@@ -149,7 +163,9 @@ class NaivePartTracker:
             pts0 = self._top_up(pts0, depth, mask, self.cfg.n_points)
         self.pts0 = pts0
         self.anchor_xyz, self.anchor_ok = lift(pts0, depth, self.K)
+        self.track_born = np.zeros(len(pts0), np.int32)
         self.parts = [NaivePart(idx=np.where(self.anchor_ok)[0])]
+        self.parts[0].box = self._fit_box(self.parts[0])
         self.n = 1
         n = len(self.anchor_xyz)
         self.co_same = np.zeros((n, n), np.float32)
@@ -200,6 +216,8 @@ class NaivePartTracker:
             for j, p in enumerate(list(self.parts)):
                 if self.n - p.born < cfg.part_settle:
                     continue
+                if p.n_mature < 2 * cfg.min_part_pts:
+                    continue
                 if p.over >= cfg.split_frames and self._split(j, cur, cur_ok, vis):
                     self.last_split = i
                     break
@@ -208,10 +226,14 @@ class NaivePartTracker:
             if p.joint is None or j == p.parent or p.parent >= len(self.parts):
                 continue
             if p.resid < cfg.joint_gate:
+                # the BIC needs the real observation noise, and the fit itself
+                # is the only thing that knows it
+                p.joint.sigma = max(p.sigma, self.parts[p.parent].sigma)
                 A = np.linalg.inv(self.parts[p.parent].pose) @ p.pose
                 p.joint.add(A)
                 if p.joint.kind is None or len(p.joint.A) % 4 == 0:
-                    p.joint.fit()
+                    if p.joint.fit():
+                        self._note_controllable(j, p, i)
 
         if cfg.top_up and i % cfg.reseed_every == 0:
             self._reseed(rgb, depth, mask, i)
@@ -297,6 +319,10 @@ class NaivePartTracker:
             live = int((cok[idx] & cvi[idx]).sum()) if idx.size else 0
             if live >= cfg.min_live or len(self.anchor_xyz) >= cfg.max_points:
                 continue
+            if i - p.last_seed < cfg.reseed_gap:
+                continue
+            if p.resid > cfg.reseed_max_resid:
+                continue        # do not anchor through a pose that has slipped
             m = mask.copy()
             if idx.size >= 3 and len(self.parts) > 1:
                 q = t2[idx].astype(int)
@@ -322,11 +348,33 @@ class NaivePartTracker:
                 [self.anchor_xyz, (xyz @ Ti[:3, :3].T + Ti[:3, 3]).astype(np.float32)])
             self.anchor_ok = np.concatenate([self.anchor_ok, ok])
             p.idx = np.concatenate([p.idx, base + np.where(ok)[0]])
+            self.track_born = np.concatenate(
+                [self.track_born, np.full(len(new), i, np.int32)])
+            p.last_seed = i
             added += int(ok.sum())
         if added:
+            for p in self.parts:
+                p.box = self._fit_box(p)
             print(f"[naive] frame {i}: re-seeded {added} tracks "
                   f"({len(self.anchor_xyz)} total)")
         return added
+
+    def _note_controllable(self, j, part, i):
+        """First moment a joint is pinned down well enough to command."""
+        c = part.joint.confidence()
+        if c["conf"] < self.cfg.joint_conf or hasattr(self, "controllable"):
+            return
+        self.controllable = {
+            "frame": int(i), "part": int(j), "kind": part.joint.kind,
+            "conf": c["conf"], "axis_std_deg": c["axis_std_deg"],
+            "span": c["span"], "split_frame": self.split_log[0][0]
+            if self.split_log else None}
+        span = (np.degrees(c["span"]) if part.joint.kind == "revolute"
+                else c["span"] * 1000)
+        unit = "deg" if part.joint.kind == "revolute" else "mm"
+        print(f"[naive] CONTROLLABLE at frame {i}: part {j} {part.joint.kind}, "
+              f"conf {c['conf']:.2f}, axis +-{c['axis_std_deg']:.1f} deg, "
+              f"observed {span:.1f} {unit}")
 
     def _fit_joint(self, part, sel, cur):
         """Search the joint's scalar instead of a free SE(3), when it is known."""
@@ -336,6 +384,8 @@ class NaivePartTracker:
             return None
         if len(jm.A) < cfg.joint_min_obs or part.parent >= len(self.parts):
             return None
+        if jm.confidence()["conf"] < cfg.joint_conf:
+            return None         # an unexercised axis constrains nothing
         Tp = self.parts[part.parent].pose
         if Tp is None:
             return None
@@ -392,7 +442,11 @@ class NaivePartTracker:
             else cfg.sigma_floor
         part.sigma = float(np.clip(max(sig, np.median(inl) if inl.size else 0.0),
                                    cfg.sigma_floor, cfg.sigma_ceil))
-        part.out_frac = float(np.mean(d > cfg.split_out_band * part.sigma))
+        # a track only a few frames old has not earned a vote on articulation
+        mature = self.track_born[sel] <= self.n - cfg.track_grace
+        dm = d[mature] if mature.any() else d
+        part.out_frac = float(np.mean(dm > cfg.split_out_band * part.sigma))
+        part.n_mature = int(mature.sum())
         hot = (part.out_frac > cfg.split_out_frac) or (part.resid > cfg.split_res)
         part.over = part.over + 1 if hot else 0
 
@@ -438,6 +492,23 @@ class NaivePartTracker:
         S = P.T @ P
         self.co_same[np.ix_(sel, sel)] += w * S
         self.co_seen[np.ix_(sel, sel)] += w
+
+    def _fit_box(self, part):
+        """Oriented box around this part's anchor-frame points."""
+        try:
+            from experiments.articulated.demo_part_discovery import fit_oriented_box
+        except Exception:
+            return None
+        idx = part.idx[part.idx < len(self.anchor_xyz)]
+        q = self.anchor_xyz[idx[self.anchor_ok[idx]]]
+        if q.shape[0] < 6:
+            return None
+        try:
+            # one stray track would otherwise stretch the box across the scene
+            d = np.linalg.norm(q - np.median(q, axis=0), axis=1)
+            return fit_oriented_box(q[d <= np.percentile(d, 90)])
+        except Exception:
+            return None
 
     def _sep_sigma(self, groups, motions, part):
         """How far the groups' own points move if you swap the two motions.
@@ -493,6 +564,7 @@ class NaivePartTracker:
         cfg = self.cfg
         part = self.parts[j]
         idx = part.idx[(part.idx < len(cur_ok)) & (part.idx < len(self.anchor_ok))]
+        idx = idx[self.track_born[idx] <= self.n - cfg.track_grace]
         sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
         if sel.size < 2 * cfg.min_part_pts:
             return False
@@ -568,6 +640,8 @@ class NaivePartTracker:
                 p.joint = JointModel()
         if self.model is not None:
             self._split_labels(j, new, cur, cur_ok)
+        for p in self.parts:
+            p.box = self._fit_box(p)
         self.state = self.SPLIT
         self.split_log.append((self.n, len(self.parts)))
         # how much relative motion it actually took, which is the number the
@@ -609,13 +683,19 @@ class NaivePartTracker:
 
     # ---- visualisation ----
     def render(self, bgr, palette=None):
+        """Tracks coloured by part, an oriented 3D box and pose axes per part,
+        and the fitted joint axis -- the same read-out as the dense pipeline."""
         import cv2
+        from point2pose.utils.visualization import draw_oriented_3d_box
         pal = palette or [(60, 140, 235), (200, 120, 40), (70, 180, 90),
-                          (200, 80, 200), (60, 200, 200)]
+                          (200, 80, 200), (60, 200, 200), (90, 90, 235)]
+        K = self.K
+        out = bgr
         cur, cur_ok, vis = getattr(self, "cur", (None, None, None))
         t2 = getattr(self, "cur_tracks_2d", None)
         if t2 is None:
-            return bgr
+            return out
+
         owner = np.full(len(t2), -1)
         for j, p in enumerate(self.parts):
             owner[p.idx[p.idx < len(t2)]] = j
@@ -623,18 +703,64 @@ class NaivePartTracker:
             if not (cur_ok[k] and vis[k]):
                 continue
             col = (110, 110, 110) if owner[k] < 0 else pal[owner[k] % len(pal)]
-            cv2.circle(bgr, (int(x), int(y)), 3, col, -1, cv2.LINE_AA)
+            cv2.circle(out, (int(x), int(y)), 3, col, -1, cv2.LINE_AA)
+
+        def proj(P):
+            if P[2] <= 1e-3:
+                return None
+            return (int(P[0] * K[0, 0] / P[2] + K[0, 2]),
+                    int(P[1] * K[1, 1] / P[2] + K[1, 2]))
+
         for j, p in enumerate(self.parts):
-            q = t2[p.idx[p.idx < len(t2)]]
-            if len(q) < 3:
+            col = pal[j % len(pal)]
+            if p.box is None:
+                p.box = self._fit_box(p)
+            if p.box is not None and p.pose is not None:
+                try:
+                    out = draw_oriented_3d_box(K, out, p.pose, p.box,
+                                               line_color=col, linewidth=2)
+                except Exception:
+                    pass
+            idx = p.idx[p.idx < len(self.anchor_xyz)]
+            q = self.anchor_xyz[idx[self.anchor_ok[idx]]]
+            if q.shape[0] < 3 or p.pose is None:
                 continue
-            x0, y0 = q.min(0).astype(int)
-            x1, y1 = q.max(0).astype(int)
-            cv2.rectangle(bgr, (x0, y0), (x1, y1), pal[j % len(pal)], 2)
+            c = q.mean(0)
+            org = p.pose[:3, :3] @ c + p.pose[:3, 3]
+            p0 = proj(org)
+            for ax, acol in zip(np.eye(3) * 0.05,
+                                [(60, 60, 235), (60, 220, 60), (235, 160, 60)]):
+                p1 = proj(p.pose[:3, :3] @ (c + ax) + p.pose[:3, 3])
+                if p0 and p1:
+                    cv2.arrowedLine(out, p0, p1, acol, 2, cv2.LINE_AA,
+                                    tipLength=0.3)
             lab = f"p{j} {p.resid * 1000:.0f}mm {100 * p.out_frac:.0f}%"
             if p.joint is not None and p.joint.kind:
                 lab += f" {p.joint.kind[:4]}" + ("*" if p.on_joint else "")
-            cv2.putText(bgr, lab, (x0, max(12, y0 - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                        pal[j % len(pal)], 1, cv2.LINE_AA)
-        return bgr
+            if p0:
+                cv2.putText(out, lab, (p0[0] - 30, p0[1] - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+
+        # the joint axis, drawn once per pair in the parent's frame
+        drawn = set()
+        for j, p in enumerate(self.parts):
+            jm = p.joint
+            if jm is None or jm.kind is None or p.parent >= len(self.parts):
+                continue
+            key = tuple(sorted((j, p.parent)))
+            if key in drawn:
+                continue
+            drawn.add(key)
+            Tp = self.parts[p.parent].pose
+            if Tp is None:
+                continue
+            base = jm.point if (jm.kind == "revolute" and jm.point is not None) \
+                else np.zeros(3)
+            a0 = Tp[:3, :3] @ (base - jm.axis * 0.08) + Tp[:3, 3]
+            a1 = Tp[:3, :3] @ (base + jm.axis * 0.08) + Tp[:3, 3]
+            q0, q1 = proj(a0), proj(a1)
+            if q0 and q1:
+                cv2.line(out, q0, q1, (20, 20, 20), 3, cv2.LINE_AA)
+                cv2.putText(out, jm.kind, q1, cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (20, 20, 20), 1, cv2.LINE_AA)
+        return out
