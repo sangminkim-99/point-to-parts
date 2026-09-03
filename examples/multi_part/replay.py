@@ -216,8 +216,19 @@ def main():
           f"{getattr(s, 'grow_blocked', 0)} blocked by the energy gate "
           f"(rel gate {cfg.grow_gate_rel}); part energies "
           f"{[round(p.energy, 4) for p in s.parts]}")
+    n0 = getattr(s, "n_initial", None)
+    if n0:
+        import numpy as _np
+        gm = s.cloud.means.detach().cpu().numpy()
+        for j, pt in enumerate(s.parts):
+            w = pt.weights[:len(gm)] > 0.5
+            orig = int(w[:n0].sum()); grown = int(w[n0:].sum())
+            ext = _np.round(gm[w].max(0) - gm[w].min(0), 3) if w.any() else None
+            print(f"[replay]   part {j}: {orig} original + {grown} grown, extent {ext}")
     if getattr(s, "unmodelled", None) is not None:
         print(f"[replay] unmodelled object surface: {100 * s.unmodelled:.0f}%")
+    if getattr(s, "pruned_total", 0):
+        print(f"[replay] pruned {s.pruned_total} gaussians no part explained")
     print(f"[replay] final state: {s.state}, {len(s.parts)} parts")
     for j, p in enumerate(s.parts):
         jm = p.joint

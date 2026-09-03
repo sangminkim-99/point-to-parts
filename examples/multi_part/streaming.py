@@ -189,6 +189,16 @@ class Config:
     min_frames_before_split: int = 12
     # part discovery was one-shot: once SPLIT, _try_split was never called
     # again, so a third part could not be found no matter what moved
+    # Membership was frozen at the split, so a part kept a copy of its
+    # neighbour's surface from frame 0 and drew it at its old place forever.
+    # Co-Fusion (Runz & Agapito 2017) removes such geometry from the model it
+    # was wrongly left in rather than moving it, and EM-Fusion (Strecke &
+    # Stueckler 2019) re-infers the association every frame with an explicit
+    # "belongs to nothing" outlier term.
+    prune: bool = True
+    prune_votes: int = 3
+    prune_every: int = 3
+    prune_margin: float = 0.03          # metres the sensor must see past the model
     resplit: bool = True
     resplit_wait: int = 12              # frames of evidence after a split
     # A re-split has to earn its extra part. Without a floor the grouping with
@@ -300,6 +310,7 @@ class StreamingPartDiscovery:
         self.pose_log = []
         self.n = 1
         self.whole_pose = np.eye(4)
+        self.n_initial = len(self.cloud)
         self.whole_box = self._fit_box(np.ones(len(self.cloud), bool))
         return self
 
@@ -899,6 +910,46 @@ class StreamingPartDiscovery:
                 # grow the dense model at the same moment: the surface that
                 # justified new tracks is the surface the model is missing
                 self._grow(rgb, depth, mask)
+
+        # ---- carve away surface the sensor sees straight through ----
+        # Residuals mark a gaussian projecting outside the mask as UNOBSERVED,
+        # which is exactly where a ghost copy of a neighbouring part lands, so
+        # it is never questioned. Free-space carving asks the opposite: if the
+        # sensor reports something BEHIND where this part claims surface, the
+        # space between is empty and the claim is wrong. A hand in front gives
+        # the other sign and is left alone, which is EM-Fusion's unoccluded-only
+        # update stated per gaussian.
+        if cfg.prune and self.parts and i % cfg.prune_every == 0:
+            dt = torch.as_tensor(depth, dtype=torch.float32, device=a.device)
+            gmm = self.cloud.means
+            Kt = torch.as_tensor(self.K, dtype=torch.float32, device=a.device)
+            n = len(self.cloud)
+            free = np.zeros(n, bool)
+            for j, p in enumerate(self.parts):
+                T = torch.as_tensor(p.pose, dtype=torch.float32, device=a.device)
+                q = gmm @ T[:3, :3].T + T[:3, 3]
+                z = q[:, 2]
+                u = (q[:, 0] * Kt[0, 0] / z + Kt[0, 2]).round().long()
+                v_ = (q[:, 1] * Kt[1, 1] / z + Kt[1, 2]).round().long()
+                ok = (z > 1e-3) & (u >= 0) & (u < W) & (v_ >= 0) & (v_ < H)
+                zo = torch.zeros_like(z)
+                zo[ok] = dt[v_[ok].clamp(0, H - 1), u[ok].clamp(0, W - 1)]
+                carve = (ok & (zo > 0) & (zo > z + cfg.prune_margin)).cpu().numpy()
+                free |= carve & (p.weights[:n] > 0.5)
+            v = getattr(self, "_prune_votes", np.zeros(0, np.int16))
+            if len(v) < n:
+                v = np.concatenate([v, np.zeros(n - len(v), np.int16)])
+            v[:n] = np.where(free, v[:n] + 1, 0)
+            self._prune_votes = v
+            go = np.where(v[:n] >= cfg.prune_votes)[0]
+            if go.size:
+                for p in self.parts:
+                    p.weights[go] = 0.0
+                v[go] = 0
+                self.pruned_total = getattr(self, "pruned_total", 0) + int(go.size)
+                gm2 = self.cloud.means.detach().cpu().numpy()
+                for p in self.parts:
+                    p.box = self._fit_box(p.weights[:len(gm2)] > 0.5)
 
         # ---- keep accumulating, so a part can still split later ----
         # The hypotheses that matter now are the parts' own poses; feeding the

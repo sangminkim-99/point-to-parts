@@ -593,7 +593,7 @@ class GaussianPartAssignment:
 
     def grow_parts(self, rgb, depth, K, mask, poses, weights, tol=0.02,
                    stride=3, max_new=1500, max_total=300000, grow_ok=None,
-                   max_adj_px=25.0):
+                   max_adj_px=25.0, dedup_vox=0.004, confirm=2):
         """Attach newly revealed surface to the part it is adjacent to.
 
         `grow` anchors new points through the *first* hypothesis, which is fine
@@ -719,6 +719,52 @@ class GaussianPartAssignment:
             pa[g] = ((pc[g] - Ta[:3, 3]) @ Ta[:3, :3]).float()
 
         c = self.cloud
+        # Surface the model already holds must not be added again, and surface
+        # belonging to another moving part must never be absorbed at all. A pixel
+        # of a moving part lands somewhere different in THIS part's frame every
+        # step, so it is never seen twice there, while stationary newly revealed
+        # surface is. Committing only on the second sighting is what stops a
+        # neighbour being baked in over and over as it swings past.
+        if dedup_vox > 0 and pa.shape[0]:
+            def vox(pts):
+                q = torch.floor(pts / dedup_vox).long()
+                return (q[:, 0] * 73856093) ^ (q[:, 1] * 19349663) ^ (q[:, 2] * 83492791)
+            own_t = torch.as_tensor(owner, device=self.device)
+            fresh = torch.ones(pa.shape[0], dtype=torch.bool, device=self.device)
+            for k, w in enumerate(weights):
+                g = own_t == k
+                if not g.any():
+                    continue
+                wt = torch.as_tensor(w, dtype=torch.float32, device=self.device)
+                held = c.means[wt[:len(c)] > 0.5]
+                if held.shape[0]:
+                    fresh[g] &= ~torch.isin(vox(pa[g]), vox(held))
+            if not bool(fresh.any()):
+                return 0, None
+            pa, cols, foot = pa[fresh], cols[fresh], foot[fresh]
+            owner = owner[fresh.cpu().numpy()]
+
+            if confirm > 1 and pa.shape[0]:
+                keys = (vox(pa) * 97 + torch.as_tensor(owner, device=self.device)
+                        ).cpu().numpy()
+                seen = getattr(self, "_grow_seen", {})
+                age = getattr(self, "_grow_age", 0) + 1
+                ok = np.zeros(len(keys), bool)
+                for i_, kk in enumerate(keys):
+                    n_, t_ = seen.get(int(kk), (0, 0))
+                    n_ = n_ + 1 if age - t_ <= 3 else 1
+                    seen[int(kk)] = (n_, age)
+                    ok[i_] = n_ >= confirm
+                if age % 20 == 0:
+                    seen = {a_: b_ for a_, b_ in seen.items() if age - b_[1] <= 3}
+                self._grow_seen, self._grow_age = seen, age
+                if not ok.any():
+                    return 0, None
+                kt2 = torch.as_tensor(ok, device=self.device)
+                pa, cols, foot = pa[kt2], cols[kt2], foot[kt2]
+                owner = owner[ok]
+            n_new = int(pa.shape[0])
+
         c.means = torch.cat([c.means, pa], 0)
         c.colors = torch.cat([c.colors, cols], 0)
         c.scales = torch.cat([c.scales, foot[:, None].repeat(1, 3)], 0)
