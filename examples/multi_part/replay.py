@@ -76,6 +76,20 @@ def main():
     ap.add_argument("--joint-track", type=int, default=None)
     ap.add_argument("--top-up", type=int, default=None)
     ap.add_argument("--mask-gate", type=int, default=None)
+    ap.add_argument("--persist", type=int, default=None)
+    ap.add_argument("--part-settle", type=int, default=None)
+    ap.add_argument("--co-gap", type=float, default=None)
+    ap.add_argument("--co-min-seen", type=float, default=None)
+    ap.add_argument("--split-sep-sigma", type=float, default=None)
+    ap.add_argument("--split-out-band", type=float, default=None)
+    ap.add_argument("--frame-fallback", type=int, default=None)
+    ap.add_argument("--frame-after", type=int, default=None)
+    ap.add_argument("--sampler", default=None,
+                    help="super_point_balanced | super_point_fps | super_point "
+                         "| uniform_fps | orb | random")
+    ap.add_argument("--occlude", default=None,
+                    help="START:END:FRAC -- hide FRAC of the object's bounding "
+                         "box (depth and mask) between those frames")
     ap.add_argument("--urdf", default=None,
                     help="write the discovered object out as a URDF")
     ap.add_argument("--resplit-cov-frac", type=float, default=None)
@@ -141,6 +155,8 @@ def main():
     cfg = Config()
     if args.n_points:
         cfg.n_points = args.n_points
+    if args.sampler:
+        cfg.sampler = args.sampler
     if args.hyp_every:
         cfg.hyp_every = args.hyp_every
     if args.co_sample:
@@ -208,7 +224,18 @@ def main():
                       else bool(args.joint_track)),
                      ("top_up", None if args.top_up is None else bool(args.top_up)),
                      ("mask_gate", None if args.mask_gate is None
-                      else bool(args.mask_gate))):
+                      else bool(args.mask_gate)),
+                     ("persist", None if args.persist is None
+                      else bool(args.persist)),
+                     ("part_settle", args.part_settle),
+                     ("co_gap", args.co_gap),
+                     ("co_min_seen", args.co_min_seen),
+                     ("split_sep_sigma", args.split_sep_sigma),
+                     ("split_out_band", args.split_out_band),
+                     ("frame_fallback", None if args.frame_fallback is None
+                      else bool(args.frame_fallback)),
+                     ("frame_after", args.frame_after),
+                     ("sampler", args.sampler)):
             if v is not None:
                 setattr(ncfg, k, v)
         s = NaivePartTracker(r.K, ncfg, tracker, reg)
@@ -240,10 +267,25 @@ def main():
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     writer, times, breakdown, split_costs = None, [], {}, []
+    occ = None
+    if args.occlude:
+        a0, a1, fr = args.occlude.split(":")
+        occ = (int(a0), int(a1), float(fr))
+        print(f"[replay] occluding {100 * occ[2]:.0f}% of the object "
+              f"from frame {occ[0]} to {occ[1]}")
+
     for i in frames[1:]:
         rgb, dep, m = r.get_color(i), r.get_depth(i), object_mask(i)
         if m is None:
             continue
+        if occ is not None and occ[0] <= i < occ[1]:
+            ys, xs = np.where(m > 0)
+            if len(xs):
+                # hide the right-hand slice of the object, sensor and all
+                cut = int(xs.min() + (1.0 - occ[2]) * (xs.max() - xs.min()))
+                m = m.copy(); m[:, cut:] = 0
+                dep = dep.copy(); dep[:, cut:] = 0
+                rgb = rgb.copy(); rgb[:, cut:] = 0
         s.step(rgb, dep, m)
         times.append(s.last_timings["total_ms"])
         if getattr(s, "last_split_ms", None):

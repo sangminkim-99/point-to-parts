@@ -11,10 +11,13 @@ axes and joint axis.
     s            start
     h            toggle the per-hypothesis residual strip
     r            reset
+    u            write the URDF (needs --urdf PATH)
     q            quit
 
-Front-end modelled on `examples/realsense_tracking/realsense_tracking.py`; the
-method itself lives in `streaming.py`.
+--method naive runs the sparse-only tracker in `naive.py` (steps 1-3), with the
+gaussian model and the render-based refinement as optional layers on top of it;
+--method dense runs the gaussian pipeline in `streaming.py`. Front-end modelled
+on `examples/realsense_tracking/realsense_tracking.py`.
 """
 
 import argparse
@@ -35,10 +38,25 @@ class RealSenseMultiPart:
         import pyrealsense2 as rs
 
         self.args = args
-        self.cfg = Config()
+        if getattr(args, "method", "dense") == "naive":
+            from examples.multi_part.naive import NaiveConfig
+            self.cfg = NaiveConfig(dense=bool(getattr(args, "dense", 0)),
+                                   refine=bool(getattr(args, "dense", 0)
+                                               and getattr(args, "refine", 0)))
+        else:
+            self.cfg = Config()
         if args.n_points:
             self.cfg.n_points = args.n_points
-        if args.hyp_every:
+        for k, v in (("sampler", args.sampler),
+                     ("split_out_frac", args.split_out_frac),
+                     ("min_part_pts", args.min_part_pts),
+                     ("joint_track", None if args.joint_track is None
+                      else bool(args.joint_track)),
+                     ("persist", None if args.persist is None
+                      else bool(args.persist))):
+            if v is not None and hasattr(self.cfg, k):
+                setattr(self.cfg, k, v)
+        if args.hyp_every and hasattr(self.cfg, "hyp_every"):
             self.cfg.hyp_every = args.hyp_every
         if args.pips_iter:
             self.cfg.num_pips_iter = args.pips_iter
@@ -87,6 +105,25 @@ class RealSenseMultiPart:
         bgr = np.asanyarray(c.get_data())
         depth = np.asanyarray(d.get_data()).astype(np.float32) * self.depth_scale
         return bgr, depth
+
+    def _write_urdf(self):
+        """Step 6 on demand: meshes come from whatever the model holds now."""
+        from examples.multi_part import urdf_export as ux
+        st = self.stream
+        model = getattr(st, "model", None)
+        if model is not None:
+            gm = model.cloud.means.detach().cpu().numpy()
+            pts_of = lambda j: gm[model.labels[:len(gm)] == j]
+        elif hasattr(st, "anchor_xyz"):
+            pts_of = lambda j: st.anchor_xyz[st.parts[j].idx]
+        else:
+            gm = st.cloud.means.detach().cpu().numpy()
+            pts_of = lambda j: gm[st.parts[j].weights[:len(gm)] > 0.5]
+        try:
+            out, w = ux.export(self.args.urdf, st.parts, pts_of)
+            print(f"wrote {out} with {len(w)} collision meshes")
+        except Exception as exc:
+            print(f"urdf export failed: {exc}")
 
     def _on_mouse(self, event, x, y, _flags, _param):
         if self.started:
@@ -179,7 +216,8 @@ class RealSenseMultiPart:
                         self.stream.step(rgb, depth, mask)
                         self.times.append(self.stream.last_timings["total_ms"])
                         disp = self.stream.render(disp)
-                        if self.show_hyp:
+                        if self.show_hyp and hasattr(self.stream,
+                                                     "hypothesis_panel"):
                             panel = self.stream.hypothesis_panel(
                                 depth, mask, width=disp.shape[1] // 4)
                             if panel is not None:
@@ -198,25 +236,47 @@ class RealSenseMultiPart:
                                      f"dense {t.get('dense_ms', 0):.0f}  (ms)",
                                 (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                                 (150, 150, 150), 1, cv2.LINE_AA)
-                    d = self.stream.diag
-                    # a split needs >=2 DISTINCT hypotheses; with one, every
-                    # gaussian has the same posterior and nothing can separate
-                    hcol = (90, 90, 235) if d.get("hyp", 0) < 2 else (150, 220, 150)
-                    cv2.putText(bar, f"hypotheses {d.get('hyp', 0)}   "
-                                     f"tracks {d.get('tracks_live', 0)}/{d.get('tracks', 0)}"
-                                     f"   decisive {100*d.get('decisive', 0):.0f}%"
-                                     f"   split tries {d.get('tries', 0)}",
-                                (8, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                                hcol, 1, cv2.LINE_AA)
-                    cv2.putText(bar, d.get("why", ""), (8, 76),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                                (170, 170, 170), 1, cv2.LINE_AA)
+                    d = getattr(self.stream, "diag", {})
+                    if self.args.method == "naive":
+                        # outliers, not the median residual, are what a split
+                        # needs: the second part is always the smaller set
+                        hot = any(p.out_frac > self.cfg.split_out_frac
+                                  for p in self.stream.parts)
+                        cv2.putText(bar, "  ".join(
+                            f"p{j} {p.resid*1000:.0f}mm out {100*p.out_frac:.0f}%"
+                            + (" joint" if p.on_joint else "")
+                            for j, p in enumerate(self.stream.parts)),
+                            (8, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                            (150, 220, 150) if hot else (150, 150, 150), 1,
+                            cv2.LINE_AA)
+                        cv2.putText(bar, f"points {len(self.stream.anchor_xyz)}"
+                                         f"   need out > "
+                                         f"{100*self.cfg.split_out_frac:.0f}%"
+                                         f" for {self.cfg.split_frames} frames",
+                                    (8, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                    (170, 170, 170), 1, cv2.LINE_AA)
+                    else:
+                        # a split needs >=2 DISTINCT hypotheses; with one, every
+                        # gaussian has the same posterior and nothing separates
+                        hcol = (90, 90, 235) if d.get("hyp", 0) < 2 else (150, 220, 150)
+                        cv2.putText(bar, f"hypotheses {d.get('hyp', 0)}   "
+                                         f"tracks {d.get('tracks_live', 0)}/{d.get('tracks', 0)}"
+                                         f"   decisive {100*d.get('decisive', 0):.0f}%"
+                                         f"   split tries {d.get('tries', 0)}",
+                                    (8, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                                    hcol, 1, cv2.LINE_AA)
+                        cv2.putText(bar, d.get("why", ""), (8, 76),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                    (170, 170, 170), 1, cv2.LINE_AA)
                     disp = np.vstack([disp, bar])
 
                 cv2.imshow("multi-part", disp)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
+                if key == ord("u") and self.stream is not None \
+                        and self.args.urdf:
+                    self._write_urdf()
                 if key == ord("h"):
                     self.show_hyp = not self.show_hyp
                 if key == ord("r"):
@@ -251,13 +311,24 @@ class RealSenseMultiPart:
                             "ransac_iters": self.cfg.ransac_iters, "sample_size": 4,
                             "inlier_thres": self.cfg.inlier_thres,
                             "min_inliers": self.cfg.min_inliers,
-                            "max_clusters": self.cfg.max_hyp,
+                            "max_clusters": getattr(self.cfg, "max_hyp", 4),
                             "use_uncertainty": False})
-                    self.stream = StreamingPartDiscovery(self.K, self.cfg, tracker, reg)
+                    if self.args.method == "naive":
+                        from examples.multi_part.naive import NaivePartTracker
+                        self.stream = NaivePartTracker(self.K, self.cfg,
+                                                       tracker, reg)
+                    else:
+                        self.stream = StreamingPartDiscovery(self.K, self.cfg,
+                                                             tracker, reg)
                     self.stream.start(rgb, depth, mask)
                     self.started = True
-                    print(f"started: {len(self.stream.cloud)} gaussians, "
-                          f"stride {self.stream.gauss_stride}")
+                    if self.args.method == "naive":
+                        print(f"started: {len(self.stream.anchor_xyz)} points"
+                              + (f", {len(self.stream.model.cloud)} gaussians"
+                                 if self.stream.model else ""))
+                    else:
+                        print(f"started: {len(self.stream.cloud)} gaussians, "
+                              f"stride {self.stream.gauss_stride}")
         finally:
             self.pipe.stop()
             cv2.destroyAllWindows()
@@ -266,7 +337,22 @@ class RealSenseMultiPart:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--serial", default=None, help="RealSense serial number")
+    ap.add_argument("--method", choices=["dense", "naive"], default="dense",
+                    help="naive = sparse frontend only (steps 1-3)")
+    ap.add_argument("--dense", type=int, default=0,
+                    help="naive only: add the gaussian model (step 4)")
+    ap.add_argument("--refine", type=int, default=0,
+                    help="naive only: add render-based refinement (step 5)")
+    ap.add_argument("--urdf", default=None,
+                    help="write a URDF on quit")
     ap.add_argument("--n-points", type=int, default=None)
+    ap.add_argument("--sampler", default=None,
+                    help="super_point_balanced | super_point_fps | uniform_fps "
+                         "| orb | random")
+    ap.add_argument("--split-out-frac", type=float, default=None)
+    ap.add_argument("--min-part-pts", type=int, default=None)
+    ap.add_argument("--joint-track", type=int, default=None)
+    ap.add_argument("--persist", type=int, default=None)
     ap.add_argument("--hyp-every", type=int, default=None)
     ap.add_argument("--tapir-res", type=int, default=512)
     ap.add_argument("--pips-iter", type=int, default=None)

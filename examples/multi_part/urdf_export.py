@@ -50,6 +50,9 @@ def export(path, parts, points_of, colors_of=None, name="discovered",
         link = ET.SubElement(root, "link", {"name": f"part{j}"})
         pts = points_of(j)
         if pts is None or len(pts) < 100:
+            # sparse tracks alone cannot carry a surface; step 4 supplies it
+            print(f"[urdf] part{j}: {0 if pts is None else len(pts)} points, "
+                  f"too few for a mesh (run with the gaussian model on)")
             continue
         m = part_mesh(pts, None if colors_of is None else colors_of(j))
         if m is None:

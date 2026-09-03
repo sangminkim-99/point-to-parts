@@ -49,6 +49,10 @@ def se3_pow(T, s):
         return np.asarray(T)
 
 
+SAMPLERS = ("super_point_balanced", "super_point_fps", "super_point",
+            "uniform_fps", "orb", "random")
+
+
 def build_sampler(cfg):
     """Point2Pose's own sampler, so the few points we get are worth tracking.
 
@@ -56,19 +60,40 @@ def build_sampler(cfg):
     points is a different thing entirely -- measured, it never separates the
     eyeglasses and shrinks the storage parts to a few hundred gaussians.
     """
-    try:
-        from point2pose.modules.sampler.super_point_balanced_sampler import (
-            SuperPointBalancedSampler)
-        return SuperPointBalancedSampler({
-            "num_points": cfg.n_points, "density_per_kpx": -1,
-            "fps_oversample_factor": 3, "min_points": 5, "max_points": 50,
-            "edge_margin_px": 5, "remove_convex_hull": False,
-            "inflate_points": False, "cell_size": -1,
-            "crop_to_mask": True, "crop_pad_px": 3,
-            "super_point_max_num_keypoints": 512, "debug_level": 0,
+    kind = getattr(cfg, "sampler", "super_point_balanced")
+    # Coverage matters more here than raw keypoint score: a part is found from
+    # points that sit on it, so a cluster on one textured corner is worse than
+    # a thinner spread over the whole object.
+    common = {
+        "num_points": cfg.n_points, "density_per_kpx": -1,
+        "min_points": 5, "max_points": max(cfg.n_points, 50),
+        "edge_margin_px": 5, "remove_convex_hull": False,
+        "inflate_points": False, "crop_to_mask": True, "crop_pad_px": 3,
+        "cell_size": getattr(cfg, "sampler_cell", -1),
+        "super_point_max_num_keypoints": 1024, "debug_level": 0,
+    }
+    if kind == "super_point_balanced":
+        common.update({
+            "fps_oversample_factor": 4,
+            "nms_radius_px": getattr(cfg, "sampler_nms", 0.0),
+            "score_weight": getattr(cfg, "sampler_score_w", 0.20),
+            "min_separation_px": getattr(cfg, "sampler_min_sep", 6.0),
+            "separation_penalty_weight": 0.5,
         })
+    elif kind in ("super_point_fps", "super_point"):
+        common.update({"fps_oversample_factor": 4,
+                       "cell_size": max(1, getattr(cfg, "sampler_cell", 8))})
+    elif kind == "uniform_fps":
+        # geometric spread with no texture requirement -- the interesting
+        # counterpoint to SuperPoint, and the one likeliest to be untrackable
+        common.update({"density_per_kpx": -1})
+    try:
+        from point2pose.core.build import build_from_cfg
+        from point2pose.core.module_registry import SAMPLER
+        import point2pose.modules.sampler  # noqa: F401  (registers them)
+        return build_from_cfg({"type": kind, "params": common}, SAMPLER)
     except Exception as exc:
-        print(f"[stream] SuperPoint sampler unavailable ({exc}); using random")
+        print(f"[stream] sampler '{kind}' unavailable ({exc}); using random")
         return None
 
 
@@ -286,6 +311,15 @@ class Config:
     # behind the body (sim eyeglasses 3 -> 2 parts); 7 px keeps both.
     mask_depth_jump: float = 0.15
     mask_win: int = 7
+    # spatial spread of the sampled points; coverage beats keypoint score here
+    # Measured on RBO: NMS and one-per-cell rejection buy 4 points of coverage
+    # on a big object and cost a third of the points on a small one. Only the
+    # novelty weight is worth changing.
+    sampler: str = "super_point_balanced"
+    sampler_cell: int = -1
+    sampler_nms: float = 0.0
+    sampler_score_w: float = 0.20
+    sampler_min_sep: float = 6.0
 
 
 class StreamingPartDiscovery:

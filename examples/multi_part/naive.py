@@ -35,15 +35,39 @@ class NaiveConfig:
     # A split is proposed when a MINORITY of points stops following the fit.
     # The median residual cannot see that: a second part is by definition the
     # smaller set, so the median stays with the majority and never rises.
+    # Thresholds in metres cannot see a wiggle. Fifty points displaced 1 cm the
+    # same way is overwhelming evidence against one rigid body even though no
+    # single point moved far, so the trigger and the separation test are both
+    # measured in units of the depth noise the fit itself reveals.
     split_out_frac: float = 0.12        # share of points beyond the inlier band
-    split_out_band: float = 3.0         # x inlier_thres
+    split_out_band: float = 3.0         # x the estimated noise sigma
+    sigma_floor: float = 0.002          # metres; a RealSense at 0.5 m
+    sigma_ceil: float = 0.02
+    split_sep_sigma: float = 4.0        # group displacement, in sigma
     split_res: float = 0.05             # metres of median residual, as a backstop
     split_frames: int = 3               # consecutive frames above either
     min_part_pts: int = 6
     # The two motions must actually differ, or a noisy fit splits a rigid body:
     # foldingrule01 ran to 6 parts against a ground truth of 3.
-    split_min_sep: float = 8.0          # degrees + centimetres between motions
     split_gain: float = 0.7             # new residual must be this x the old
+    # Stage B: a single frame's RANSAC split is a coin toss on noisy depth. What
+    # marks a real part is the SAME point subset backing a different motion frame
+    # after frame, so co-association is accumulated and clustered instead.
+    persist: bool = True
+    co_hyp: int = 3                     # motions proposed per frame
+    co_tau: float = 0.01                # metres, softmax temperature
+    co_min_seen: float = 2.5            # weighted frames a pair must co-occur
+    co_gap: float = 0.15                # affinity gap the two clusters need
+    # A new part inherits no history: the affinity that split its parent would
+    # otherwise split it again the moment it is allowed to, and cabinet03 ran to
+    # 6 parts against a ground truth of 3.
+    part_settle: int = 20               # frames a part must live before splitting
+    # Co-association covers 3/3 and 2/2 GT parts where it fires but stays silent
+    # on laptop02 and cardboardbox02, where one frame's RANSAC did split. So the
+    # frame path is kept, but only once the part has been inconsistent for far
+    # longer than co-association needed.
+    frame_fallback: bool = True
+    frame_after: int = 5                # x split_frames before one frame decides
     ambiguous_band: float = 1.5         # x inlier_thres: points in the joint gap
     min_frames_before_split: int = 8
     resplit_wait: int = 12
@@ -62,6 +86,11 @@ class NaiveConfig:
     reseed_points: int = 24
     reseed_every: int = 6
     max_points: int = 400
+    sampler: str = "super_point_balanced"
+    sampler_cell: int = -1
+    sampler_nms: float = 0.0
+    sampler_score_w: float = 0.20
+    sampler_min_sep: float = 6.0
     # A track that leaves the object mask has walked onto the hand. On RBO
     # pliers that is what the second "rigid motion" was: the arm, not a jaw.
     mask_gate: bool = True
@@ -83,8 +112,10 @@ class NaivePart:
     parent: int = 0
     joint: JointModel = None
     resid: float = 0.0
+    sigma: float = 0.004                # robust noise scale of this part's fit
     out_frac: float = 0.0
     on_joint: bool = False
+    born: int = 0
     energy: float = float("inf")
     over: int = 0                       # consecutive frames above split_res
 
@@ -120,6 +151,9 @@ class NaivePartTracker:
         self.anchor_xyz, self.anchor_ok = lift(pts0, depth, self.K)
         self.parts = [NaivePart(idx=np.where(self.anchor_ok)[0])]
         self.n = 1
+        n = len(self.anchor_xyz)
+        self.co_same = np.zeros((n, n), np.float32)
+        self.co_seen = np.zeros((n, n), np.float32)
         self.model = self.refiner = None
         if self.cfg.dense:
             from examples.multi_part.dense_model import PartGaussians
@@ -151,6 +185,9 @@ class NaivePartTracker:
 
         for p in self.parts:
             self._fit(p, cur, cur_ok, vis)
+        if cfg.persist:
+            for p in self.parts:
+                self._accumulate(p, cur, cur_ok, vis)
         import os
         if os.environ.get("NAIVE_DEBUG") and i % 10 == 0:
             print("[naive] f%d " % i + "  ".join(
@@ -161,6 +198,8 @@ class NaivePartTracker:
         if i >= cfg.min_frames_before_split and len(self.parts) < cfg.max_parts \
                 and i - getattr(self, "last_split", 0) >= cfg.resplit_wait:
             for j, p in enumerate(list(self.parts)):
+                if self.n - p.born < cfg.part_settle:
+                    continue
                 if p.over >= cfg.split_frames and self._split(j, cur, cur_ok, vis):
                     self.last_split = i
                     break
@@ -347,9 +386,107 @@ class NaivePartTracker:
         else:
             part.on_joint = False
         part.resid = float(np.median(d))
-        part.out_frac = float(np.mean(d > cfg.split_out_band * cfg.inlier_thres))
+        # the inlier half of the residuals IS the sensor noise on this surface
+        inl = d[d <= max(np.median(d), 1e-4) * 2.0]
+        sig = 1.4826 * float(np.median(np.abs(inl - np.median(inl)))) if inl.size \
+            else cfg.sigma_floor
+        part.sigma = float(np.clip(max(sig, np.median(inl) if inl.size else 0.0),
+                                   cfg.sigma_floor, cfg.sigma_ceil))
+        part.out_frac = float(np.mean(d > cfg.split_out_band * part.sigma))
         hot = (part.out_frac > cfg.split_out_frac) or (part.resid > cfg.split_res)
         part.over = part.over + 1 if hot else 0
+
+    def _grow_co(self, n):
+        """Keep the co-association matrices as wide as the track set."""
+        m = self.co_same.shape[0]
+        if n <= m:
+            return
+        for a in ("co_same", "co_seen"):
+            M = getattr(self, a)
+            N = np.zeros((n, n), np.float32)
+            N[:m, :m] = M
+            setattr(self, a, N)
+
+    def _accumulate(self, part, cur, cur_ok, vis):
+        """Soft votes for which points move together, over several motions."""
+        cfg = self.cfg
+        self._grow_co(len(self.anchor_xyz))
+        idx = part.idx[(part.idx < len(cur_ok)) & (part.idx < len(self.anchor_ok))]
+        sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
+        if sel.size < 2 * cfg.min_inliers or self.reg is None:
+            return
+        rem = np.ones(sel.size, bool)
+        motions = []
+        for _ in range(cfg.co_hyp):
+            c = self.reg._RANSAC(p0=self.anchor_xyz[sel], tgt_pcd=cur[sel],
+                                 w=None, remaining=rem, init_pose=None)
+            if c is None:
+                break
+            motions.append(np.asarray(c["T"]))
+        if len(motions) < 2:
+            return
+        D = np.stack([np.linalg.norm(
+            self.anchor_xyz[sel] @ T[:3, :3].T + T[:3, 3] - cur[sel], axis=1)
+            for T in motions])
+        P = np.exp(-D / max(cfg.co_tau, 1e-6))
+        P /= P.sum(axis=0, keepdims=True) + 1e-12
+        # a frame where one motion explains everything says nothing about which
+        # points move together, so it is down-weighted by how decisive it is
+        w = float(np.mean(P.max(axis=0) > 0.8) * (1.0 - P.mean(axis=1).max()))
+        if w <= 1e-3:
+            return
+        S = P.T @ P
+        self.co_same[np.ix_(sel, sel)] += w * S
+        self.co_seen[np.ix_(sel, sel)] += w
+
+    def _sep_sigma(self, groups, motions, part):
+        """How far the groups' own points move if you swap the two motions.
+
+        Degrees plus centimetres is scale-free nonsense; what decides whether a
+        motion difference is real is how large the disagreement is where the
+        points actually are, against the noise on those same points.
+        """
+        d = []
+        for k, g in enumerate(groups):
+            g = np.asarray(g)
+            if g.size == 0:
+                continue
+            P0 = self.anchor_xyz[g]
+            A = P0 @ motions[k][:3, :3].T + motions[k][:3, 3]
+            B = P0 @ motions[1 - k][:3, :3].T + motions[1 - k][:3, 3]
+            d.append(np.linalg.norm(A - B, axis=1))
+        if not d:
+            return 0.0
+        return float(np.median(np.concatenate(d)) / max(part.sigma, 1e-6))
+
+    def _cluster_co(self, sel):
+        """Two groups from the accumulated affinity, or None if not separable."""
+        cfg = self.cfg
+        seen = self.co_seen[np.ix_(sel, sel)]
+        if seen.size == 0 or np.median(seen) < cfg.co_min_seen:
+            return None
+        A = self.co_same[np.ix_(sel, sel)] / np.maximum(seen, 1e-6)
+        keep = seen.sum(axis=1) > 0
+        if keep.sum() < 2 * cfg.min_part_pts:
+            return None
+        A = A[np.ix_(keep, keep)]
+        sub = sel[keep]
+        try:
+            from sklearn.cluster import AgglomerativeClustering
+            lab = AgglomerativeClustering(
+                n_clusters=2, metric="precomputed",
+                linkage="average").fit_predict(1.0 - A)
+        except Exception:
+            return None
+        g0, g1 = sub[lab == 0], sub[lab == 1]
+        if min(len(g0), len(g1)) < cfg.min_part_pts:
+            return None
+        within = 0.5 * (A[np.ix_(lab == 0, lab == 0)].mean()
+                        + A[np.ix_(lab == 1, lab == 1)].mean())
+        across = A[np.ix_(lab == 0, lab == 1)].mean()
+        if within - across < cfg.co_gap:
+            return None
+        return [g0, g1], float(within - across)
 
     def _split(self, j, cur, cur_ok, vis):
         """Second rigid motion inside one part; ambiguous points are dropped."""
@@ -358,6 +495,26 @@ class NaivePartTracker:
         idx = part.idx[(part.idx < len(cur_ok)) & (part.idx < len(self.anchor_ok))]
         sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
         if sel.size < 2 * cfg.min_part_pts:
+            return False
+
+        # Stage B first: groups that held together over frames, not one frame's
+        # RANSAC. The single frame decides only when the history is too thin.
+        cc = self._cluster_co(sel) if cfg.persist else None
+        if cc is not None:
+            groups, gap = cc
+            motions = []
+            for g in groups:
+                c = self.reg._RANSAC(p0=self.anchor_xyz[g], tgt_pcd=cur[g],
+                                     w=None, remaining=np.ones(len(g), bool),
+                                     init_pose=None)
+                motions.append(np.asarray(c["T"]) if c is not None else part.pose)
+            ss = self._sep_sigma(groups, motions, part)
+            if ss >= cfg.split_sep_sigma:
+                return self._accept(j, part, groups, motions, cur, cur_ok,
+                                    "coassoc", gap, None, ss)
+
+        if cfg.persist and (not cfg.frame_fallback
+                            or part.over < cfg.frame_after * cfg.split_frames):
             return False
         rem = np.ones(sel.size, bool)
         motions = []
@@ -369,10 +526,8 @@ class NaivePartTracker:
             motions.append(np.asarray(c["T"]))
         if len(motions) < 2:
             return False
-        D01 = np.linalg.inv(motions[0]) @ motions[1]
-        sep = np.degrees(np.arccos(np.clip((np.trace(D01[:3, :3]) - 1) / 2, -1, 1))) \
-            + 100 * np.linalg.norm(D01[:3, 3])
-        if sep < cfg.split_min_sep:
+        ss = self._sep_sigma([sel, sel], motions, part)
+        if ss < cfg.split_sep_sigma:
             return False
         D = np.stack([np.linalg.norm(
             self.anchor_xyz[sel] @ T[:3, :3].T + T[:3, 3] - cur[sel], axis=1)
@@ -392,8 +547,20 @@ class NaivePartTracker:
             [D[k][keep & (best == k)] for k in range(2)])))
         if before > 1e-6 and after > cfg.split_gain * before:
             return False
+        return self._accept(j, part, groups, motions, cur, cur_ok, "frame",
+                            float("nan"), keep, ss)
+
+    def _accept(self, j, part, groups, motions, cur, cur_ok, via, gap, keep,
+                sep_sigma=float("nan")):
+        """Install the two groups as parts and hand the gaussian labels over."""
         order = np.argsort([-len(g) for g in groups])
-        new = [NaivePart(idx=groups[k], pose=motions[k]) for k in order]
+        new = [NaivePart(idx=np.asarray(groups[k]), pose=motions[k],
+                         born=self.n) for k in order]
+        # the affinity that justified this split has been spent; each new part
+        # has to earn its own before it may split again
+        all_idx = np.concatenate([np.asarray(g) for g in groups])
+        self.co_same[np.ix_(all_idx, all_idx)] = 0.0
+        self.co_seen[np.ix_(all_idx, all_idx)] = 0.0
         self.parts[j:j + 1] = new
         for k, p in enumerate(self.parts):
             p.parent = 0 if k else (1 if len(self.parts) > 1 else 0)
@@ -403,11 +570,18 @@ class NaivePartTracker:
             self._split_labels(j, new, cur, cur_ok)
         self.state = self.SPLIT
         self.split_log.append((self.n, len(self.parts)))
-        print(f"[naive] split at frame {self.n}: {len(self.parts)} parts "
-              f"(residual {part.resid * 1000:.0f} mm, "
-              f"outliers {100 * part.out_frac:.0f}%, "
-              f"{len(groups[0])}/{len(groups[1])} points, "
-              f"{int((~keep).sum())} dropped)")
+        # how much relative motion it actually took, which is the number the
+        # "wiggle and it becomes controllable" claim lives or dies on
+        mm = sep_sigma * part.sigma * 1000
+        self.split_evidence = (self.n, mm, part.sigma * 1000)
+        print(f"[naive] split at frame {self.n} via {via}: {len(self.parts)} "
+              f"parts (motion {mm:.0f} mm = {sep_sigma:.1f} sigma, "
+              f"noise {part.sigma * 1000:.1f} mm, outliers "
+              f"{100 * part.out_frac:.0f}%, "
+              f"{len(groups[0])}/{len(groups[1])} pts"
+              + (f", gap {gap:.2f}" if gap == gap else "")
+              + (f", {int((~keep).sum())} dropped" if keep is not None else "")
+              + ")")
         return True
 
     def _split_labels(self, j, new, cur, cur_ok):
