@@ -91,30 +91,29 @@ def sample_superpoint(sampler, rgb, depth, mask, K, n):
     return pts if pts.shape[0] >= 5 else sample_points(mask, depth, n)
 
 
-def clean_mask(mask, depth, jump=0.15, grow=0):
-    """Drop mask pixels sitting on a depth discontinuity.
+def clean_mask(mask, depth, jump=0.15, win=7):
+    """Drop mask pixels that sit well BEHIND the object's local surface.
 
-    A hand-drawn or propagated mask always leaks a few pixels of background at
-    the silhouette. Measured on a real take, that put points 1.20 m deep into a
-    0.55 m object, stretched the cloud to 0.69 m along z against a true 0.28,
-    and left 93% of gaussians undecided; removing them took the first split from
-    16% coverage to 86%.
+    A propagated mask leaks background at the silhouette, and the leak is always
+    behind. A symmetric depth-span test also deletes the object's own edge,
+    which on a live sensor eats enough of the mask that the poses stop updating
+    and the model is drawn at its old place over a moving image.
     """
     import cv2
     m = (mask > 0) & (depth > 0)
     if jump <= 0 or not m.any():
-        return (m.astype(np.uint8) * 255) if mask.dtype == np.uint8 else m
-    d = np.where(m, depth, np.nan).astype(np.float32)
-    k = np.ones((3, 3), np.uint8)
-    filled = np.where(np.isnan(d), 0, d)
-    hi = cv2.dilate(filled, k)
-    lo = -cv2.dilate(np.where(np.isnan(d), -1e3, -filled), k)
-    edge = m & ((hi - lo) > jump)
-    if grow > 0 and edge.any():
-        edge = cv2.dilate(edge.astype(np.uint8), k, iterations=grow) > 0
-    out = m & ~edge
-    if out.sum() < 0.2 * m.sum():       # the whole object is a slope: keep it
-        out = m
+        return m.astype(np.uint8) * 255
+    # nearest masked surface within `win`: erosion of depth is a min filter, and
+    # unmasked pixels are pushed to +inf so they cannot win it
+    big = np.where(m, depth, np.float32(1e3)).astype(np.float32)
+    near = cv2.erode(big, np.ones((win, win), np.uint8))
+    out = m & (depth <= near + jump)
+    if out.sum() < 0.5 * m.sum():       # the object really is that deep
+        return m.astype(np.uint8) * 255
+    n, lb, st, _ = cv2.connectedComponentsWithStats(out.astype(np.uint8), 8)
+    if n > 2:                            # keep the body, drop specks
+        keep = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+        out = lb == keep
     return out.astype(np.uint8) * 255
 
 
@@ -235,10 +234,12 @@ class Config:
     score_round: int = 3
     merge_eps: float = 0.002
     merge_tol: float = 0.012
-    # Metres of depth jump that marks a mask pixel as silhouette leakage.
-    # Measured: 0.05 also eats a thin part's own edge (sim eyeglasses 3 -> 2
-    # parts); 0.25 lets the background back in (take01 to 5 parts).
+    # Metres a mask pixel may sit behind the nearest surface in its mask_win
+    # neighbourhood before it counts as background leaking through the
+    # silhouette. A 21 px reference also rejects a thin part that is genuinely
+    # behind the body (sim eyeglasses 3 -> 2 parts); 7 px keeps both.
     mask_depth_jump: float = 0.15
+    mask_win: int = 7
 
 
 class StreamingPartDiscovery:
@@ -269,7 +270,7 @@ class StreamingPartDiscovery:
         cfg = self.cfg
         H, W = depth.shape
         self.H, self.W = H, W
-        mask = clean_mask(mask, depth, cfg.mask_depth_jump)
+        mask = clean_mask(mask, depth, cfg.mask_depth_jump, cfg.mask_win)
 
         # a thin object at a fixed stride yields a few hundred gaussians, and
         # then nothing is ever decisively assigned
@@ -310,7 +311,7 @@ class StreamingPartDiscovery:
         i = self.n
         self.n += 1
         cfg = self.cfg
-        mask = clean_mask(mask, depth, cfg.mask_depth_jump)
+        mask = clean_mask(mask, depth, cfg.mask_depth_jump, cfg.mask_win)
 
         tracks, _, vis = self.tracker.track_once(
             Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K))

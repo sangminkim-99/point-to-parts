@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--min-group", type=int, default=None)
     ap.add_argument("--min-group-frac", type=float, default=None)
     ap.add_argument("--mask-depth-jump", type=float, default=None)
+    ap.add_argument("--mask-win", type=int, default=None)
     ap.add_argument("--resplit", type=int, default=None)
     ap.add_argument("--resplit-wait", type=int, default=None)
     ap.add_argument("--resplit-min-ratio", type=float, default=None)
@@ -106,6 +107,8 @@ def main():
         cfg.groupings = args.groupings
     if args.min_group:
         cfg.min_group = args.min_group
+    if args.mask_win is not None:
+        cfg.mask_win = args.mask_win
     if args.mask_depth_jump is not None:
         cfg.mask_depth_jump = args.mask_depth_jump
     if args.min_group_frac is not None:
