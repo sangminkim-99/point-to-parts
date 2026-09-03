@@ -40,11 +40,33 @@ class NaiveConfig:
     split_res: float = 0.05             # metres of median residual, as a backstop
     split_frames: int = 3               # consecutive frames above either
     min_part_pts: int = 6
+    # The two motions must actually differ, or a noisy fit splits a rigid body:
+    # foldingrule01 ran to 6 parts against a ground truth of 3.
+    split_min_sep: float = 8.0          # degrees + centimetres between motions
+    split_gain: float = 0.7             # new residual must be this x the old
     ambiguous_band: float = 1.5         # x inlier_thres: points in the joint gap
     min_frames_before_split: int = 8
     resplit_wait: int = 12
     max_parts: int = 6
     joint_gate: float = 0.02
+    # Step 3b: once a joint is confident the part has one degree of freedom, not
+    # six. Searching that scalar instead is what survives occlusion.
+    joint_track: bool = True
+    joint_min_obs: int = 12
+    joint_tol: float = 1.3              # x the free fit's residual before falling back
+    joint_grid: int = 61
+    # A thin object leaves most SuperPoint picks on invalid depth -- pliers01
+    # kept 10 of 100 -- and a part can never split below 2 * min_part_pts.
+    top_up: bool = True
+    min_live: int = 24                  # per part, before new points are sought
+    reseed_points: int = 24
+    reseed_every: int = 6
+    max_points: int = 400
+    # A track that leaves the object mask has walked onto the hand. On RBO
+    # pliers that is what the second "rigid motion" was: the arm, not a jaw.
+    mask_gate: bool = True
+    mask_pad: int = 4
+    mask_strikes: int = 5
     # optional layers, each measurable on its own
     dense: bool = False                 # step 4: per-part gaussian model
     dense_stride: int = 2
@@ -62,6 +84,7 @@ class NaivePart:
     joint: JointModel = None
     resid: float = 0.0
     out_frac: float = 0.0
+    on_joint: bool = False
     energy: float = float("inf")
     over: int = 0                       # consecutive frames above split_res
 
@@ -90,7 +113,10 @@ class NaivePartTracker:
         f0 = Frame(id=0, rgb=rgb, depth=depth, intrinsics=self.K)
         self.tracker.add_query_points(f0, pts0)
         self.tracker.initialize(f0)
-        self.pts0 = np.asarray(pts0, np.float32)
+        pts0 = np.asarray(pts0, np.float32)
+        if self.cfg.top_up:
+            pts0 = self._top_up(pts0, depth, mask, self.cfg.n_points)
+        self.pts0 = pts0
         self.anchor_xyz, self.anchor_ok = lift(pts0, depth, self.K)
         self.parts = [NaivePart(idx=np.where(self.anchor_ok)[0])]
         self.n = 1
@@ -117,12 +143,20 @@ class NaivePartTracker:
             Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K))
         vis = vis.astype(bool)
         cur, cur_ok = lift(tracks, depth, self.K)
+        if cfg.mask_gate:
+            cur_ok = cur_ok & self._on_object(tracks, mask)
         self.cur = (cur, cur_ok, vis)
         self.cur_tracks_2d = tracks
         t_track = time.perf_counter()
 
         for p in self.parts:
             self._fit(p, cur, cur_ok, vis)
+        import os
+        if os.environ.get("NAIVE_DEBUG") and i % 10 == 0:
+            print("[naive] f%d " % i + "  ".join(
+                f"p{j}: n={len(p.idx)} resid={p.resid*1000:.0f}mm "
+                f"out={100*p.out_frac:.0f}% over={p.over}"
+                for j, p in enumerate(self.parts)), flush=True)
 
         if i >= cfg.min_frames_before_split and len(self.parts) < cfg.max_parts \
                 and i - getattr(self, "last_split", 0) >= cfg.resplit_wait:
@@ -139,6 +173,9 @@ class NaivePartTracker:
                 p.joint.add(A)
                 if p.joint.kind is None or len(p.joint.A) % 4 == 0:
                     p.joint.fit()
+
+        if cfg.top_up and i % cfg.reseed_every == 0:
+            self._reseed(rgb, depth, mask, i)
 
         t_dense = t_track
         if self.model is not None:
@@ -176,11 +213,116 @@ class NaivePartTracker:
                 self.model.grow(rgb, depth, mask, poses, grow_ok=ok)
         self.unmodelled = self.model.uncovered(depth, mask, poses)
 
+    def _on_object(self, t2, mask):
+        """True where a track still sits inside the (padded) object mask."""
+        import cv2
+        cfg = self.cfg
+        m = (mask > 0).astype(np.uint8)
+        if cfg.mask_pad > 0:
+            k = 2 * cfg.mask_pad + 1
+            m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+        u = np.clip(np.round(t2[:, 0]).astype(int), 0, m.shape[1] - 1)
+        v = np.clip(np.round(t2[:, 1]).astype(int), 0, m.shape[0] - 1)
+        inside = m[v, u] > 0
+        st = getattr(self, "_strikes", np.zeros(0, np.int16))
+        if len(st) < len(inside):
+            st = np.concatenate([st, np.zeros(len(inside) - len(st), np.int16)])
+        st[:len(inside)] = np.where(inside, 0, st[:len(inside)] + 1)
+        self._strikes = st
+        # a track that has been off the object for a while is gone for good
+        dead = st[:len(inside)] >= cfg.mask_strikes
+        self.dropped = int(dead.sum())
+        return inside & ~dead
+
+    @staticmethod
+    def _top_up(pts, depth, mask, want):
+        """Keep only points with valid depth.
+
+        Refilling with random pixels was measured and removed: TAPIR cannot
+        track an untextured point, and 90 random ones took the rigid fit's
+        residual on RBO pliers from 2 mm to 78 mm.
+        """
+        _, ok = lift(pts, depth, np.eye(3))
+        return pts[ok][:want]
+
+    def _reseed(self, rgb, depth, mask, i):
+        """New tracks for parts that have run out, inside their own region."""
+        from point2pose.data_types.frame import Frame
+        from examples.multi_part.streaming import sample_superpoint
+        cfg = self.cfg
+        cur, cok, cvi = self.cur
+        t2 = self.cur_tracks_2d
+        added = 0
+        for j, p in enumerate(self.parts):
+            idx = p.idx[p.idx < len(cok)]
+            live = int((cok[idx] & cvi[idx]).sum()) if idx.size else 0
+            if live >= cfg.min_live or len(self.anchor_xyz) >= cfg.max_points:
+                continue
+            m = mask.copy()
+            if idx.size >= 3 and len(self.parts) > 1:
+                q = t2[idx].astype(int)
+                box = np.zeros_like(m)
+                x0, y0 = np.clip(q.min(0) - 20, 0, None)
+                x1, y1 = q.max(0) + 20
+                box[y0:y1, x0:x1] = 1
+                m = m * box
+            new = np.asarray(sample_superpoint(self.sampler, rgb, depth, m,
+                                                self.K, cfg.reseed_points),
+                             np.float32)
+            _, nok = lift(new, depth, self.K)
+            new = new[nok][:cfg.reseed_points]
+            if len(new) < 4:
+                continue
+            f = Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K)
+            self.tracker.add_query_points(f, new)
+            xyz, ok = lift(new, depth, self.K)
+            # a new track is anchored through this part's current pose
+            Ti = np.linalg.inv(p.pose)
+            base = len(self.anchor_xyz)
+            self.anchor_xyz = np.concatenate(
+                [self.anchor_xyz, (xyz @ Ti[:3, :3].T + Ti[:3, 3]).astype(np.float32)])
+            self.anchor_ok = np.concatenate([self.anchor_ok, ok])
+            p.idx = np.concatenate([p.idx, base + np.where(ok)[0]])
+            added += int(ok.sum())
+        if added:
+            print(f"[naive] frame {i}: re-seeded {added} tracks "
+                  f"({len(self.anchor_xyz)} total)")
+        return added
+
+    def _fit_joint(self, part, sel, cur):
+        """Search the joint's scalar instead of a free SE(3), when it is known."""
+        cfg = self.cfg
+        jm = part.joint
+        if not (cfg.joint_track and jm is not None and jm.kind is not None):
+            return None
+        if len(jm.A) < cfg.joint_min_obs or part.parent >= len(self.parts):
+            return None
+        Tp = self.parts[part.parent].pose
+        if Tp is None:
+            return None
+        vs = [jm.value_of(A) for A in jm.A]
+        span = max(max(vs) - min(vs), 1e-2)
+        pred = vs[-1] + (vs[-1] - vs[-2] if len(vs) > 1 else 0.0)
+        grid = np.concatenate([
+            pred + np.linspace(-1.0, 1.0, cfg.joint_grid) * span,
+            np.linspace(min(vs) - 0.2 * span, max(vs) + 0.2 * span, cfg.joint_grid)])
+        P0 = self.anchor_xyz[sel]
+        Q = cur[sel]
+        best, bq = None, np.inf
+        for v in grid:
+            T = Tp @ jm.at(float(v))
+            d = np.linalg.norm(P0 @ T[:3, :3].T + T[:3, 3] - Q, axis=1)
+            q = float(np.median(d))
+            if q < bq:
+                best, bq = T, q
+        return None if best is None else (best, bq)
+
     def _fit(self, part, cur, cur_ok, vis):
         """Rigid fit of this part's points from the anchor frame, RANSAC + SVD."""
         cfg = self.cfg
-        sel = part.idx[self.anchor_ok[part.idx] & cur_ok[part.idx]
-                       & vis[part.idx]]
+        # tracks added this frame have no measurement yet
+        idx = part.idx[(part.idx < len(cur_ok)) & (part.idx < len(self.anchor_ok))]
+        sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
         if sel.size < cfg.min_inliers or self.reg is None:
             part.over = 0
             return
@@ -189,10 +331,21 @@ class NaivePartTracker:
         if c is None:
             part.over = 0
             return
-        part.pose = np.asarray(c["T"])
+        T_free = np.asarray(c["T"])
         d = np.linalg.norm(
-            self.anchor_xyz[sel] @ part.pose[:3, :3].T + part.pose[:3, 3]
+            self.anchor_xyz[sel] @ T_free[:3, :3].T + T_free[:3, 3]
             - cur[sel], axis=1)
+        part.pose = T_free
+        jf = self._fit_joint(part, sel, cur)
+        if jf is not None and jf[1] <= max(float(np.median(d)), 1e-4) * cfg.joint_tol:
+            part.pose = jf[0]
+            part.on_joint = True
+            self.joint_frames = getattr(self, "joint_frames", 0) + 1
+            d = np.linalg.norm(
+                self.anchor_xyz[sel] @ part.pose[:3, :3].T + part.pose[:3, 3]
+                - cur[sel], axis=1)
+        else:
+            part.on_joint = False
         part.resid = float(np.median(d))
         part.out_frac = float(np.mean(d > cfg.split_out_band * cfg.inlier_thres))
         hot = (part.out_frac > cfg.split_out_frac) or (part.resid > cfg.split_res)
@@ -202,8 +355,8 @@ class NaivePartTracker:
         """Second rigid motion inside one part; ambiguous points are dropped."""
         cfg = self.cfg
         part = self.parts[j]
-        sel = part.idx[self.anchor_ok[part.idx] & cur_ok[part.idx]
-                       & vis[part.idx]]
+        idx = part.idx[(part.idx < len(cur_ok)) & (part.idx < len(self.anchor_ok))]
+        sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
         if sel.size < 2 * cfg.min_part_pts:
             return False
         rem = np.ones(sel.size, bool)
@@ -216,6 +369,11 @@ class NaivePartTracker:
             motions.append(np.asarray(c["T"]))
         if len(motions) < 2:
             return False
+        D01 = np.linalg.inv(motions[0]) @ motions[1]
+        sep = np.degrees(np.arccos(np.clip((np.trace(D01[:3, :3]) - 1) / 2, -1, 1))) \
+            + 100 * np.linalg.norm(D01[:3, 3])
+        if sep < cfg.split_min_sep:
+            return False
         D = np.stack([np.linalg.norm(
             self.anchor_xyz[sel] @ T[:3, :3].T + T[:3, 3] - cur[sel], axis=1)
             for T in motions])
@@ -225,6 +383,14 @@ class NaivePartTracker:
         keep = (bv < cfg.inlier_thres) & (sv > cfg.ambiguous_band * bv)
         groups = [sel[keep & (best == k)] for k in range(2)]
         if min(len(g) for g in groups) < cfg.min_part_pts:
+            return False
+        # splitting must explain the points better than the one body did
+        before = float(np.median(np.linalg.norm(
+            self.anchor_xyz[sel] @ part.pose[:3, :3].T + part.pose[:3, 3]
+            - cur[sel], axis=1)))
+        after = float(np.median(np.concatenate(
+            [D[k][keep & (best == k)] for k in range(2)])))
+        if before > 1e-6 and after > cfg.split_gain * before:
             return False
         order = np.argsort([-len(g) for g in groups])
         new = [NaivePart(idx=groups[k], pose=motions[k]) for k in order]
@@ -293,7 +459,7 @@ class NaivePartTracker:
             cv2.rectangle(bgr, (x0, y0), (x1, y1), pal[j % len(pal)], 2)
             lab = f"p{j} {p.resid * 1000:.0f}mm {100 * p.out_frac:.0f}%"
             if p.joint is not None and p.joint.kind:
-                lab += f" {p.joint.kind[:4]}"
+                lab += f" {p.joint.kind[:4]}" + ("*" if p.on_joint else "")
             cv2.putText(bgr, lab, (x0, max(12, y0 - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                         pal[j % len(pal)], 1, cv2.LINE_AA)

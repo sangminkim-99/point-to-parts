@@ -48,6 +48,9 @@ class JointModel:
         self.A0 = None            # the relative transform at value 0
 
     def add(self, A):
+        # a degenerate rotation block gives scipy a zero-norm quaternion
+        if not np.all(np.isfinite(A)) or abs(np.linalg.det(A[:3, :3]) - 1) > 0.2:
+            return
         self.A.append(np.asarray(A, dtype=np.float64).copy())
 
     # ---------------------------------------------------------------- fit --

@@ -53,7 +53,10 @@ def report(reader, anchor, parts_gt, lab_gt, stream, pose_log, min_group=30):
         for (i, Ts) in pose_log:
             if r_["part"] >= len(Ts) or Ts[r_["part"]] is None:
                 continue
-            Tgt = reader.get_gt_pose(i, r_["gt"]) @ np.linalg.inv(Ta[r_["gt"]])
+            G = reader.get_gt_pose(i, r_["gt"])
+            if G is None or Ta[r_["gt"]] is None:
+                continue
+            Tgt = G @ np.linalg.inv(Ta[r_["gt"]])
             E = np.linalg.inv(Tgt) @ Ts[r_["part"]]
             te.append(float(np.linalg.norm(E[:3, 3])))
             re_.append(float(np.degrees(
@@ -96,7 +99,8 @@ def joint_metrics(reader, parts_gt, stream, rows, frames):
         ref = JointModel()
         for i in frames:
             Tp, Tc = reader.get_gt_pose(i, par), reader.get_gt_pose(i, chi)
-            if Tp is None or Tc is None:
+            if Tp is None or Tc is None or not np.all(np.isfinite(Tp)) \
+                    or not np.all(np.isfinite(Tc)):
                 continue
             ref.add(np.linalg.inv(Tp) @ Tc)
         if not ref.fit() or ref.axis is None:

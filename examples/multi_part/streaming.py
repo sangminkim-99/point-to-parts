@@ -72,14 +72,30 @@ def build_sampler(cfg):
         return None
 
 
-def sample_superpoint(sampler, rgb, depth, mask, K, n):
-    """Run the SuperPoint sampler over one mask; falls back to random."""
+def sample_superpoint(sampler, rgb, depth, mask, K, n, min_px=20000):
+    """Run the SuperPoint sampler over one mask; falls back to random.
+
+    A small object yields almost no keypoints -- RBO pliers cover 1.5% of the
+    frame and give 12 -- so the crop is upscaled until it is worth detecting on.
+    """
     import torch as _t
     from point2pose.data_types.frame import Frame
     from point2pose.data_types.sampler_context import SamplerContext
 
     if sampler is None:
         return sample_points(mask, depth, n)
+    import cv2
+    area = int((mask > 0).sum())
+    up = 1
+    if 0 < area < min_px:
+        up = int(min(4, max(1, round(np.sqrt(min_px / max(area, 1))))))
+    if up > 1:
+        rgb = cv2.resize(rgb, None, fx=up, fy=up, interpolation=cv2.INTER_LINEAR)
+        depth = cv2.resize(depth, None, fx=up, fy=up,
+                           interpolation=cv2.INTER_NEAREST)
+        mask = cv2.resize(mask.astype(np.uint8), None, fx=up, fy=up,
+                          interpolation=cv2.INTER_NEAREST)
+        K = np.asarray(K).copy(); K[:2] *= up
     m = _t.as_tensor((mask > 0).astype(np.uint8))[None, None]
     f = Frame(id=0, rgb=rgb, depth=depth, mask=m, intrinsics=K)
     try:
@@ -87,8 +103,10 @@ def sample_superpoint(sampler, rgb, depth, mask, K, n):
     except Exception as exc:
         print(f"[stream] SuperPoint sample failed ({exc}); using random")
         return sample_points(mask, depth, n)
-    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
-    return pts if pts.shape[0] >= 5 else sample_points(mask, depth, n)
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2) / up
+    if pts.shape[0] < 5:
+        return sample_points(mask, depth, n).astype(np.float32) / up
+    return pts
 
 
 def clean_mask(mask, depth, jump=0.15, win=7):

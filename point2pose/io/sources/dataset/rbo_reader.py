@@ -59,8 +59,13 @@ def _norm(frame):
 
 
 def _pose_matrix(tx, ty, tz, qx, qy, qz, qw):
+    """NaN pose for a dropped mocap sample, whose quaternion is all zeros."""
+    q = np.array([qx, qy, qz, qw], dtype=np.float64)
+    n = np.linalg.norm(q)
+    if not np.isfinite(n) or n < 1e-8:
+        return np.full((4, 4), np.nan)
     T = np.eye(4)
-    T[:3, :3] = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+    T[:3, :3] = Rotation.from_quat(q / n).as_matrix()
     T[:3, 3] = (tx, ty, tz)
     return T
 
@@ -399,7 +404,10 @@ class RBOReader:
         if poses is None:
             logging.info("no mocap body for part %s", obj_name)
             return None
-        return self._T_cam_map[i] @ poses[self._rb_idx[i]]
+        P = poses[self._rb_idx[i]]
+        if not np.all(np.isfinite(P)):      # dropped mocap sample
+            return None
+        return self._T_cam_map[i] @ P
 
     def get_gt_poses(self, i):
         return {p: self.get_gt_pose(i, p) for p in self.object_names}

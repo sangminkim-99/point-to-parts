@@ -73,6 +73,9 @@ def main():
     ap.add_argument("--ambiguous-band", type=float, default=None)
     ap.add_argument("--min-part-pts", type=int, default=None)
     ap.add_argument("--split-frames", type=int, default=None)
+    ap.add_argument("--joint-track", type=int, default=None)
+    ap.add_argument("--top-up", type=int, default=None)
+    ap.add_argument("--mask-gate", type=int, default=None)
     ap.add_argument("--urdf", default=None,
                     help="write the discovered object out as a URDF")
     ap.add_argument("--resplit-cov-frac", type=float, default=None)
@@ -200,7 +203,12 @@ def main():
         for k, v in (("split_out_frac", args.split_out_frac),
                      ("ambiguous_band", args.ambiguous_band),
                      ("min_part_pts", args.min_part_pts),
-                     ("split_frames", args.split_frames)):
+                     ("split_frames", args.split_frames),
+                     ("joint_track", None if args.joint_track is None
+                      else bool(args.joint_track)),
+                     ("top_up", None if args.top_up is None else bool(args.top_up)),
+                     ("mask_gate", None if args.mask_gate is None
+                      else bool(args.mask_gate))):
             if v is not None:
                 setattr(ncfg, k, v)
         s = NaivePartTracker(r.K, ncfg, tracker, reg)
@@ -306,6 +314,7 @@ def main():
         pass
     if args.method == "naive":
         print(f"[replay] naive: {len(s.parts)} parts, splits {s.split_log}"
+              + f", joint-tracked {getattr(s, 'joint_frames', 0)} part-frames"
               + (f", grown {getattr(s, 'grown', 0)}, carved "
                  f"{getattr(s, 'carved', 0)}, relabelled {getattr(s, 'moved', 0)}"
                  if s.model else ""))
