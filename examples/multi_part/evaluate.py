@@ -15,12 +15,24 @@ def gt_labels(reader, anchor, depth0, mask0, stride):
     return pim[(dd > 0.05) & (mm > 0)]
 
 
+def gt_labels_at(reader, anchor, pts2d):
+    """GT part index at each 2D query point -- the sparse counterpart."""
+    pim = reader.render_part_index_map(anchor)
+    u = np.clip(np.round(pts2d[:, 0]).astype(int), 0, pim.shape[1] - 1)
+    v = np.clip(np.round(pts2d[:, 1]).astype(int), 0, pim.shape[0] - 1)
+    return pim[v, u]
+
+
 def report(reader, anchor, parts_gt, lab_gt, stream, pose_log, min_group=30):
     """Purity, coverage and per-part pose error. `pose_log` is [(frame, [T...])]."""
     out = {}
     rows = []
     for j, p in enumerate(stream.parts):
-        w = p.weights[:len(lab_gt)] > 0.5
+        if hasattr(p, "weights"):
+            w = p.weights[:len(lab_gt)] > 0.5
+        else:                            # sparse parts own indices, not weights
+            w = np.zeros(len(lab_gt), bool)
+            w[p.idx[p.idx < len(lab_gt)]] = True
         g = lab_gt[w[:len(lab_gt)]] if w.any() else np.array([])
         g = g[g >= 0]
         if g.size < min_group:

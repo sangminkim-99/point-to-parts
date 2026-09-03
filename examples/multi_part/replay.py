@@ -20,6 +20,24 @@ from point2pose.modules.register.svd_cluster_ransac_register import (
     SVDClusterRANSACRegister)
 
 
+def _naive_tail(s, cfg, args, r, a, gt):
+    """The naive path shares the ground-truth report and nothing else."""
+    if getattr(s, "unmodelled", None) is not None:
+        print(f"[replay] unmodelled object surface: {100 * s.unmodelled:.0f}%")
+    if gt is None or not s.parts:
+        return
+    from pathlib import Path as _P
+    from examples.multi_part import evaluate as _ev
+    res = _ev.report(r, a, gt["parts"], gt["lab"], s, gt["log"],
+                     min_group=cfg.min_part_pts)
+    try:
+        res["joints"] = _ev.joint_metrics(r, gt["parts"], s, res["rows"],
+                                          [f for f, _ in gt["log"]])
+    except Exception as exc:
+        print(f"[eval] joint metrics unavailable ({exc})")
+    print("[eval] " + _ev.fmt(_P(args.seq_dir).name, res, len(s.parts)))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seq-dir", required=True)
@@ -44,6 +62,19 @@ def main():
     ap.add_argument("--resplit-wait", type=int, default=None)
     ap.add_argument("--resplit-min-ratio", type=float, default=None)
     ap.add_argument("--resplit-gain", type=float, default=None)
+    ap.add_argument("--graph", type=int, default=None)
+    ap.add_argument("--method", choices=["dense", "naive"], default="dense",
+                    help="naive = sparse frontend (steps 1-3), layers optional")
+    ap.add_argument("--dense", type=int, default=0,
+                    help="naive only: step 4, per-part gaussian model")
+    ap.add_argument("--refine", type=int, default=0,
+                    help="naive only: step 5, rendering-based refinement")
+    ap.add_argument("--split-out-frac", type=float, default=None)
+    ap.add_argument("--ambiguous-band", type=float, default=None)
+    ap.add_argument("--min-part-pts", type=int, default=None)
+    ap.add_argument("--split-frames", type=int, default=None)
+    ap.add_argument("--urdf", default=None,
+                    help="write the discovered object out as a URDF")
     ap.add_argument("--resplit-cov-frac", type=float, default=None)
     ap.add_argument("--pips-iter", type=int, default=None)
     ap.add_argument("--grow-gate-rel", type=float, default=None)
@@ -131,6 +162,8 @@ def main():
         cfg.resplit = bool(args.resplit)
     if args.resplit_wait:
         cfg.resplit_wait = args.resplit_wait
+    if args.graph is not None:
+        cfg.graph = bool(args.graph)
     if args.resplit_gain is not None:
         cfg.resplit_gain = args.resplit_gain
     if args.resplit_min_ratio is not None:
@@ -156,21 +189,43 @@ def main():
         "inlier_thres": cfg.inlier_thres, "min_inliers": cfg.min_inliers,
         "max_clusters": cfg.max_hyp, "use_uncertainty": False})
 
-    s = StreamingPartDiscovery(r.K, cfg, tracker, reg)
+    if args.method == "naive":
+        from examples.multi_part.naive import NaiveConfig, NaivePartTracker
+        ncfg = NaiveConfig(n_points=cfg.n_points, inlier_thres=cfg.inlier_thres,
+                           min_inliers=cfg.min_inliers,
+                           ransac_iters=cfg.ransac_iters,
+                           num_pips_iter=cfg.num_pips_iter,
+                           dense=bool(args.dense),
+                           refine=bool(args.dense and args.refine))
+        for k, v in (("split_out_frac", args.split_out_frac),
+                     ("ambiguous_band", args.ambiguous_band),
+                     ("min_part_pts", args.min_part_pts),
+                     ("split_frames", args.split_frames)):
+            if v is not None:
+                setattr(ncfg, k, v)
+        s = NaivePartTracker(r.K, ncfg, tracker, reg)
+        cfg = ncfg
+    else:
+        s = StreamingPartDiscovery(r.K, cfg, tracker, reg)
     a = frames[0]
     s.start(r.get_color(a), r.get_depth(a), object_mask(a))
-    print(f"[replay] {len(s.cloud)} gaussians, stride {s.gauss_stride}, "
-          f"{len(frames)} frames")
+    if args.method == "naive":
+        print(f"[replay] naive: {len(s.anchor_xyz)} points"
+              + (f", {len(s.model.cloud)} gaussians" if s.model else "")
+              + f", {len(frames)} frames")
+    else:
+        print(f"[replay] {len(s.cloud)} gaussians, stride {s.gauss_stride}, "
+              f"{len(frames)} frames")
 
     # ground truth, when the reader has it
     gt = None
     if not rec_mode and hasattr(r, "render_part_index_map"):
         try:
             from examples.multi_part import evaluate as _ev
-            gt = {"parts": list(r.get_object_names()),
-                  "lab": _ev.gt_labels(r, a, r.get_depth(a), object_mask(a),
-                                       s.gauss_stride),
-                  "log": []}
+            lab = (_ev.gt_labels_at(r, a, s.pts0) if args.method == "naive"
+                   else _ev.gt_labels(r, a, r.get_depth(a), object_mask(a),
+                                      s.gauss_stride))
+            gt = {"parts": list(r.get_object_names()), "lab": lab, "log": []}
         except Exception as exc:
             print(f"[replay] no GT evaluation ({exc})")
             gt = None
@@ -192,18 +247,24 @@ def main():
                                        for p in s.parts]))
 
         vis = s.render(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy())
-        if args.hyp_panel:
+        if args.hyp_panel and hasattr(s, "hypothesis_panel"):
             panel = s.hypothesis_panel(dep, m, width=vis.shape[1] // 4)
             if panel is not None:
                 vis = np.vstack([vis, s.fit_panel(panel, vis.shape[1])])
         bar = np.full((30, vis.shape[1], 3), (28, 24, 20), np.uint8)
         fps = 1000.0 / max(np.median(times[-30:]), 1e-6)
-        d = s.diag
-        label = (f"{s.state} parts {len(s.parts)} | hyp {d.get('hyp', 0)} "
-                 f"tracks {d.get('tracks_live', 0)}/{d.get('tracks', 0)} "
-                 f"decisive {100*d.get('decisive', 0):.0f}% "
-                 f"tries {d.get('tries', 0)} | g {d.get('gauss', 0)//1000}k "
-                 f"ws {d.get('winsets', 0)} | {fps:.1f} fps")
+        d = getattr(s, "diag", {})
+        if args.method == "naive":
+            label = (f"{s.state} parts {len(s.parts)} | resid "
+                     + " ".join(f"{p.resid*1000:.0f}" for p in s.parts)
+                     + f" mm | g {len(s.model.cloud) if s.model else 0} "
+                     f"| {fps:.1f} fps")
+        else:
+            label = (f"{s.state} parts {len(s.parts)} | hyp {d.get('hyp', 0)} "
+                     f"tracks {d.get('tracks_live', 0)}/{d.get('tracks', 0)} "
+                     f"decisive {100*d.get('decisive', 0):.0f}% "
+                     f"tries {d.get('tries', 0)} | g {d.get('gauss', 0)//1000}k "
+                     f"ws {d.get('winsets', 0)} | {fps:.1f} fps")
         cv2.putText(bar, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (235, 235, 235), 1, cv2.LINE_AA)
         canvas = np.vstack([vis, bar])
@@ -243,6 +304,23 @@ def main():
               f"winsets {len(getattr(s.assign, 'winsets', []))}")
     except Exception:
         pass
+    if args.method == "naive":
+        print(f"[replay] naive: {len(s.parts)} parts, splits {s.split_log}"
+              + (f", grown {getattr(s, 'grown', 0)}, carved "
+                 f"{getattr(s, 'carved', 0)}, relabelled {getattr(s, 'moved', 0)}"
+                 if s.model else ""))
+        if args.urdf:
+            from examples.multi_part import urdf_export as _ux
+            gm = (s.model.cloud.means.detach().cpu().numpy()
+                  if s.model else None)
+            if gm is None:
+                pts_of = lambda j: s.anchor_xyz[s.parts[j].idx]
+            else:
+                pts_of = lambda j: gm[s.model.labels[:len(gm)] == j]
+            out, w = _ux.export(args.urdf, s.parts, pts_of)
+            print(f"[replay] wrote {out} with {len(w)} collision meshes")
+        _naive_tail(s, cfg, args, r, a, gt)
+        return
     print(f"[replay] growth: {getattr(s, 'grown_total', 0)} gaussians added over "
           f"{getattr(s, 'grow_calls', 0)} attempts, "
           f"{getattr(s, 'grow_blocked', 0)} blocked by the energy gate "
@@ -259,12 +337,15 @@ def main():
             print(f"[replay]   part {j}: {orig} original + {grown} grown, extent {ext}")
     if getattr(s, "unmodelled", None) is not None:
         print(f"[replay] unmodelled object surface: {100 * s.unmodelled:.0f}%")
+    if getattr(s, "graph_used", 0):
+        print(f"[replay] pose graph accepted {s.graph_used} part-frames")
     if getattr(s, "pruned_total", 0):
         print(f"[replay] pruned {s.pruned_total} gaussians no part explained")
     if gt is not None and s.parts:
         from examples.multi_part import evaluate as _ev
         res = _ev.report(r, a, gt["parts"], gt["lab"], s, gt["log"],
-                         min_group=cfg.min_group)
+                         min_group=(cfg.min_part_pts if args.method == "naive"
+                                    else cfg.min_group))
         try:
             res["joints"] = _ev.joint_metrics(r, gt["parts"], s, res["rows"],
                                               [f for f, _ in gt["log"]])

@@ -153,6 +153,8 @@ class Part:
     d_pose: np.ndarray = None           # last inter-frame increment
     track_idx: np.ndarray = None        # sparse tracks sitting on this part
     view_dirs: list = None              # viewing directions already keyframed
+    opt: object = None                  # per-part ISAM2 graph
+    opt_n: int = 0
 
 
 @dataclass
@@ -198,6 +200,13 @@ class Config:
     # EM-Fusion's uniform outlier class: without it a gaussian that fits no part
     # still has to pick one. Metres; 0 disables.
     outlier_r: float = 0.0
+    # Point2Pose's own back end. Each part's pose was chosen greedily per frame
+    # with nothing to pull it back once it slipped: RBO median 57 mm but p90
+    # 544 mm. A pose graph over the part's own tracks is what Point2Pose already
+    # brings and what the streaming tracker was not using at all.
+    graph: bool = False   # measured on RBO: helps one part, wrecks another
+    graph_relin: float = 0.1
+    graph_prior: float = 0.05
     prune: bool = True
     prune_votes: int = 3
     prune_every: int = 3
@@ -877,6 +886,21 @@ class StreamingPartDiscovery:
             if ef < best_e:
                 best_T, best_e = Tf, ef
 
+            if cfg.graph:
+                if part.opt is None:
+                    part.opt = self._new_graph()
+                if part.opt is not None:
+                    Tg = self._graph_pose(part, j, best_T, i)
+                    # the graph only replaces the greedy pose when it still
+                    # explains the depth at least as well
+                    if Tg is not None:
+                        eg = a.fit_energy(Tg, w, self.K, H, W, depth, obs_mask=om,
+                                          r_max=cfg.track_rmax,
+                                          outside_w=cfg.outside_w)
+                        if eg <= best_e * 1.05:
+                            best_T, best_e = Tg, eg
+                            self.graph_used = getattr(self, "graph_used", 0) + 1
+
             part.d_pose = best_T @ np.linalg.inv(part.pose)
             part.pose, part.energy = best_T, best_e
             part.best_energy = min(part.best_energy, best_e)
@@ -998,6 +1022,55 @@ class StreamingPartDiscovery:
         # ---- online part modelling ----
         if cfg.grow_every > 0 and i % cfg.grow_every == 0:
             self._grow(rgb, depth, mask)
+
+    def _new_graph(self):
+        """One ISAM2 graph per part, or None if GTSAM is unavailable."""
+        try:
+            from point2pose.modules.optimizer.isam2_optimizer import ISAM2Optimizer
+        except Exception as exc:
+            if not getattr(self, "_graph_warned", False):
+                print(f"[stream] pose graph disabled ({exc})")
+                self._graph_warned = True
+            return None
+        return ISAM2Optimizer({"relinearize_threshold": self.cfg.graph_relin,
+                               "relinearize_skip": 1,
+                               "prior_noise_param": [self.cfg.graph_prior] * 6})
+
+    def _graph_pose(self, part, j, T, i):
+        """Smooth this part's pose through its own graph over its own tracks."""
+        from point2pose.data_types.object_frame_data import ObjectFrameData
+        cur, cok, cvi = self.cur_tracks
+        ti = part.track_idx
+        n3 = np.zeros((0, 3), np.float32)
+        idx = np.zeros(0, np.int64)
+        inl = np.zeros(0, bool)
+        res = np.zeros(0, np.float32)
+        if ti is not None and ti.size:
+            ti = ti[ti < len(cok)]
+            sel = ti[cok[ti] & cvi[ti] & self.anchor_ok[ti]]
+            if sel.size:
+                pred = self.anchor_xyz[sel] @ T[:3, :3].T + T[:3, 3]
+                d = np.linalg.norm(pred - cur[sel], axis=1)
+                n3, idx = cur[sel].astype(np.float32), sel.astype(np.int64)
+                inl = d < self.cfg.inlier_thres * 3
+                res = np.maximum(d, 1e-4).astype(np.float32)
+        data = ObjectFrameData(
+            obj_id=int(j), frame_id=int(i), intrinsics=self.K,
+            pose=np.asarray(T, dtype=np.float64),
+            rel_pose=None if part.d_pose is None else np.asarray(part.d_pose,
+                                                                 dtype=np.float64),
+            visible_pts_2d=np.zeros((0, 2), np.float32),
+            visible_pts_2d_idx=np.zeros(0, np.int64),
+            visible_uncertainties=np.zeros(0, np.float32),
+            reg_cur_3d=n3, reg_cur_3d_idx=idx,
+            reg_valid_idx=np.arange(len(idx), dtype=np.int64),
+            reg_inliers=inl, reg_residuals=res, reg_uncertainties=res)
+        try:
+            out = part.opt.optimize(data)
+        except Exception:
+            return None
+        part.opt_n += 1
+        return None if out is None else np.asarray(out.pose_optimized)
 
     def _tracks_on(self, gm, w):
         """Which sparse tracks sit on this part, by nearest gaussian in the
