@@ -87,23 +87,29 @@ class JointModel:
         return "revolute", n, p
 
     def _fit_prismatic(self, A, ang, t):
+        """Axis by least squares through the observed translations."""
         nrm = np.linalg.norm(t, axis=1)
         if nrm.max() < self.min_shift:
             return None
-        d = t[np.argmax(nrm)]
-        return "prismatic", d / (np.linalg.norm(d) + 1e-12), np.zeros(3)
+        c = t - t.mean(0)
+        # the principal direction is the axis; one extreme sample is not enough
+        u, sv, vt = np.linalg.svd(c, full_matrices=False)
+        d = vt[0]
+        if float(d @ t[np.argmax(nrm)]) < 0:
+            d = -d
+        return "prismatic", d, np.zeros(3)
 
     # Sturm, Stachniss & Burgard (JAIR 2011) count k = 6 for a rigid link,
     # 9 for prismatic and 12 for revolute, and select on the lowest BIC.
     K_PARAMS = {"rigid": 6, "prismatic": 9, "revolute": 12}
 
     def _score(self, model, A):
-        """Mean squared residual of a candidate over the history."""
+        """Mean squared residual of a candidate over the offset-free history."""
         kind, axis, point = model
-        keep = (self.kind, self.axis, self.point)
-        self.kind, self.axis, self.point = kind, axis, point
+        keep = (self.kind, self.axis, self.point, self.A0)
+        self.kind, self.axis, self.point, self.A0 = kind, axis, point, None
         r = float(np.mean([self.residual(a) ** 2 for a in A]))
-        self.kind, self.axis, self.point = keep
+        self.kind, self.axis, self.point, self.A0 = keep
         return r
 
     def _bic(self, kind, mse, n):
@@ -128,7 +134,15 @@ class JointModel:
         """
         if len(self.A) < self.min_obs:
             return False
-        A = np.stack(self.A)
+        raw = np.stack(self.A)
+        # Both models describe motion FROM a rest pose, but two parts each carry
+        # their own anchor frame, so the relative transform at rest is never the
+        # identity. Without factoring that offset out, the fixed rotation between
+        # the parts is charged to the prismatic model as permanent residual and a
+        # sliding joint is always typed revolute. This is Sturm's origin a.
+        self.A0 = raw[0].copy()
+        A0i = np.linalg.inv(self.A0)
+        A = np.einsum("ij,njk->nik", A0i, raw)
         ang = np.linalg.norm(R.from_matrix(A[:, :3, :3]).as_rotvec(), axis=1)
         t = A[:, :3, 3]
         cands = []
@@ -188,8 +202,10 @@ class JointModel:
         else:
             axis_std = float("nan")
 
-        # excitation: how far the joint has actually been moved
+        # excitation: how far the joint has actually been moved (A is offset-free)
+        a0, self.A0 = self.A0, None
         vals = np.array([self.value_of(a) for a in A])
+        self.A0 = a0
         span = float(vals.max() - vals.min()) if vals.size else 0.0
         need = np.radians(min_range_deg) if self.kind == "revolute" else min_range_m
         exc = float(np.clip(span / max(need, 1e-9), 0.0, 1.0))
@@ -212,6 +228,10 @@ class JointModel:
     # --------------------------------------------------------------- pose --
     def at(self, value):
         """Relative transform at a joint value (radians, or metres)."""
+        return (self.A0 if self.A0 is not None else np.eye(4)) @ self._local(value)
+
+    def _local(self, value):
+        """Joint motion away from the rest pose."""
         A = np.eye(4)
         if self.kind == "revolute":
             Rm = R.from_rotvec(self.axis * value).as_matrix()
@@ -224,6 +244,8 @@ class JointModel:
     def value_of(self, A):
         """Joint value that best explains a relative transform."""
         A = np.asarray(A, dtype=np.float64)
+        if self.A0 is not None:
+            A = np.linalg.inv(self.A0) @ A
         if self.kind == "revolute":
             rv = R.from_matrix(A[:3, :3]).as_rotvec()
             return float(rv @ self.axis)

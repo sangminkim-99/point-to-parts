@@ -736,7 +736,12 @@ class NaivePartTracker:
                                     tipLength=0.3)
             lab = f"p{j} {p.resid * 1000:.0f}mm {100 * p.out_frac:.0f}%"
             if p.joint is not None and p.joint.kind:
-                lab += f" {p.joint.kind[:4]}" + ("*" if p.on_joint else "")
+                c = p.joint.confidence()
+                # the type on its own says nothing; how sure and how much it has
+                # been moved are what tell a person to keep wiggling
+                lab += (f" {p.joint.kind[:4]} {c['conf']:.2f}"
+                        f"/t{c['type_p']:.2f}/x{c['excitation']:.1f}"
+                        + ("*" if p.on_joint else ""))
             if p0:
                 cv2.putText(out, lab, (p0[0] - 30, p0[1] - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
