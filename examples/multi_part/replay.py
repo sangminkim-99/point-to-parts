@@ -39,9 +39,11 @@ def main():
     ap.add_argument("--min-group-frac", type=float, default=None)
     ap.add_argument("--mask-depth-jump", type=float, default=None)
     ap.add_argument("--mask-win", type=int, default=None)
+    ap.add_argument("--outlier-r", type=float, default=None)
     ap.add_argument("--resplit", type=int, default=None)
     ap.add_argument("--resplit-wait", type=int, default=None)
     ap.add_argument("--resplit-min-ratio", type=float, default=None)
+    ap.add_argument("--resplit-gain", type=float, default=None)
     ap.add_argument("--resplit-cov-frac", type=float, default=None)
     ap.add_argument("--pips-iter", type=int, default=None)
     ap.add_argument("--grow-gate-rel", type=float, default=None)
@@ -50,17 +52,27 @@ def main():
                     help="show a live cv2 window; 'q' quits, 'space' pauses")
     ap.add_argument("--hyp-panel", type=int, default=1,
                     help="strip of per-hypothesis render-vs-depth residuals")
+    ap.add_argument("--models-dir", default=None,
+                    help="RBO models/ directory (defaults beside sequences/)")
+    ap.add_argument("--shorter-side", type=int, default=None)
     ap.add_argument("--min-frames", type=int, default=None)
     ap.add_argument("--regroup-every", type=int, default=None)
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
     args = ap.parse_args()
 
-    # a RealSense recording (rgb/, depth/, cam_K.txt) or a dataset sequence
-    if (Path(args.seq_dir).expanduser() / "cam_K.txt").exists():
+    # a RealSense recording (rgb/, depth/, cam_K.txt), an RBO sequence
+    # (camera_rgb/, tf.csv) or a rendered SAPIEN sequence
+    sd = Path(args.seq_dir).expanduser()
+    if (sd / "cam_K.txt").exists():
         from examples.multi_part.recording import Recording
         r = Recording(args.seq_dir)
         rec_mode = True
+    elif (sd / "camera_rgb").is_dir():
+        from point2pose.io.sources.dataset.rbo_reader import RBOReader
+        r = RBOReader(str(sd), models_dir=args.models_dir,
+                      shorter_side=args.shorter_side)
+        rec_mode = False
     else:
         r = open_sequence(args.seq_dir)
         rec_mode = False
@@ -107,6 +119,8 @@ def main():
         cfg.groupings = args.groupings
     if args.min_group:
         cfg.min_group = args.min_group
+    if args.outlier_r is not None:
+        cfg.outlier_r = args.outlier_r
     if args.mask_win is not None:
         cfg.mask_win = args.mask_win
     if args.mask_depth_jump is not None:
@@ -117,6 +131,8 @@ def main():
         cfg.resplit = bool(args.resplit)
     if args.resplit_wait:
         cfg.resplit_wait = args.resplit_wait
+    if args.resplit_gain is not None:
+        cfg.resplit_gain = args.resplit_gain
     if args.resplit_min_ratio is not None:
         cfg.resplit_min_ratio = args.resplit_min_ratio
     if args.resplit_cov_frac is not None:
@@ -146,6 +162,19 @@ def main():
     print(f"[replay] {len(s.cloud)} gaussians, stride {s.gauss_stride}, "
           f"{len(frames)} frames")
 
+    # ground truth, when the reader has it
+    gt = None
+    if not rec_mode and hasattr(r, "render_part_index_map"):
+        try:
+            from examples.multi_part import evaluate as _ev
+            gt = {"parts": list(r.get_object_names()),
+                  "lab": _ev.gt_labels(r, a, r.get_depth(a), object_mask(a),
+                                       s.gauss_stride),
+                  "log": []}
+        except Exception as exc:
+            print(f"[replay] no GT evaluation ({exc})")
+            gt = None
+
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     writer, times, breakdown, split_costs = None, [], {}, []
     for i in frames[1:]:
@@ -158,6 +187,9 @@ def main():
             split_costs.append(s.last_split_ms); s.last_split_ms = None
         for k, v in s.last_timings.items():
             breakdown.setdefault(k, []).append(v)
+        if gt is not None and s.parts:
+            gt["log"].append((int(i), [None if p.pose is None else p.pose.copy()
+                                       for p in s.parts]))
 
         vis = s.render(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy())
         if args.hyp_panel:
@@ -229,6 +261,16 @@ def main():
         print(f"[replay] unmodelled object surface: {100 * s.unmodelled:.0f}%")
     if getattr(s, "pruned_total", 0):
         print(f"[replay] pruned {s.pruned_total} gaussians no part explained")
+    if gt is not None and s.parts:
+        from examples.multi_part import evaluate as _ev
+        res = _ev.report(r, a, gt["parts"], gt["lab"], s, gt["log"],
+                         min_group=cfg.min_group)
+        try:
+            res["joints"] = _ev.joint_metrics(r, gt["parts"], s, res["rows"],
+                                              [f for f, _ in gt["log"]])
+        except Exception as exc:
+            print(f"[eval] joint metrics unavailable ({exc})")
+        print("[eval] " + _ev.fmt(Path(args.seq_dir).name, res, len(s.parts)))
     print(f"[replay] final state: {s.state}, {len(s.parts)} parts")
     for j, p in enumerate(s.parts):
         jm = p.joint

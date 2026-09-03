@@ -110,6 +110,7 @@ class GaussianPartAssignment:
         # moves. Without this the accumulation is meaningless -- on RBO it left
         # every gaussian in one group no matter how diverse the hypotheses were.
         self._slot_members = [None] * n_hypotheses
+        self.outlier_r = 0.0            # metres; 0 disables the outlier class
         self.n_slots = n_hypotheses
         self.coassoc_weight = "none"
         # ceiling on a winner set, as a fraction of the cloud. 0.5 assumes at
@@ -490,12 +491,24 @@ class GaussianPartAssignment:
             img = f[0, 0] > 0
         return img.cpu().numpy()
 
-    def soft_membership(self, R, tau=None):
-        """Posterior over hypotheses per gaussian, (Hy, N)."""
+    def soft_membership(self, R, tau=None, outlier_r=None):
+        """Posterior over hypotheses per gaussian, (Hy, N).
+
+        With `outlier_r` set, a constant "explained by nothing" row competes in
+        the softmax and is then dropped, so the returned columns no longer sum
+        to one: a gaussian that fits no hypothesis gets little mass anywhere
+        instead of being forced to pick the least bad one. This is EM-Fusion's
+        uniform outlier component (Strecke & Stueckler 2019).
+        """
         tau = self.depth_sigma if tau is None else tau
         r = R.clone()
         r[~torch.isfinite(r)] = 1e6
-        return torch.softmax(-r / max(tau, 1e-6), dim=0)
+        ro = self.outlier_r if outlier_r is None else outlier_r
+        if not ro:
+            return torch.softmax(-r / max(tau, 1e-6), dim=0)
+        r = torch.cat([r, torch.full((1, r.shape[1]), float(ro),
+                                     device=r.device, dtype=r.dtype)], 0)
+        return torch.softmax(-r / max(tau, 1e-6), dim=0)[:-1]
 
     def residuals(self, hypotheses, K, H, W, obs_depth, obs_mask=None):
         """Per-gaussian depth residual under each hypothesis, (Hy, N)."""
@@ -593,7 +606,8 @@ class GaussianPartAssignment:
 
     def grow_parts(self, rgb, depth, K, mask, poses, weights, tol=0.02,
                    stride=3, max_new=1500, max_total=300000, grow_ok=None,
-                   max_adj_px=25.0, dedup_vox=0.004, confirm=2):
+                   max_adj_px=25.0, max_adj_m=0.05, dedup_vox=0.004,
+                   confirm=2):
         """Attach newly revealed surface to the part it is adjacent to.
 
         `grow` anchors new points through the *first* hypothesis, which is fine
@@ -683,6 +697,19 @@ class GaussianPartAssignment:
         li = near[vn, un] - 1
         li = np.clip(li, 0, len(ys) - 1)
         owner = labn[ys[li], xs[li]]
+        # Adjacent in the image is not adjacent in space: a part passing in front
+        # of another is a few pixels away and tens of centimetres apart. Require
+        # the new surface to touch its owner in depth as well.
+        if max_adj_m > 0:
+            dn = depth[vn, un]
+            do = depth[ys[li], xs[li]]
+            keep = np.abs(dn - do) <= max_adj_m
+            if not keep.any():
+                return 0, None
+            kt3 = torch.as_tensor(keep, device=vs.device)
+            vs, us = vs[kt3], us[kt3]
+            vn, un, owner = vn[keep], un[keep], owner[keep]
+            n_new = int(keep.sum())
 
         # Only parts whose pose is currently trusted may absorb new surface.
         # Growing through a pose that has already slipped writes the error into

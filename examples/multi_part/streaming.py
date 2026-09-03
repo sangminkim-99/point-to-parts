@@ -195,6 +195,9 @@ class Config:
     # was wrongly left in rather than moving it, and EM-Fusion (Strecke &
     # Stueckler 2019) re-infers the association every frame with an explicit
     # "belongs to nothing" outlier term.
+    # EM-Fusion's uniform outlier class: without it a gaussian that fits no part
+    # still has to pick one. Metres; 0 disables.
+    outlier_r: float = 0.0
     prune: bool = True
     prune_votes: int = 3
     prune_every: int = 3
@@ -204,7 +207,13 @@ class Config:
     # A re-split has to earn its extra part. Without a floor the grouping with
     # the required group count wins even at ratio 0.00, and every object
     # fragments to max_hyp pieces.
-    resplit_min_ratio: float = 1.02
+    # The grouping score rises monotonically with the number of groups -- every
+    # extra group picks its own best hypothesis -- so comparing a re-split
+    # against a fixed constant can never say no. RBO cabinet01 walked 2 -> 6
+    # parts with the ratio climbing 1.16, 1.20, 1.27, 1.36 at every step. The
+    # comparison has to be against the partition already in use.
+    resplit_min_ratio: float = 1.02     # kept for the absolute floor
+    resplit_gain: float = 1.08          # x the CURRENT partition's own score
     # Relative to the coverage the accepted split itself reached. An absolute
     # 0.30 was calibrated on sim (first split 0.82-0.94); on a real sequence
     # 87% of gaussians are undecided, so coverage cannot exceed ~0.13 and the
@@ -294,6 +303,7 @@ class StreamingPartDiscovery:
             raise RuntimeError("anchor frame gives too few gaussians")
         self.assign = GaussianPartAssignment(
             self.cloud, cfg.max_hyp, depth_sigma=cfg.depth_sigma)
+        self.assign.outlier_r = cfg.outlier_r
         self.assign.init_coassoc(min(cfg.co_sample, len(self.cloud)))
 
         self.sampler = build_sampler(cfg)
@@ -972,9 +982,15 @@ class StreamingPartDiscovery:
             if since >= cfg.resplit_wait and i % cfg.regroup_every == 0:
                 t0 = time.perf_counter()
                 prev_cov = float(getattr(self, "split_info", {}).get("coverage", 0.0))
+                cur_lab = np.full(len(self.cloud), -1, dtype=int)
+                for j2, p2 in enumerate(self.parts):
+                    cur_lab[p2.weights[:len(cur_lab)] > 0.5] = j2
+                cur_ratio = self._grouping_score(cur_lab)[0]
+                self.cur_ratio = cur_ratio
                 self._try_split(min_groups=len(self.parts) + 1,
                                 max_groups=len(self.parts) + 1,
-                                min_ratio=cfg.resplit_min_ratio,
+                                min_ratio=max(cfg.resplit_min_ratio,
+                                              cfg.resplit_gain * cur_ratio),
                                 min_cov=cfg.resplit_cov_frac * prev_cov,
                                 require_relative_motion=True)
                 self.last_split_ms = (time.perf_counter() - t0) * 1e3
