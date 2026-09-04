@@ -134,7 +134,7 @@ def sample_superpoint(sampler, rgb, depth, mask, K, n, min_px=20000):
     return pts
 
 
-def clean_mask(mask, depth, jump=0.15, win=7):
+def clean_mask(mask, depth, jump=0.15, win=7, min_frac=0.02):
     """Drop mask pixels that sit well BEHIND the object's local surface.
 
     A propagated mask leaks background at the silhouette, and the leak is always
@@ -153,10 +153,16 @@ def clean_mask(mask, depth, jump=0.15, win=7):
     out = m & (depth <= near + jump)
     if out.sum() < 0.5 * m.sum():       # the object really is that deep
         return m.astype(np.uint8) * 255
+    # Keep every component that is a real share of the object, not just the
+    # biggest: an object can be pointed at as several separate blobs, and an
+    # articulated one comes apart in the image whenever a part is occluded.
+    # Only specks left behind by the depth filter are dropped.
     n, lb, st, _ = cv2.connectedComponentsWithStats(out.astype(np.uint8), 8)
-    if n > 2:                            # keep the body, drop specks
-        keep = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
-        out = lb == keep
+    if n > 2:
+        area = st[1:, cv2.CC_STAT_AREA]
+        keep = 1 + np.where(area >= max(min_frac * area.sum(), 30))[0]
+        if keep.size:
+            out = np.isin(lb, keep)
     return out.astype(np.uint8) * 255
 
 

@@ -80,7 +80,11 @@ class NaiveConfig:
     # Residual evidence cannot separate a joint from correlated tracking error;
     # the smoothness of q(t) can, because a real joint is driven and error is
     # white. Measured on synthetic data: real joints 1.00, pure jitter 0.00.
-    merge_smooth: float = 0.35
+    merge_smooth: float = 0.15
+    # A hinge is a physical thing: it lives in or on the object. Used as a MAP
+    # prior on the axis, scaled by the object's own radius. Proposal generators
+    # assume this (H-SAUR, Real2Code); using it to REJECT a joint is new.
+    axis_prior: float = 0.5             # x the object radius; 0 disables
     # Stage B: a single frame's RANSAC split is a coin toss on noisy depth. What
     # marks a real part is the SAME point subset backing a different motion frame
     # after frame, so co-association is accumulated and clustered instead.
@@ -129,6 +133,24 @@ class NaiveConfig:
     # part -- we put it there. Starting its co-association at zero throws that
     # away and lets a few noisy frames carve it back out. It starts instead with
     # recorded agreement with its part, which evidence then has to overcome.
+    # A new track's part is a question about MOTION, and it was being answered
+    # by position -- sampled inside a part's box, anchored through that part's
+    # pose at that instant, so any error in it was written in permanently. A
+    # track belongs to part j when inv(T_j(t)) x(t) stays put, which needs no
+    # anchor at all and decides itself over several frames.
+    pending: bool = True
+    pend_min_obs: int = 8               # observations before a track is placed
+    pend_max_age: int = 45              # frames before an undecided track is dropped
+    pend_margin: float = 1.8            # x better than the runner-up to claim it
+    pend_sigma: float = 3.0             # x noise the winner must still be under
+    # Motion evidence alone cannot tell "moves with" from "is wrong with":
+    # tracking error is correlated in time, so it fakes agreement. Where the
+    # point LANDS is a second, independent source -- a part's own tracked points
+    # are its observed surface, so a new point on that surface, at that depth,
+    # belongs to it. Reprojection and temporal consistency have to agree.
+    reproject: bool = True
+    reproj_px: float = 24.0             # how near the part's surface, in pixels
+    reproj_depth: float = 0.03          # and in metres
     seed_prior: float = 6.0             # weighted frames of assumed agreement
     track_grace: int = 12               # frames before a track may vote
     reseed_max_resid: float = 0.012     # metres; pose must explain the old ones
@@ -197,6 +219,7 @@ class NaivePartTracker:
         from examples.multi_part.streaming import (build_sampler,
                                                    sample_superpoint, clean_mask)
         mask = clean_mask(mask, depth)
+        self.mask = mask
         self.sampler = build_sampler(self.cfg)
         pts0 = sample_superpoint(self.sampler, rgb, depth, mask, self.K,
                                  self.cfg.n_points)
@@ -209,6 +232,7 @@ class NaivePartTracker:
         self.pts0 = pts0
         self.anchor_xyz, self.anchor_ok = lift(pts0, depth, self.K)
         self.track_born = np.zeros(len(pts0), np.int32)
+        self.pend = {}          # track index -> (n, sum, sumsq) per part
         self.parts = [NaivePart(idx=np.where(self.anchor_ok)[0])]
         self.parts[0].box = self._fit_box(self.parts[0])
         self.n = 1
@@ -229,10 +253,16 @@ class NaivePartTracker:
     # ---- one frame ----
     def step(self, rgb, depth, mask):
         from point2pose.data_types.frame import Frame
+        from examples.multi_part.streaming import clean_mask
         cfg = self.cfg
         t0 = time.perf_counter()
         i = self.n
         self.n += 1
+        # one mask for the whole frame: the gate, the re-seeding and the viewer
+        # were each using a different one, so a track could be judged on-object
+        # against pixels the sampler had already discarded
+        mask = clean_mask(mask, depth)
+        self.mask = mask
 
         tracks, _, vis = self.tracker.track_once(
             Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K))
@@ -274,11 +304,19 @@ class NaivePartTracker:
                 # the BIC needs the real observation noise, and the fit itself
                 # is the only thing that knows it
                 p.joint.sigma = max(p.sigma, self.parts[p.parent].sigma)
+                p.joint.axis_prior = cfg.axis_prior
+                p.joint.geom = self._joint_geom(j, p)
                 A = np.linalg.inv(self.parts[p.parent].pose) @ p.pose
                 p.joint.add(A)
                 if p.joint.kind is None or len(p.joint.A) % 4 == 0:
                     if p.joint.fit():
                         self._note_controllable(j, p, i)
+
+        self.reproj = None
+        if cfg.reproject and len(self.parts) > 1:
+            self.reproj, _ = self._reproject_owner(tracks, depth)
+        if cfg.pending:
+            self._place_pending(i)
 
         if cfg.merge_rigid and len(self.parts) > 1 and i % cfg.merge_every == 0:
             self._merge_rigid(i)
@@ -298,9 +336,7 @@ class NaivePartTracker:
 
     def _dense_step(self, rgb, depth, mask, i):
         """Steps 4 and 5, run at their own rate on top of the sparse frontend."""
-        from examples.multi_part.streaming import clean_mask
         cfg = self.cfg
-        mask = clean_mask(mask, depth)
         H, W = depth.shape
         poses = [p.pose for p in self.parts]
 
@@ -399,24 +435,34 @@ class NaivePartTracker:
             f = Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K)
             self.tracker.add_query_points(f, new)
             xyz, ok = lift(new, depth, self.K)
-            # a new track is anchored through this part's current pose
-            Ti = np.linalg.inv(p.pose)
             base = len(self.anchor_xyz)
+            n_new = len(new)
             self.anchor_xyz = np.concatenate(
-                [self.anchor_xyz, (xyz @ Ti[:3, :3].T + Ti[:3, 3]).astype(np.float32)])
-            self.anchor_ok = np.concatenate([self.anchor_ok, ok])
-            p.idx = np.concatenate([p.idx, base + np.where(ok)[0]])
+                [self.anchor_xyz, np.zeros((n_new, 3), np.float32)])
+            self.anchor_ok = np.concatenate(
+                [self.anchor_ok, np.zeros(n_new, bool)])
             self.track_born = np.concatenate(
-                [self.track_born, np.full(len(new), i, np.int32)])
+                [self.track_born, np.full(n_new, i, np.int32)])
+            if cfg.pending:
+                # nothing is claimed yet: the track waits for its own motion to
+                # say which part it belongs to, and is anchored only then
+                for k in np.where(ok)[0]:
+                    self.pend[base + int(k)] = {"born": i, "obs": []}
+            else:
+                Ti = np.linalg.inv(p.pose)
+                self.anchor_xyz[base:] = (xyz @ Ti[:3, :3].T
+                                          + Ti[:3, 3]).astype(np.float32)
+                self.anchor_ok[base:] = ok
+                p.idx = np.concatenate([p.idx, base + np.where(ok)[0]])
             p.last_seed = i
             p.view_dirs.append(u)
             fresh = base + np.where(ok)[0]
-            if cfg.seed_prior > 0 and fresh.size:
+            if cfg.seed_prior > 0 and fresh.size and not cfg.pending:
                 self._grow_co(len(self.anchor_xyz))
-                old = p.idx[(p.idx < len(self.anchor_xyz))
-                            & ~np.isin(p.idx, fresh)]
+                old_i = p.idx[(p.idx < len(self.anchor_xyz))
+                              & ~np.isin(p.idx, fresh)]
                 w = cfg.seed_prior
-                for a_, b_ in ((fresh, old), (old, fresh), (fresh, fresh)):
+                for a_, b_ in ((fresh, old_i), (old_i, fresh), (fresh, fresh)):
                     if a_.size and b_.size:
                         self.co_same[np.ix_(a_, b_)] += w
                         self.co_seen[np.ix_(a_, b_)] += w
@@ -425,7 +471,7 @@ class NaivePartTracker:
             for p in self.parts:
                 p.box = self._fit_box(p)
             print(f"[naive] frame {i}: re-seeded {added} tracks "
-                  f"({len(self.anchor_xyz)} total, "
+                  f"({len(self.pend)} awaiting a part, "
                   f"{sum(len(q.view_dirs or []) for q in self.parts)} views)")
         return added
 
@@ -582,6 +628,146 @@ class NaivePartTracker:
             return fit_oriented_box(q[d <= np.percentile(d, 90)])
         except Exception:
             return None
+
+    def _reproject_owner(self, t2, depth):
+        """Part id per pixel, from where each part's own points are right now.
+
+        Not a rendering -- the tracked points ARE the surface we have observed,
+        so the nearest one that also agrees in depth is the part that owns a
+        pixel. A neighbouring part passing in front is near in the image and far
+        in depth, and is rejected by the second test.
+        """
+        import cv2
+        cfg = self.cfg
+        cur, cok, cvi = self.cur
+        H, W = depth.shape
+        seed = np.zeros((H, W), np.uint8)
+        lab = np.full((H, W), -1, np.int16)
+        zbuf = np.zeros((H, W), np.float32)
+        for j, p in enumerate(self.parts):
+            idx = p.idx[(p.idx < len(cok)) & (p.idx < len(t2))]
+            idx = idx[cok[idx] & cvi[idx]]
+            if idx.size < 3:
+                continue
+            u = np.clip(t2[idx, 0].astype(int), 0, W - 1)
+            v = np.clip(t2[idx, 1].astype(int), 0, H - 1)
+            seed[v, u] = 1
+            lab[v, u] = j
+            zbuf[v, u] = cur[idx, 2]
+        if not seed.any():
+            return None, None
+        dist, near = cv2.distanceTransformWithLabels(
+            1 - seed, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+        ys, xs = np.where(seed > 0)
+        order = np.argsort(ys * W + xs)
+        ys, xs = ys[order], xs[order]
+        li = np.clip(near - 1, 0, len(ys) - 1)
+        owner = lab[ys[li], xs[li]]
+        zref = zbuf[ys[li], xs[li]]
+        bad = (dist > cfg.reproj_px) | (np.abs(depth - zref) > cfg.reproj_depth) \
+            | (depth <= 0)
+        owner = np.where(bad, -1, owner)
+        return owner, dist
+
+    def _place_pending(self, i):
+        """Give each waiting track to the part it actually moves with.
+
+        For a track rigidly attached to part j, inv(T_j(t)) x(t) is the same
+        point every frame. Its spread over time is therefore the evidence, and
+        the winning part's mean IS the anchor -- computed from every frame the
+        track was seen, not from the one it happened to be sampled in.
+        """
+        cfg = self.cfg
+        cur, cok, cvi = self.cur
+        placed, dropped = 0, 0
+        for idx in list(self.pend):
+            if idx >= len(cok):
+                continue
+            st = self.pend[idx]
+            # Keep the raw observation and the poses that go with it. Throwing
+            # the history away whenever the part list changed left every track
+            # unowned right after a split, and the parts then lost the points
+            # that justified it -- cabinet03 collapsed back to one body.
+            if cok[idx] and cvi[idx]:
+                st["obs"].append((cur[idx].copy(),
+                                  [None if p.pose is None else p.pose.copy()
+                                   for p in self.parts]))
+                if len(st["obs"]) > cfg.pend_max_age:
+                    st["obs"].pop(0)
+            n_obs = len(st["obs"])
+            if n_obs < cfg.pend_min_obs:
+                if i - st["born"] > cfg.pend_max_age:
+                    del self.pend[idx]
+                    dropped += 1
+                continue
+            # re-evaluate against whatever the parts are NOW
+            npart = len(self.parts)
+            spread = np.full(npart, np.inf)
+            mean = np.zeros((npart, 3))
+            for j in range(npart):
+                a = [(x - T[j][:3, 3]) @ T[j][:3, :3]
+                     for x, T in st["obs"] if j < len(T) and T[j] is not None]
+                if len(a) < cfg.pend_min_obs:
+                    continue
+                a = np.stack(a)
+                mean[j] = a.mean(0)
+                spread[j] = float(np.sqrt(a.var(0).sum()))
+            order = np.argsort(spread)
+            best = int(order[0])
+            runner = spread[order[1]] if len(order) > 1 else np.inf
+            noise = max(self.parts[best].sigma, cfg.sigma_floor)
+            decisive = (spread[best] < cfg.pend_sigma * noise
+                        and runner > cfg.pend_margin * spread[best])
+            if not decisive:
+                if i - st["born"] > cfg.pend_max_age:
+                    del self.pend[idx]
+                    dropped += 1
+                continue
+            # reprojection has to agree with the motion, or the track waits
+            if cfg.reproject and self.reproj is not None:
+                t2 = self.cur_tracks_2d
+                if idx < len(t2):
+                    u = int(np.clip(t2[idx, 0], 0, self.reproj.shape[1] - 1))
+                    v = int(np.clip(t2[idx, 1], 0, self.reproj.shape[0] - 1))
+                    o = int(self.reproj[v, u])
+                    if o >= 0 and o != best:
+                        if i - st["born"] > cfg.pend_max_age:
+                            del self.pend[idx]
+                            dropped += 1
+                        continue
+            self.anchor_xyz[idx] = mean[best].astype(np.float32)
+            self.anchor_ok[idx] = True
+            self.track_born[idx] = i        # the grace runs from placement
+            p = self.parts[best]
+            p.idx = np.unique(np.concatenate([p.idx, [idx]]))
+            del self.pend[idx]
+            placed += 1
+        if placed or dropped:
+            self.placed_total = getattr(self, "placed_total", 0) + placed
+            self.dropped_total = getattr(self, "dropped_total", 0) + dropped
+        return placed
+
+    def _joint_geom(self, j, part):
+        """Parent and child points together, in the parent's frame at rest.
+
+        Both sides matter: a cabinet door hinges on the body's edge, not inside
+        the door, so judging the axis against the moving part alone would throw
+        away every correct hinge.
+        """
+        par = self.parts[part.parent]
+        def pts(q):
+            idx = q.idx[q.idx < len(self.anchor_xyz)]
+            idx = idx[self.anchor_ok[idx]]
+            if idx.size > 300:
+                idx = idx[np.linspace(0, idx.size - 1, 300).astype(int)]
+            return self.anchor_xyz[idx]
+        a, b = pts(par), pts(part)
+        if a.shape[0] < 3 or b.shape[0] < 3:
+            return None
+        A0 = part.joint.A0
+        if A0 is not None:
+            b = b @ A0[:3, :3].T + A0[:3, 3]
+        return np.concatenate([a, b]).astype(np.float64)
 
     def _merge_rigid(self, i):
         """Undo a split whose relative motion is best explained by no joint.
@@ -888,6 +1074,11 @@ class NaivePartTracker:
         if t2 is None:
             return out
 
+        m = getattr(self, "mask", None)
+        if m is not None:
+            edge = cv2.morphologyEx((m > 0).astype(np.uint8), cv2.MORPH_GRADIENT,
+                                    np.ones((3, 3), np.uint8))
+            out[edge > 0] = (235, 235, 235)
         owner = np.full(len(t2), -1)
         for j, p in enumerate(self.parts):
             owner[p.idx[p.idx < len(t2)]] = j

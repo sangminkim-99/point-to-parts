@@ -86,6 +86,8 @@ def main():
     ap.add_argument("--cohort-veto", type=int, default=None)
     ap.add_argument("--merge-rigid", type=int, default=None)
     ap.add_argument("--merge-smooth", type=float, default=None)
+    ap.add_argument("--axis-prior", type=float, default=None)
+    ap.add_argument("--pending", type=int, default=None)
     ap.add_argument("--seed-prior", type=float, default=None)
     ap.add_argument("--max-parts", type=int, default=None)
     ap.add_argument("--key-view", type=int, default=None)
@@ -246,6 +248,9 @@ def main():
                      ("merge_rigid", None if args.merge_rigid is None
                       else bool(args.merge_rigid)),
                      ("merge_smooth", args.merge_smooth),
+                     ("axis_prior", args.axis_prior),
+                     ("pending", None if args.pending is None
+                      else bool(args.pending)),
                      ("seed_prior", args.seed_prior),
                      ("max_parts", args.max_parts),
                      ("cohort_veto", None if args.cohort_veto is None
@@ -394,7 +399,13 @@ def main():
                       f"conf {cc['conf']:.2f} (type {cc['type_p']:.2f}, "
                       f"axis +-{cc['axis_std_deg']:.1f} deg, "
                       f"exercised {100 * cc['excitation']:.0f}%, "
-                      f"smooth {cc.get('smooth', float('nan')):.2f})")
+                      f"smooth {cc.get('smooth', float('nan')):.2f}, "
+                      f"axis {100 * getattr(p.joint, 'axis_far', 0.0):.0f} cm "
+                      f"from the object)")
+        if getattr(s, "placed_total", 0) or getattr(s, "dropped_total", 0):
+            print(f"[replay] {getattr(s, 'placed_total', 0)} new tracks placed "
+                  f"by the motion they follow, "
+                  f"{getattr(s, 'dropped_total', 0)} never decided")
         if getattr(s, "merged_total", 0):
             print(f"[replay] {s.merged_total} parts merged back: their joint "
                   f"never opened")

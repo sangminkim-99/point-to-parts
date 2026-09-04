@@ -51,7 +51,17 @@ class JointModel:
         self.A0 = None            # the relative transform at value 0
         self.conf = None          # dict from confidence(); None until fitted
         self.sigma = 0.003        # metres of observation noise, for the BIC
-        self.sigma_eff = 0.003    # scale actually used, from the best fit
+        self.sigma_eff = 0.003    # scale actually used, from the data
+        self.sigma_t = 0.003      # metres, from the pose sequence itself
+        self.sigma_r = 0.01       # radians, likewise
+        self.geom = None          # parent+child points in the parent frame
+        self.axis_prior = 0.5     # x the object radius; 0 disables
+        # Free 6-DoF as a candidate. Measured: it never won on RBO when the
+        # residual was in metres, and once the residual was put in units of
+        # noise it started beating REAL joints at two degrees of pose jitter,
+        # because it is the model that absorbs an underestimated sigma. Off.
+        self.allow_free = False
+        self.axis_far = 0.0       # how far the axis line sits from that geometry
         self.bic = {}             # per-candidate BIC, lowest wins
 
     def add(self, A):
@@ -120,28 +130,62 @@ class JointModel:
 
     @staticmethod
     def _noise_from_smoothness(A):
-        """Noise scale from the high-frequency content of the pose sequence.
+        """Noise in translation AND rotation, from the pose sequence itself.
 
         Real relative motion is smooth in time and noise is not, so the second
         difference is almost all noise. Independent of every candidate model,
         which is what makes the comparison between them mean anything.
         """
         if len(A) < 5:
+            return 0.003, 0.01
+        def scale(x):
+            d2 = (x[2:] - 2 * x[1:-1] + x[:-2]).ravel()
+            if not d2.size:
+                return 0.0
+            # componentwise and zero-centred: a second difference of white noise
+            # is itself zero-mean with variance 6 sigma^2
+            return float(1.4826 * np.median(np.abs(d2))) / np.sqrt(6.0)
+        rv = R.from_matrix(A[:, :3, :3]).as_rotvec()
+        return scale(A[:, :3, 3]), scale(rv)
+
+    def axis_line(self, origin_hint=None):
+        """A representative line for the joint, in the parent frame.
+
+        A revolute joint IS a line -- direction and position. A prismatic joint
+        is only a direction, so it is given a line through the moving part's
+        own centre: the kinematics are unchanged and three drawers sliding the
+        same way stop being the same joint.
+        """
+        if self.axis is None:
+            return None
+        if self.kind == "revolute" and self.point is not None:
+            p0 = np.asarray(self.point, dtype=np.float64)
+        elif origin_hint is not None:
+            p0 = np.asarray(origin_hint, dtype=np.float64)
+        else:
+            return None
+        return p0, np.asarray(self.axis, dtype=np.float64)
+
+    def _axis_distance(self, kind, axis, point):
+        """Closest approach of a revolute axis to the object's own geometry.
+
+        A hinge is a physical thing: it lives in or on the object. An axis that
+        passes metres away is the "revolute with a huge radius" that explains a
+        slide, and geometry rejects it where the residual cannot.
+        """
+        if kind != "revolute" or self.geom is None or point is None:
             return 0.0
-        t = A[:, :3, 3]
-        d2 = t[2:] - 2 * t[1:-1] + t[:-2]
-        m = np.linalg.norm(d2, axis=1)
-        if not m.size:
-            return 0.0
-        # var of a second difference of white noise is 6 sigma^2
-        return float(1.4826 * np.median(np.abs(m - np.median(m)))
-                     + np.median(m)) / np.sqrt(6.0)
+        g = self.geom - np.asarray(point, dtype=np.float64)
+        a = np.asarray(axis, dtype=np.float64)
+        perp = g - np.outer(g @ a, a)
+        return float(np.min(np.linalg.norm(perp, axis=1)))
 
     def _bic_free(self, n):
         """A model that fits everything and pays for every degree of freedom."""
         return self.K_FREE_PER_OBS * n * np.log(max(n, 2))
 
     def _bic(self, kind, mse, n, sigma=None):
+        """mse is already in units of noise, so no further scaling is needed."""
         """BIC(M) = -2 log p + k log n, Gaussian noise, constants dropped.
 
         A pure translation is explained perfectly by a revolute joint with a
@@ -149,8 +193,7 @@ class JointModel:
         1.6 mm for the prismatic fit -- so residual alone can never separate
         them. Revolute pays for its three extra parameters instead.
         """
-        s2 = max(self.sigma if sigma is None else sigma, 1e-4) ** 2
-        return n * mse / s2 + self.K_PARAMS[kind] * np.log(max(n, 2))
+        return n * mse + self.K_PARAMS[kind] * np.log(max(n, 2))
 
     def fit(self):
         """Fit the axis from the accumulated relative transforms.
@@ -196,14 +239,30 @@ class JointModel:
         # must not come from the model being judged either -- taking it from the
         # best 1-DoF fit makes that fit adequate by construction, and nothing
         # can ever beat it. It comes from the data alone instead.
-        self.sigma_eff = max(self.sigma, self._noise_from_smoothness(A))
-        rows = [(self._bic(m[0], mses[m[0]], n, self.sigma_eff), mses[m[0]], m)
-                for m in cands]
-        rows.append((self._bic_free(n), 0.0,
-                     ("disconnected", np.array([0., 0., 1.]), np.zeros(3))))
+        st, sr = self._noise_from_smoothness(A)
+        self.sigma_t = max(self.sigma, st)
+        self.sigma_r = max(0.002, sr)
+        self.sigma_eff = self.sigma_t
+        # MAP, not ML: the axis has a prior that says a hinge is on the object.
+        # Scaled by the object's own extent, so it is a shape claim, not a size.
+        scale = (float(np.percentile(
+            np.linalg.norm(self.geom - self.geom.mean(0), axis=1), 90))
+            if self.geom is not None and len(self.geom) else 0.0)
+        rows, far_of = [], {}
+        for m in cands:
+            far = self._axis_distance(m[0], m[1], m[2])
+            pen = (far / max(self.axis_prior * max(scale, 1e-3), 1e-6)) ** 2 \
+                if (self.axis_prior > 0 and scale > 0) else 0.0
+            rows.append((self._bic(m[0], mses[m[0]], n, self.sigma_eff) + pen,
+                         mses[m[0]], m))
+            far_of[m[0]] = far
+        if self.allow_free:
+            rows.append((self._bic_free(n), 0.0,
+                         ("disconnected", np.array([0., 0., 1.]), np.zeros(3))))
         rows.sort(key=lambda x: x[0])
         self.bic = {m[0]: b for b, _, m in rows}
         self.kind, self.axis, self.point = rows[0][2]
+        self.axis_far = far_of.get(self.kind, 0.0)
         self._confidence(A, ang, t, rows)
         return True
 
@@ -267,7 +326,9 @@ class JointModel:
             float(np.exp(-axis_std / axis_scale_deg))
         self.conf = {"type_p": type_p, "axis_std_deg": axis_std, "span": span,
                      "excitation": exc, "smooth": smooth, "n": int(n),
-                     "rmse": float(np.sqrt(rows[0][1])),
+                     "rmse": float(np.sqrt(rows[0][1])),      # in sigma
+                     "sigma_t": float(self.sigma_t),
+                     "sigma_r": float(self.sigma_r),
                      "bic": dict(self.bic),
                      "conf": float(type_p * axis_ok * exc * smooth)}
         return self.conf
@@ -310,10 +371,22 @@ class JointModel:
         return 0.0        # rigid and unfitted both have no configuration
 
     def residual(self, A):
-        """How far a relative transform is from the joint manifold, in metres."""
+        """Distance from the joint manifold, in units of the observation noise.
+
+        Translation and rotation were being added with an arbitrary 0.1 m per
+        radian while the noise scale was estimated from translation alone. The
+        prismatic model asserts zero rotation, so it paid for every bit of
+        rotational noise in the pose estimate with nothing to offset it, and the
+        revolute model absorbed the same noise for free -- a slide came back
+        revolute however the rest of the comparison was fixed. Each channel is
+        now divided by its own measured noise, so they are comparable and the
+        result is dimensionless.
+        """
         if self.kind is None:
             return float("inf")
         B = self.at(self.value_of(A))
         E = np.linalg.inv(B) @ np.asarray(A, dtype=np.float64)
-        rot = np.linalg.norm(R.from_matrix(E[:3, :3]).as_rotvec())
-        return float(np.linalg.norm(E[:3, 3]) + 0.1 * rot)
+        rot = float(np.linalg.norm(R.from_matrix(E[:3, :3]).as_rotvec()))
+        st, sr = self.sigma_t, self.sigma_r
+        return float(np.sqrt((np.linalg.norm(E[:3, 3]) / max(st, 1e-6)) ** 2
+                             + (rot / max(sr, 1e-6)) ** 2))

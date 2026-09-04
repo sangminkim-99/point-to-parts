@@ -195,6 +195,17 @@ class RealSenseMultiPart:
                         ov = np.zeros_like(disp)
                         ov[self.preview_mask > 0] = (60, 200, 60)
                         disp = cv2.addWeighted(disp, 1.0, ov, 0.45, 0)
+                        # the preview is SAM 2's raw mask; the tracker will use
+                        # the depth-cleaned one, so show that outline too
+                        try:
+                            from examples.multi_part.streaming import clean_mask
+                            cm = clean_mask(self.preview_mask, depth) > 0
+                            e = cv2.morphologyEx(cm.astype(np.uint8),
+                                                 cv2.MORPH_GRADIENT,
+                                                 np.ones((3, 3), np.uint8))
+                            disp[e > 0] = (235, 235, 235)
+                        except Exception:
+                            pass
                     for (x, y), l in zip(self.points, self.labels):
                         if l == 1:
                             cv2.circle(disp, (x, y), 5, (60, 220, 60), -1)
