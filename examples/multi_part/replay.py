@@ -90,6 +90,8 @@ def main():
     ap.add_argument("--pending", type=int, default=None)
     ap.add_argument("--motion-gate", type=int, default=None)
     ap.add_argument("--motion-sigma", type=float, default=None)
+    ap.add_argument("--motion-coherent", type=float, default=None)
+    ap.add_argument("--motion-min-pts", type=int, default=None)
     ap.add_argument("--unc-gate", type=int, default=None)
     ap.add_argument("--unc-max", type=float, default=None)
     ap.add_argument("--rot-tol", type=float, default=None)
@@ -267,6 +269,8 @@ def main():
                      ("motion_gate", None if args.motion_gate is None
                       else bool(args.motion_gate)),
                      ("motion_sigma", args.motion_sigma),
+                     ("motion_coherent", args.motion_coherent),
+                     ("motion_min_pts", args.motion_min_pts),
                      ("unc_gate", None if args.unc_gate is None
                       else bool(args.unc_gate)),
                      ("unc_max", args.unc_max),
@@ -443,7 +447,7 @@ def main():
                   f"was not sure of them")
         if getattr(s, "still_frames", 0):
             print(f"[replay] {s.still_frames} part-frames carried no evidence: "
-                  f"the part had not moved past its own noise")
+                  f"nothing moved that one rigid body could not explain")
         if getattr(s, "placed_total", 0) or getattr(s, "dropped_total", 0):
             print(f"[replay] {getattr(s, 'placed_total', 0)} new tracks placed "
                   f"by the motion they follow, "

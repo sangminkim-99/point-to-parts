@@ -119,7 +119,9 @@ class NaiveConfig:
     # tracking noise, and co-association cannot tell the two apart. A frame in
     # which the part has not moved past its own noise contributes nothing.
     motion_gate: bool = True
-    motion_sigma: float = 2.0           # inter-frame motion, in units of noise
+    motion_sigma: float = 2.0           # residual beyond this counts as differential
+    motion_min_pts: int = 4             # this many points must disagree
+    motion_coherent: float = 0.5        # and disagree in a consistent direction
     co_gap: float = 0.15                # affinity gap the two clusters need
     # A new part inherits no history: the affinity that split its parent would
     # otherwise split it again the moment it is allowed to, and cabinet03 ran to
@@ -240,6 +242,8 @@ class NaivePart:
     _last_sel: object = None
     _last_pose: object = None           # for the rotation the band allows for
     rot_step: float = 0.0
+    coherence: float = 0.0              # how aligned the disagreement is
+    n_off: int = 0                      # how many points disagree
     box: object = None                  # oriented box in the anchor frame
     born: int = 0
     last_seed: int = -999
@@ -651,18 +655,39 @@ class NaivePartTracker:
             N[:m, :m] = M
             setattr(self, a, N)
 
-    def _moved_enough(self, part, sel, cur):
-        """Did this part actually move since the last frame it was measured?"""
-        prev, prev_sel = part._last_seen, part._last_sel
-        now = cur[sel]
-        part._last_sel, part._last_seen = sel.copy(), now.copy()
-        if prev is None or prev_sel is None:
-            return False
-        _, i0, i1 = np.intersect1d(sel, prev_sel, return_indices=True)
-        if i0.size < 4:
-            return False
-        d = np.linalg.norm(now[i0] - prev[i1], axis=1)
-        return float(np.median(d)) > self.cfg.motion_sigma * max(part.sigma, 1e-4)
+    def _informative(self, part, sel, cur):
+        """Does this frame say anything about which points move together?
+
+        Not "did the part move" -- a rigid body carried across the room moves
+        every point and tells us nothing, while a small part turning on a large
+        one moves almost none and tells us everything. What matters is motion
+        the part's own single rigid fit cannot explain, and whether that
+        disagreement points somewhere consistent: a moving sub-part displaces
+        its points the same way, tracking noise does not.
+
+        Returns (informative, weight in 0..1).
+        """
+        cfg = self.cfg
+        if part.pose is None or sel.size < cfg.motion_min_pts:
+            return False, 0.0
+        pred = self.anchor_xyz[sel] @ part.pose[:3, :3].T + part.pose[:3, 3]
+        e = cur[sel] - pred
+        d = np.linalg.norm(e, axis=1)
+        band = cfg.motion_sigma * max(part.sigma, 1e-4)
+        off = d > band
+        n_off = int(off.sum())
+        if n_off < cfg.motion_min_pts:
+            return False, 0.0
+        # how aligned the disagreement is: 1 if every offender moves the same
+        # way, near 0 if they scatter
+        v = e[off] / np.maximum(d[off, None], 1e-9)
+        coh = float(np.linalg.norm(v.mean(axis=0)))
+        part.coherence, part.n_off = coh, n_off
+        if coh < cfg.motion_coherent:
+            return False, 0.0
+        # a bigger, more coherent disagreement is worth more than a marginal one
+        w = float(np.clip(np.median(d[off]) / max(band, 1e-9) - 1.0, 0.0, 1.0))
+        return True, max(w, 0.2) * coh
 
     def _accumulate(self, part, cur, cur_ok, vis):
         """Soft votes for which points move together, over several motions."""
@@ -675,9 +700,12 @@ class NaivePartTracker:
         sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
         if sel.size < 2 * cfg.min_inliers or self.reg is None:
             return
-        if cfg.motion_gate and not self._moved_enough(part, sel, cur):
-            self.still_frames = getattr(self, "still_frames", 0) + 1
-            return
+        w_inf = 1.0
+        if cfg.motion_gate:
+            ok_inf, w_inf = self._informative(part, sel, cur)
+            if not ok_inf:
+                self.still_frames = getattr(self, "still_frames", 0) + 1
+                return
         rem = np.ones(sel.size, bool)
         motions = []
         for _ in range(cfg.co_hyp):
@@ -696,6 +724,7 @@ class NaivePartTracker:
         # a frame where one motion explains everything says nothing about which
         # points move together, so it is down-weighted by how decisive it is
         w = float(np.mean(P.max(axis=0) > 0.8) * (1.0 - P.mean(axis=1).max()))
+        w *= w_inf
         if w <= 1e-3:
             return
         S = P.T @ P

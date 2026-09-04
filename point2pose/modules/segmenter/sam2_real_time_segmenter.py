@@ -40,26 +40,27 @@ class Sam2RealTimeSegmenter(Segmenter):
         self.tracking_started = False
         self.frame_count = 0
 
-    def add_input_object(self, points, labels):
+    def add_input_object(self, points, labels, bbox=None):
         """
-        Register the prompt points for ONE object. Multiple positive/negative points
-        may be provided for the same object.
+        Register the prompt for ONE object: points, a box, or both.
 
         Args:
             points (List[List[int]]): [[x, y], ...] for this object.
             labels (List[int]): 1 (positive) or 0 (negative) per point.
+            bbox (Optional[Sequence[float]]): [x0, y0, x1, y1] for this object.
         """
-        pts = [[int(p[0]), int(p[1])] for p in points]
-        lbls = [int(l) for l in labels]
-        if len(pts) == 0:
+        pts = [[int(p[0]), int(p[1])] for p in points] if points else []
+        lbls = [int(l) for l in labels] if labels else []
+        box = None if bbox is None else [float(v) for v in bbox]
+        if not pts and box is None:
             return
-        self.input_objects.append({"points": pts, "labels": lbls})
+        self.input_objects.append({"points": pts, "labels": lbls, "bbox": box})
 
     def clear_input_objects(self):
         """Drop any pending prompt objects (does not affect an active track)."""
         self.input_objects = []
 
-    def preview(self, image, objects_points, objects_labels):
+    def preview(self, image, objects_points, objects_labels, objects_bboxes=None):
         """
         Run SAM2 on the given per-object prompt points and return their masks for
         `image`, WITHOUT starting real-time tracking. Intended for UI preview only:
@@ -74,21 +75,23 @@ class Sam2RealTimeSegmenter(Segmenter):
             torch.Tensor of mask logits ([num_obj, 1, H, W], >0 = foreground), or
             None if there are no valid prompt points.
         """
+        boxes = objects_bboxes or [None] * len(objects_points)
         groups = [
-            (pts, lbls)
-            for pts, lbls in zip(objects_points, objects_labels)
-            if len(pts) > 0
+            (pts, lbls, box)
+            for pts, lbls, box in zip(objects_points, objects_labels, boxes)
+            if len(pts) > 0 or box is not None
         ]
         if not groups:
             return None
         self.predictor.load_first_frame(image)
         video_res_masks = None
-        for i, (pts, lbls) in enumerate(groups):
+        for i, (pts, lbls, box) in enumerate(groups):
             _, _, video_res_masks = self.predictor.add_new_prompt(
                 frame_idx=0,
                 obj_id=i,
-                points=np.array(pts, dtype=np.float32),
-                labels=np.array(lbls, dtype=np.int32),
+                points=(np.array(pts, dtype=np.float32) if pts else None),
+                labels=(np.array(lbls, dtype=np.int32) if lbls else None),
+                bbox=(np.array(box, dtype=np.float32) if box is not None else None),
             )
         return video_res_masks
 
@@ -229,13 +232,15 @@ class Sam2RealTimeSegmenter(Segmenter):
         for group in self.input_objects:
             points = group["points"]
             labels = group["labels"]
-            if not points:
+            box = group.get("bbox")
+            if not points and box is None:
                 continue
             self.predictor.add_new_prompt(
                 frame_idx=0,
                 obj_id=obj_id,
-                points=np.array(points, dtype=np.float32),
-                labels=np.array(labels, dtype=np.int32),
+                points=(np.array(points, dtype=np.float32) if points else None),
+                labels=(np.array(labels, dtype=np.int32) if labels else None),
+                bbox=(np.array(box, dtype=np.float32) if box is not None else None),
             )
             obj_id += 1
 
@@ -243,9 +248,10 @@ class Sam2RealTimeSegmenter(Segmenter):
         self.num_obj += added_obj
         if self.num_obj > 0:
             total_points = sum(len(g["points"]) for g in self.input_objects)
+            n_box = sum(1 for g in self.input_objects if g.get("bbox") is not None)
             print(
-                f"[SAM2] Added {added_obj} object(s) with {total_points} points; "
-                f"total objects: {self.num_obj}"
+                f"[SAM2] Added {added_obj} object(s) with {total_points} points "
+                f"and {n_box} box(es); total objects: {self.num_obj}"
             )
             return True
         print(

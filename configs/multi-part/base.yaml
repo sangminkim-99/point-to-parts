@@ -46,7 +46,7 @@ reproj_px: 24.0
 reproj_depth: 0.03
 
 # ---- splitting ----
-split_out_frac: 0.12
+split_out_frac: 0.01
 split_out_band: 3.0
 sigma_floor: 0.002
 sigma_ceil: 0.02
@@ -56,7 +56,7 @@ split_min_trans_m: 0.015
 split_res: 0.05
 split_frames: 3
 rot_tol: 1.0
-min_part_pts: 6
+min_part_pts: 5
 ambiguous_band: 1.5
 split_gain: 0.7
 split_bic: true

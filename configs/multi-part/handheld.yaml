@@ -7,5 +7,6 @@ extends: sparse.yaml
 split_min_rot_deg: 30.0
 split_min_trans_m: 0.03
 rot_tol: 3.0
-motion_sigma: 3.0
+motion_sigma: 1.0
 key_angle_deg: 25.0
+n_points: 60

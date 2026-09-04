@@ -4,7 +4,7 @@ Click the object, press s, then move one of its parts. The bar is how sure the
 system is about the joint it has found; the line on it is the threshold. When
 the confidence has HELD there, the object is ready to be commanded.
 
-    Left click   a point on the object
+    Left click   a point on the object   (drag a box with --bbox-prompt)
     Right click  a point that is not the object
     s            start
     d            depth window on/off
@@ -33,6 +33,7 @@ class LiveAcquire:
         self.args, self.rs = args, rs
         self._init_camera(args.serial)
         self.points, self.labels = [], []
+        self.bbox, self._drag = None, None
         self.started, self.sam, self.stream = False, None, None
         self.preview_mask, self._dirty = None, False
         self.acq = Acquisition(thresh=args.thresh, hold=args.hold)
@@ -70,6 +71,23 @@ class LiveAcquire:
 
     def _on_mouse(self, ev, x, y, *_):
         if self.started:
+            return
+        if self.args.bbox_prompt:
+            # left drag draws the box; a right click still adds a negative point
+            if ev == cv2.EVENT_LBUTTONDOWN:
+                self._drag = [x, y, x, y]
+            elif ev == cv2.EVENT_MOUSEMOVE and self._drag is not None:
+                self._drag[2:] = [x, y]
+            elif ev == cv2.EVENT_LBUTTONUP and self._drag is not None:
+                x0, y0, x1, y1 = self._drag
+                self._drag = None
+                if abs(x1 - x0) > 8 and abs(y1 - y0) > 8:
+                    self.bbox = [min(x0, x1), min(y0, y1),
+                                 max(x0, x1), max(y0, y1)]
+                    self._dirty = True
+            elif ev == cv2.EVENT_RBUTTONDOWN:
+                self.points.append([x, y]); self.labels.append(0)
+                self._dirty = True
             return
         if ev == cv2.EVENT_LBUTTONDOWN:
             self.points.append([x, y]); self.labels.append(1); self._dirty = True
@@ -236,13 +254,13 @@ class LiveAcquire:
                 disp = bgr.copy()
 
                 if not self.started:
-                    if self._dirty and self.points:
+                    if self._dirty and (self.points or self.bbox is not None):
                         if self.sam is None:
                             self._init_sam()
                         try:
                             self.preview_mask = self._flat(
-                                self.sam.preview(rgb, [self.points],
-                                                 [self.labels]), rgb.shape[:2])
+                                self.sam.preview(rgb, [self.points], [self.labels],
+                                                 [self.bbox]), rgb.shape[:2])
 
                         except Exception as e:
                             print(f"[sam] {e}")
@@ -260,7 +278,15 @@ class LiveAcquire:
                     for (x, y), l in zip(self.points, self.labels):
                         cv2.circle(disp, (x, y), 5,
                                    (60, 220, 60) if l else (60, 60, 235), -1)
-                    cv2.putText(disp, "click the object, then press s",
+                    box = self._drag or self.bbox
+                    if box is not None:
+                        cv2.rectangle(disp, (int(box[0]), int(box[1])),
+                                      (int(box[2]), int(box[3])),
+                                      (60, 220, 60), 2)
+                    cv2.putText(disp,
+                                "drag a box round the object, then press s"
+                                if self.args.bbox_prompt else
+                                "click the object, then press s",
                                 (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 (235, 235, 235), 2, cv2.LINE_AA)
                     disp = self._panel(disp, 0.0, None, i)
@@ -299,16 +325,18 @@ class LiveAcquire:
                     self.show_depth = not self.show_depth
                 if k == ord("r"):
                     self.points, self.labels = [], []
+                    self.bbox, self._drag = None, None
                     self.started, self.stream = False, None
                     self.preview_mask = None
                     self.acq = Acquisition(thresh=self.args.thresh,
                                            hold=self.args.hold)
                     self.times, i = [], 0
                     print("reset")
-                if k == ord("s") and not self.started and self.points:
+                if k == ord("s") and not self.started \
+                        and (self.points or self.bbox is not None):
                     if self.sam is None:
                         self._init_sam()
-                    self.sam.add_input_object(self.points, self.labels)
+                    self.sam.add_input_object(self.points, self.labels, self.bbox)
                     self.sam.initialize(rgb)
                     _, logits = self.sam.segment(rgb)
                     mask = self._flat(logits, rgb.shape[:2])
@@ -344,6 +372,8 @@ class LiveAcquire:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--serial", default=None)
+    ap.add_argument("--bbox-prompt", action="store_true",
+                    help="drag a box instead of clicking points")
     ap.add_argument("--config", default=None,
                     help="a file in configs/multi-part, or a path")
     ap.add_argument("--n-points", type=int, default=None)
