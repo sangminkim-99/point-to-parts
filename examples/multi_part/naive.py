@@ -84,7 +84,11 @@ class NaiveConfig:
     # A hinge is a physical thing: it lives in or on the object. Used as a MAP
     # prior on the axis, scaled by the object's own radius. Proposal generators
     # assume this (H-SAUR, Real2Code); using it to REJECT a joint is new.
-    axis_prior: float = 0.5             # x the object radius; 0 disables
+    # A hinge is ON the object, so 0.2 of its radius, not 0.5. Measured on a
+    # 20 cm object lifted 20 cm with the rotation an under-constrained pose fit
+    # adds: at 0.5 the fit prefers a revolute joint pivoting 1.3 m away, at 0.2
+    # it does not. Real hinges sit 0-4 cm from the surface and pay nothing.
+    axis_prior: float = 0.2             # x the object radius; 0 disables
     # Stage B: a single frame's RANSAC split is a coin toss on noisy depth. What
     # marks a real part is the SAME point subset backing a different motion frame
     # after frame, so co-association is accumulated and clustered instead.
@@ -114,7 +118,8 @@ class NaiveConfig:
     joint_min_obs: int = 12
     # The object is "controllable" once a joint is identified well enough to
     # command a target q; that moment, not the runtime, is the online claim.
-    joint_conf: float = 0.6
+    joint_conf: float = 0.6             # on type x axis alone
+    joint_exc: float = 0.5              # and enough of the range seen
     joint_tol: float = 1.3              # x the free fit's residual before falling back
     joint_grid: int = 61
     # A thin object leaves most SuperPoint picks on invalid depth -- pliers01
@@ -306,6 +311,9 @@ class NaivePartTracker:
                 p.joint.sigma = max(p.sigma, self.parts[p.parent].sigma)
                 p.joint.axis_prior = cfg.axis_prior
                 p.joint.geom = self._joint_geom(j, p)
+                # rotation is only as well determined as the lever arm allows
+                p.joint.sigma_r_floor = max(
+                    self._rot_floor(p), self._rot_floor(self.parts[p.parent]))
                 A = np.linalg.inv(self.parts[p.parent].pose) @ p.pose
                 p.joint.add(A)
                 if p.joint.kind is None or len(p.joint.A) % 4 == 0:
@@ -500,8 +508,10 @@ class NaivePartTracker:
             return None
         if len(jm.A) < cfg.joint_min_obs or part.parent >= len(self.parts):
             return None
-        if jm.confidence()["conf"] < cfg.joint_conf:
-            return None         # an unexercised axis constrains nothing
+        c = jm.confidence()
+        if not c.get("valid", True) or c["conf"] < cfg.joint_conf \
+                or c["excitation"] < cfg.joint_exc:
+            return None         # not a joint, or not yet known well enough
         Tp = self.parts[part.parent].pose
         if Tp is None:
             return None
@@ -746,6 +756,15 @@ class NaivePartTracker:
             self.placed_total = getattr(self, "placed_total", 0) + placed
             self.dropped_total = getattr(self, "dropped_total", 0) + dropped
         return placed
+
+    def _rot_floor(self, part):
+        """Least rotational error a fit on this part's points can have."""
+        idx = part.idx[part.idx < len(self.anchor_xyz)]
+        q = self.anchor_xyz[idx[self.anchor_ok[idx]]]
+        if q.shape[0] < 4:
+            return 0.05
+        gyr = float(np.sqrt(np.mean(np.sum((q - q.mean(0)) ** 2, axis=1))))
+        return float(np.clip(part.sigma / max(gyr, 1e-3), 0.002, 0.5))
 
     def _joint_geom(self, j, part):
         """Parent and child points together, in the parent's frame at rest.

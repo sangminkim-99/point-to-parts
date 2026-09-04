@@ -19,30 +19,35 @@ import numpy as np
 
 # what to ask the person for, when the joint is not yet pinned down
 ADVICE = {
-    "excitation": "move it further",
+    "excitation": "move it further -- only a little of its range is known",
     "axis": "move it again, more slowly",
-    "type": "keep moving -- the joint type is still ambiguous",
-    "smooth": "hold the object steadier",
+    "type": "keep moving -- hinge or slide is still ambiguous",
+    "smooth": "this may not be a real part; hold the object steadier",
     "none": "move one part of it",
 }
 
 
 def limiting_factor(c):
-    """Which of the three things a joint can lack is the one holding it back."""
+    """Which of the four holds this joint back.
+
+    They answer different questions -- is it a joint (smooth), which kind
+    (type), where is it (axis), how far does it go (span) -- so the one to
+    report is the weakest, and it is what the person can act on.
+    """
     if not c or not c.get("n"):
         return "none"
-    terms = {"excitation": c["excitation"], "type": c["type_p"],
-             "smooth": c.get("smooth", 1.0)}
-    a = c.get("axis_std_deg")
-    terms["axis"] = 1.0 if a != a else float(np.exp(-a / 8.0))
+    if not c.get("valid", True):
+        return "smooth"
+    terms = {"type": c["type_p"], "axis": c.get("axis_ok", 1.0),
+             "excitation": c["excitation"]}
     return min(terms, key=terms.get)
 
 
 class Acquisition:
     """Confidence over time, and a conservative moment of readiness."""
 
-    def __init__(self, thresh=0.6, hold=8):
-        self.thresh, self.hold = thresh, hold
+    def __init__(self, thresh=0.6, hold=8, min_range=0.5):
+        self.thresh, self.hold, self.min_range = thresh, hold, min_range
         self.rows = []
         self.streak = 0
         self.ready_at = None
@@ -54,11 +59,20 @@ class Acquisition:
             if p.joint is None or p.joint.kind is None:
                 continue
             c = p.joint.confidence()
-            if c["conf"] >= best:
-                best, kind, lim = c["conf"], p.joint.kind, limiting_factor(c)
+            # a joint that has not passed the gate is not a candidate at all
+            v = c["conf"] if c.get("valid", True) else 0.0
+            if v >= best:
+                best, kind, lim = v, p.joint.kind, limiting_factor(c)
         if self.first_split is None and len(stream.parts) > 1:
             self.first_split = i
-        self.streak = self.streak + 1 if best >= self.thresh else 0
+        # ready means: it is a joint, we know which kind and where, AND we have
+        # watched enough of its range to command inside it
+        enough = any(p.joint is not None and p.joint.kind
+                     and p.joint.confidence().get("valid", False)
+                     and p.joint.confidence()["conf"] >= self.thresh
+                     and p.joint.confidence()["excitation"] >= self.min_range
+                     for p in stream.parts)
+        self.streak = self.streak + 1 if enough else 0
         if self.ready_at is None and self.streak >= self.hold:
             # date it from the frame the run of confidence began, not its end
             self.ready_at = i - self.hold + 1

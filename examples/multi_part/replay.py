@@ -398,8 +398,11 @@ def main():
                 print(f"[replay]   part {j} joint {p.joint.kind}: "
                       f"conf {cc['conf']:.2f} (type {cc['type_p']:.2f}, "
                       f"axis +-{cc['axis_std_deg']:.1f} deg, "
-                      f"exercised {100 * cc['excitation']:.0f}%, "
-                      f"smooth {cc.get('smooth', float('nan')):.2f}, "
+                      f"watched {(np.degrees(cc['span']) if p.joint.kind == 'revolute' else 1000 * cc['span']):.0f}"
+                      f"{' deg' if p.joint.kind == 'revolute' else ' mm'}"
+                      f"{'' if cc['excitation'] >= 1.0 else ' (short)'}, "
+                      f"joint? {'yes' if cc.get('valid') else 'NO'} "
+                      f"(smooth {cc.get('smooth', float('nan')):.2f}), "
                       f"axis {100 * getattr(p.joint, 'axis_far', 0.0):.0f} cm "
                       f"from the object)")
         if getattr(s, "placed_total", 0) or getattr(s, "dropped_total", 0):

@@ -125,60 +125,75 @@ class LiveAcquire:
         return img
 
     def _panel(self, vis, conf, kind, i):
-        """The bar, the threshold and what the person should do about it."""
-        h = 96
-        bar = np.full((h, vis.shape[1], 3), (26, 30, 33), np.uint8)
+        """One row per joint: the gate, the confidence, and the range.
+
+        These answer different questions -- is it a joint, which kind is it,
+        where is it, how far does it go -- so they are shown apart. Only "which
+        kind" and "where" are about knowing the joint, so only they make the
+        bar; the gate decides whether the row is a joint at all, and the range
+        is what a robot may command inside.
+        """
+        joints = [(j, p) for j, p in enumerate(self.stream.parts)
+                  if p.joint is not None and p.joint.kind] if self.stream else []
+        rows = max(1, len(joints))
+        bar = np.full((40 + 40 * rows, vis.shape[1], 3), (26, 30, 33), np.uint8)
         txt, col = self.acq.banner(self.stream)
-        cv2.putText(bar, txt, (14, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.78, col, 2,
+        cv2.putText(bar, txt, (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.68, col, 2,
                     cv2.LINE_AA)
-        x0, x1 = 14, vis.shape[1] - 14
-        cv2.rectangle(bar, (x0, 52), (x1, 72), (58, 64, 68), -1)
-        w = int((x1 - x0) * float(np.clip(conf, 0, 1)))
-        if w:
-            cv2.rectangle(bar, (x0, 52), (x0 + w, 72), col, -1)
-        xt = x0 + int((x1 - x0) * self.args.thresh)
-        cv2.line(bar, (xt, 47), (xt, 77), (225, 225, 225), 2)
-        # the streak is the conservative part: the bar has to STAY past the line
-        cv2.putText(bar, f"held {self.acq.streak}/{self.args.hold}",
-                    (x0, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.44,
-                    (170, 170, 170), 1, cv2.LINE_AA)
         parts = 0 if self.stream is None else len(self.stream.parts)
         fps = 1000.0 / max(float(np.median(self.times[-30:])), 1e-6) \
             if self.times else 0.0
-        cv2.putText(bar, f"{parts} parts   f{i}   {fps:.0f} fps",
-                    (x1 - 230, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+        cv2.putText(bar, f"{parts} parts   f{i}   {fps:.0f} fps   "
+                         f"held {self.acq.streak}/{self.args.hold}",
+                    (vis.shape[1] - 320, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
                     (170, 170, 170), 1, cv2.LINE_AA)
-        return np.vstack([vis, bar])
-
-    def _readout(self, vis):
-        """Per-joint numbers, so a stuck acquisition is legible, not mysterious."""
-        y = 24
-        for j, p in enumerate(self.stream.parts):
-            if p.joint is None or p.joint.kind is None:
+        pal = [(60, 140, 235), (200, 120, 40), (70, 180, 90), (200, 80, 200),
+               (60, 200, 200), (90, 90, 235)]
+        x0, x1 = 110, vis.shape[1] - 14
+        for k, (j, p) in enumerate(joints or [(None, None)]):
+            y = 42 + 40 * k
+            if p is None:
+                cv2.putText(bar, "no joint yet", (14, y + 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 120), 1,
+                            cv2.LINE_AA)
                 continue
             c = p.joint.confidence()
-            span = (np.degrees(c["span"]) if p.joint.kind == "revolute"
-                    else c["span"] * 1000)
-            unit = "deg" if p.joint.kind == "revolute" else "mm"
-            cv2.putText(vis, f"p{j} {p.joint.kind[:5]} {100*c['conf']:3.0f}%  "
-                             f"type {c['type_p']:.2f}  axis +-"
-                             f"{c['axis_std_deg']:.1f}deg  moved {span:.0f}{unit}"
-                             f"  smooth {c.get('smooth', 0):.2f}",
-                        (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                        (235, 235, 235), 1, cv2.LINE_AA)
-            y += 18
-            # what the type decision actually came down to, and on what noise
-            b = c.get("bic", {})
-            best = min(b.values()) if b else 0.0
-            marg = "  ".join(f"{k[:4]} +{v - best:.0f}" for k, v in
-                             sorted(b.items(), key=lambda x: x[1]))
-            cv2.putText(vis, f"     BIC {marg}   noise {1000*c.get('sigma_t',0):.1f}mm"
-                             f" / {np.degrees(c.get('sigma_r', 0)):.1f}deg"
-                             f"   rmse {c.get('rmse', 0):.1f}",
-                        (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
-                        (170, 175, 180), 1, cv2.LINE_AA)
-            y += 22
-        return vis
+            v = float(np.clip(c["conf"], 0, 1))
+            ok = c.get("valid", True)
+            pc = pal[j % len(pal)]
+            fill = ((90, 200, 120) if (ok and v >= self.args.thresh)
+                    else (pc if ok else (90, 90, 95)))
+            cv2.putText(bar, f"p{j} {p.joint.kind[:5]}", (14, y + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, pc, 1, cv2.LINE_AA)
+            cv2.rectangle(bar, (x0, y + 2), (x1, y + 20), (58, 64, 68), -1)
+            w = int((x1 - x0) * v)
+            if w:
+                cv2.rectangle(bar, (x0, y + 2), (x0 + w, y + 20), fill, -1)
+            xt = x0 + int((x1 - x0) * self.args.thresh)
+            cv2.line(bar, (xt, y - 1), (xt, y + 23), (225, 225, 225), 2)
+            cv2.putText(bar, f"{100 * v:3.0f}%", (x0 + 6, y + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (245, 245, 245), 1,
+                        cv2.LINE_AA)
+            # what was watched, in units. A percentage would claim to know
+            # where the joint stops, and nothing here can know that.
+            lim = p.joint.limits()
+            rev = p.joint.kind == "revolute"
+            f = (lambda x: np.degrees(x)) if rev else (lambda x: 1000 * x)
+            u = "deg" if rev else "mm"
+            rng = ("" if lim is None else
+                   f"{f(lim[0]):.0f} to {f(lim[1]):.0f} {u}")
+            need = f(c.get("need", 0.0))
+            cv2.putText(bar,
+                        f"joint? {'yes' if ok else 'NO'} (smooth "
+                        f"{c.get('smooth', 0):.2f})    type {c['type_p']:.2f}"
+                        f"    axis +-{c['axis_std_deg']:.1f} deg"
+                        + (f"    watched {rng}" if rng else "")
+                        + (f" (need {need:.0f} {u})"
+                           if c["excitation"] < 1.0 else ""),
+                        (x0, y + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                        (235, 235, 235) if ok else (140, 140, 145), 1,
+                        cv2.LINE_AA)
+        return np.vstack([vis, bar])
 
     def run(self):
         from point2pose.modules.tracker.tapir_tracker import TapirTracker
@@ -248,7 +263,6 @@ class LiveAcquire:
                         i += 1
                         conf, kind, _ = self.acq.step(i, self.stream, dt)
                         disp = self.stream.render(disp)
-                        disp = self._readout(disp)
                         disp = self._panel(disp, conf, kind, i)
 
                 if self.show_depth:

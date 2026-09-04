@@ -54,6 +54,12 @@ class JointModel:
         self.sigma_eff = 0.003    # scale actually used, from the data
         self.sigma_t = 0.003      # metres, from the pose sequence itself
         self.sigma_r = 0.01       # radians, likewise
+        # A rigid fit on points spread over radius r cannot pin rotation better
+        # than sigma_point / r, and that error is correlated with the motion, so
+        # the time-series estimate cannot see it. Without this floor a small
+        # part's translation is absorbed into a rotation and a 20 cm lift comes
+        # back as a revolute joint with a pivot metres away.
+        self.sigma_r_floor = 0.0
         self.geom = None          # parent+child points in the parent frame
         self.axis_prior = 0.5     # x the object radius; 0 disables
         # Free 6-DoF as a candidate. Measured: it never won on RBO when the
@@ -241,7 +247,7 @@ class JointModel:
         # can ever beat it. It comes from the data alone instead.
         st, sr = self._noise_from_smoothness(A)
         self.sigma_t = max(self.sigma, st)
-        self.sigma_r = max(0.002, sr)
+        self.sigma_r = max(0.002, sr, self.sigma_r_floor)
         self.sigma_eff = self.sigma_t
         # MAP, not ML: the axis has a prior that says a hinge is on the object.
         # Scaled by the object's own extent, so it is a shape claim, not a size.
@@ -321,22 +327,46 @@ class JointModel:
         span = float(vals.max() - vals.min()) if vals.size else 0.0
         need = np.radians(min_range_deg) if self.kind == "revolute" else min_range_m
         exc = float(np.clip(span / max(need, 1e-9), 0.0, 1.0))
+        self._need = float(need)
 
         axis_ok = 1.0 if axis_std != axis_std else \
             float(np.exp(-axis_std / axis_scale_deg))
+        # Four answers to four different questions, not one number.
+        #   smooth  -- is this a joint at all, or tracking error with a shape?
+        #   type    -- which kind is it?
+        #   axis    -- how well is its geometry pinned down?
+        #   span    -- how far we have actually watched it go. NOT a fraction
+        #              of its range: nothing here can know where the joint
+        #              stops, so only the absolute interval is reportable, and
+        #              "excitation" is only whether that interval is long
+        #              enough for the estimate to mean anything.
+        # Only type and axis are about knowing THE JOINT, so only they belong in
+        # a confidence. smooth is a gate and span is an operating range; folding
+        # them into the product made "5 mm seen but the axis is exact" look
+        # uncertain while hiding the 5 mm from anything that could use it.
         self.conf = {"type_p": type_p, "axis_std_deg": axis_std, "span": span,
                      "excitation": exc, "smooth": smooth, "n": int(n),
+                     "axis_ok": axis_ok, "valid": bool(smooth >= 0.15),
+                     "need": float(need),
                      "rmse": float(np.sqrt(rows[0][1])),      # in sigma
                      "sigma_t": float(self.sigma_t),
                      "sigma_r": float(self.sigma_r),
                      "bic": dict(self.bic),
-                     "conf": float(type_p * axis_ok * exc * smooth)}
+                     "conf": float(type_p * axis_ok)}
         return self.conf
+
+    def limits(self):
+        """The range a robot may command, being the range we have watched."""
+        if not self.A or self.kind not in ("revolute", "prismatic"):
+            return None
+        v = [self.value_of(a) for a in self.A]
+        return float(min(v)), float(max(v))
 
     def confidence(self):
         """The last fit's confidence, or zeros if it has never been fitted."""
         return self.conf or {"type_p": 0.0, "axis_std_deg": float("nan"),
                              "span": 0.0, "excitation": 0.0, "smooth": 0.0,
+                             "axis_ok": 0.0, "valid": False, "need": 0.0,
                              "n": len(self.A),
                              "rmse": float("nan"), "bic": {}, "conf": 0.0}
 
