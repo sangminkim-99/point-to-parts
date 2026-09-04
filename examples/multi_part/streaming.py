@@ -97,7 +97,8 @@ def build_sampler(cfg):
         return None
 
 
-def sample_superpoint(sampler, rgb, depth, mask, K, n, min_px=20000):
+def sample_superpoint(sampler, rgb, depth, mask, K, n, min_px=20000,
+                      existing=None):
     """Run the SuperPoint sampler over one mask; falls back to random.
 
     A small object yields almost no keypoints -- RBO pliers cover 1.5% of the
@@ -123,8 +124,15 @@ def sample_superpoint(sampler, rgb, depth, mask, K, n, min_px=20000):
         K = np.asarray(K).copy(); K[:2] *= up
     m = _t.as_tensor((mask > 0).astype(np.uint8))[None, None]
     f = Frame(id=0, rgb=rgb, depth=depth, mask=m, intrinsics=K)
+    # the sampler keeps new points off the ones already tracked, given them
+    ctx = SamplerContext(frame=f, min_depth=0.1, max_depth=10.0)
+    if existing is not None and len(existing):
+        e = np.asarray(existing, np.float32) * up
+        ctx.track_table = type("T", (), {
+            "track_2d": e, "visible": np.ones(len(e), bool),
+            "obj2track_map": {0: np.arange(len(e))}})()
     try:
-        pts = sampler.sample(SamplerContext(frame=f, min_depth=0.1, max_depth=10.0), 0)
+        pts = sampler.sample(ctx, 0)
     except Exception as exc:
         print(f"[stream] SuperPoint sample failed ({exc}); using random")
         return sample_points(mask, depth, n)

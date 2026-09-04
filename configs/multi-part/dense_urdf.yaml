@@ -1,0 +1,5 @@
+# Everything through step 6. The URDF needs the gaussian model: a Poisson
+# surface cannot be fitted to a few dozen sparse tracks.
+extends: dense_refine.yaml
+
+max_points: 600

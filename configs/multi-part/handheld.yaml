@@ -1,0 +1,11 @@
+# An object held and turned in the hand, rather than a fixed camera watching a
+# joint. In-plane rotation degrades the point tracker, and the tracks that go
+# bad form a coherent group that looks like a part, so a split has to clear a
+# joint-sized displacement and the outlier band widens with the turn.
+extends: sparse.yaml
+
+split_min_rot_deg: 30.0
+split_min_trans_m: 0.03
+rot_tol: 3.0
+motion_sigma: 3.0
+key_angle_deg: 25.0

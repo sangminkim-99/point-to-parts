@@ -1,0 +1,8 @@
+# Adds step 4: a per-part gaussian model grown from keyframes, with free-space
+# carving. Costs roughly a third of the frame rate.
+extends: sparse.yaml
+
+dense: true
+dense_stride: 2
+grow_every: 4
+carve_every: 3

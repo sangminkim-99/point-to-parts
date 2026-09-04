@@ -27,6 +27,73 @@ ADVICE = {
 }
 
 
+def load_config(path, _seen=None):
+    """Read a config, resolving `extends` from the same directory first.
+
+    A file lists only what it changes; the chain is applied base-first, so the
+    nearest file wins. Cycles are refused rather than followed.
+    """
+    import yaml
+    from pathlib import Path as _P
+    p = _P(path).expanduser()
+    if not p.exists():
+        alt = _P("configs/multi-part") / p.name
+        if alt.exists():
+            p = alt
+        else:
+            raise SystemExit(f"no such config: {path}")
+    _seen = _seen or []
+    if str(p.resolve()) in _seen:
+        raise SystemExit(f"config extends itself: {' -> '.join(_seen)}")
+    _seen = _seen + [str(p.resolve())]
+    d = yaml.safe_load(p.read_text()) or {}
+    parent = d.pop("extends", None)
+    base = load_config(p.parent / parent, _seen) if parent else {}
+    base.update(d)
+    return base
+
+
+def apply_config(cfg, path):
+    """Set every field a config names, typed from the dataclass."""
+    if not path:
+        return cfg
+    d = load_config(path)
+    apply_overrides(cfg, [f"{k}={v}" for k, v in d.items()], quiet=True)
+    print(f"[cfg] {path}: {len(d)} fields")
+    return cfg
+
+
+def apply_overrides(cfg, pairs, quiet=False):
+    """--set field=value for anything in the config, typed from the dataclass.
+
+    The flags kept drifting behind the config, so the config is the interface.
+    """
+    from dataclasses import fields
+    types = {f.name: f.type for f in fields(cfg)}
+    for pair in pairs or []:
+        if "=" not in pair:
+            raise SystemExit(f"--set expects FIELD=VALUE, got {pair!r}")
+        k, v = pair.split("=", 1)
+        k = k.strip().replace("-", "_")
+        if k not in types:
+            raise SystemExit(f"--set: no config field {k!r}; try one of "
+                             + ", ".join(sorted(types)))
+        t = types[k]
+        t = t if isinstance(t, str) else getattr(t, "__name__", "str")
+        if t.startswith("bool"):
+            val = v.strip().lower() in ("1", "true", "yes", "on")
+        elif t.startswith("int"):
+            val = int(v)
+        elif t.startswith("float"):
+            val = float(v)
+        else:
+            val = v
+        setattr(cfg, k, val)
+        if not quiet:
+            print(f"[cfg] {k} = {val}")
+    return cfg
+
+
 def limiting_factor(c):
     """Which of the four holds this joint back.
 
@@ -145,8 +212,8 @@ def main():
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seq-dir", required=True)
-    ap.add_argument("--n-points", type=int, default=200)
-    ap.add_argument("--sampler", default="uniform_fps")
+    ap.add_argument("--n-points", type=int, default=None)
+    ap.add_argument("--sampler", default=None)
     ap.add_argument("--thresh", type=float, default=0.6)
     ap.add_argument("--hold", type=int, default=8,
                     help="frames the confidence must hold before READY")
@@ -155,6 +222,10 @@ def main():
     ap.add_argument("--csv", default=None, help="confidence curve")
     ap.add_argument("--cam-fps", type=float, default=30.0,
                     help="the sequence's own frame rate, for the time metric")
+    ap.add_argument("--config", default=None,
+                    help="a file in configs/multi-part, or a path")
+    ap.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE",
+                    help="override any NaiveConfig field")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--checkpoint",
@@ -186,7 +257,13 @@ def main():
     if args.max_frames:
         frames = frames[:args.max_frames]
 
-    cfg = NaiveConfig(n_points=args.n_points, sampler=args.sampler)
+    cfg = NaiveConfig()
+    apply_config(cfg, args.config)
+    if args.n_points:
+        cfg.n_points = args.n_points
+    if args.sampler:
+        cfg.sampler = args.sampler
+    apply_overrides(cfg, args.set)
     tracker = TapirTracker({"checkpoint_path": args.checkpoint,
                             "resize_height": cfg.tapir_res,
                             "resize_width": cfg.tapir_res,

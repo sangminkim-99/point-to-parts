@@ -1,0 +1,103 @@
+# Base configuration for the multi-part tracker.
+#
+# Every field is a NaiveConfig field. Other files in this directory set
+# `extends: base.yaml` and override only what they change.
+
+# ---- frontend ----
+n_points: 100
+sampler: 'super_point_balanced'
+sampler_cell: -1
+sampler_nms: 0.0
+sampler_score_w: 0.2
+sampler_min_sep: 6.0
+tapir_res: 512
+num_pips_iter: 1
+inlier_thres: 0.01
+min_inliers: 3
+ransac_iters: 50
+
+# ---- mask and tracks ----
+mask_gate: true
+mask_pad: 4
+mask_strikes: 5
+unc_gate: true
+unc_max: 0.5
+unc_rel: 0.0
+
+# ---- re-seeding ----
+top_up: true
+key_view: true
+key_angle_deg: 15.0
+min_live: 24
+reseed_points: 24
+reseed_every: 6
+reseed_gap: 5
+reseed_max_resid: 0.012
+max_points: 400
+track_grace: 12
+pending: false
+pend_min_obs: 8
+pend_max_age: 45
+pend_margin: 1.8
+pend_sigma: 3.0
+seed_prior: 6.0
+reproject: true
+reproj_px: 24.0
+reproj_depth: 0.03
+
+# ---- splitting ----
+split_out_frac: 0.12
+split_out_band: 3.0
+sigma_floor: 0.002
+sigma_ceil: 0.02
+split_sep_sigma: 4.0
+split_min_rot_deg: 8.0
+split_min_trans_m: 0.015
+split_res: 0.05
+split_frames: 3
+rot_tol: 1.0
+min_part_pts: 6
+ambiguous_band: 1.5
+split_gain: 0.7
+split_bic: true
+split_bic_margin: 0.0
+cohort_veto: false
+cohort_pure: 0.8
+min_frames_before_split: 8
+resplit_wait: 12
+max_parts: 6
+part_settle: 20
+frame_fallback: true
+frame_after: 5
+
+# ---- persistence ----
+persist: true
+co_hyp: 3
+co_tau: 0.01
+co_min_seen: 2.5
+co_gap: 0.15
+motion_gate: true
+motion_sigma: 2.0
+
+# ---- joints ----
+joint_gate: 0.02
+joint_track: true
+joint_min_obs: 12
+joint_tol: 1.3
+joint_grid: 61
+joint_conf: 0.6
+joint_exc: 0.5
+axis_prior: 0.2
+merge_rigid: true
+merge_every: 10
+merge_min_obs: 12
+merge_bic: 10.0
+merge_smooth: 0.15
+
+# ---- dense layers ----
+dense: false
+dense_stride: 2
+grow_every: 4
+refine: false
+refine_every: 3
+carve_every: 3

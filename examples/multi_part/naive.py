@@ -29,9 +29,13 @@ def lift(pts2d, depth, K):
 @dataclass
 class NaiveConfig:
     n_points: int = 100
-    inlier_thres: float = 0.02
+    # pipeline_test2.yaml's svd_residual_outlier values. They were being
+    # injected from the dense Config at construction while this file declared
+    # something else, so every measurement ran on 0.01 and 50 -- and the first
+    # config file to actually set the declared values changed the results.
+    inlier_thres: float = 0.01
     min_inliers: int = 3
-    ransac_iters: int = 200
+    ransac_iters: int = 50
     num_pips_iter: int = 1
     tapir_res: int = 512
     # A split is proposed when a MINORITY of points stops following the fit.
@@ -43,9 +47,22 @@ class NaiveConfig:
     # measured in units of the depth noise the fit itself reveals.
     split_out_frac: float = 0.12        # share of points beyond the inlier band
     split_out_band: float = 3.0         # x the estimated noise sigma
+    # Rotation is where the tracker gives out: TAPIR matches patches, so an
+    # in-plane turn degrades it, and a rotation error of dtheta moves a point
+    # r*dtheta -- more for points further from the part's centre. Raising the
+    # band globally would blunt real joints too, so the tolerance grows only
+    # with the rotation actually seen, and only where the lever arm is long.
+    rot_tol: float = 1.0                # x r * dtheta, added to the band
     sigma_floor: float = 0.002          # metres; a RealSense at 0.5 m
     sigma_ceil: float = 0.02
     split_sep_sigma: float = 4.0        # group displacement, in sigma
+    # The answer is always a 1-DoF joint, so ask for one: the relative motion
+    # has to be a joint displacement of a size worth calling a part, in the
+    # units that joint actually has. A noise-relative test alone is hypersensitive
+    # when the noise is small, which is exactly the slow-motion case. The
+    # trade-off is explicit -- nothing smaller than these can be found.
+    split_min_rot_deg: float = 8.0      # revolute-like relative rotation
+    split_min_trans_m: float = 0.015    # or prismatic-like relative translation
     split_res: float = 0.05             # metres of median residual, as a backstop
     split_frames: int = 3               # consecutive frames above either
     min_part_pts: int = 6
@@ -96,6 +113,13 @@ class NaiveConfig:
     co_hyp: int = 3                     # motions proposed per frame
     co_tau: float = 0.01                # metres, softmax temperature
     co_min_seen: float = 2.5            # weighted frames a pair must co-occur
+    # Evidence has to be counted per unit of MOTION, not per frame. Move an
+    # object slowly and many frames pass for the same displacement; the extra
+    # frames carry no information about which points travel together, only
+    # tracking noise, and co-association cannot tell the two apart. A frame in
+    # which the part has not moved past its own noise contributes nothing.
+    motion_gate: bool = True
+    motion_sigma: float = 2.0           # inter-frame motion, in units of noise
     co_gap: float = 0.15                # affinity gap the two clusters need
     # A new part inherits no history: the affinity that split its parent would
     # otherwise split it again the moment it is allowed to, and cabinet03 ran to
@@ -126,7 +150,7 @@ class NaiveConfig:
     # kept 10 of 100 -- and a part can never split below 2 * min_part_pts.
     top_up: bool = True
     min_live: int = 24                  # per part, before new points are sought
-    reseed_points: int = 24
+    reseed_points: int = 24             # how many to add each time
     reseed_every: int = 6
     max_points: int = 400
     # Re-seeding anchors new tracks through the pose held at that moment, so a
@@ -143,7 +167,10 @@ class NaiveConfig:
     # pose at that instant, so any error in it was written in permanently. A
     # track belongs to part j when inv(T_j(t)) x(t) stays put, which needs no
     # anchor at all and decides itself over several frames.
-    pending: bool = True
+    # Measured worse on RBO (cabinet03 coverage 3/3 -> 2/3, purity 81 -> 68%):
+    # holding points back starves the parts that justified the split. Off until
+    # that is fixed.
+    pending: bool = False
     pend_min_obs: int = 8               # observations before a track is placed
     pend_max_age: int = 45              # frames before an undecided track is dropped
     pend_margin: float = 1.8            # x better than the runner-up to claim it
@@ -160,13 +187,15 @@ class NaiveConfig:
     track_grace: int = 12               # frames before a track may vote
     reseed_max_resid: float = 0.012     # metres; pose must explain the old ones
     reseed_gap: int = 5                # frames between re-seeds of one part
-    # Point2Pose's own criterion -- sample a viewpoint once, when it first turns
-    # towards the camera -- implemented and measured to be worse here, so off.
-    # It re-seeds every 15 degrees of rotation, and every seeding batch shares
-    # one anchor pose whose error becomes a coherent fake part: pliers01 2 -> 3
-    # parts, cardboardbox02 2 -> 3, laptop02's pose 64.5 -> 379.8 mm. Spinning a
-    # rigid object in place is its worst case, which is where it was reported.
-    key_view: bool = False
+    # Point2Pose's own criterion, and the primary one. It is not a proxy for
+    # "new surface": it is a proxy for the tracker going bad. TAPIR matches
+    # patches, so in-plane rotation and appearance change degrade it, and the
+    # point of re-seeding at a new viewpoint is to plant fresh templates at the
+    # CURRENT appearance before the old ones fail. Coverage cannot see that -- a
+    # fully covered part whose tracks have all rotated 40 degrees still needs
+    # new points. (Measured worse once, before the merge, the carving and the
+    # confidence gate existed to catch the spurious parts it was creating.)
+    key_view: bool = True
     key_angle_deg: float = 15.0
     sampler: str = "super_point_balanced"
     sampler_cell: int = -1
@@ -175,6 +204,14 @@ class NaiveConfig:
     sampler_min_sep: float = 6.0
     # A track that leaves the object mask has walked onto the hand. On RBO
     # pliers that is what the second "rigid motion" was: the arm, not a jaw.
+    # TAPIR reports how sure it is of each track and we were discarding it.
+    # A track going bad under in-plane rotation is exactly what forms a
+    # coherent fake part, and its own uncertainty says so before the geometry
+    # does: measured on RBO, the median rises 0.020 -> 0.041 over 75 frames
+    # while off-mask tracks sit at 0.13-0.56.
+    unc_gate: bool = True
+    unc_max: float = 0.5                # drop a track above this
+    unc_rel: float = 0.0                # relative rule; measured too blunt, off
     mask_gate: bool = True
     mask_pad: int = 4
     mask_strikes: int = 5
@@ -199,6 +236,10 @@ class NaivePart:
     n_mature: int = 0
     on_joint: bool = False
     view_dirs: list = None              # viewing directions already sampled
+    _last_seen: object = None           # last measured positions, for the gate
+    _last_sel: object = None
+    _last_pose: object = None           # for the rotation the band allows for
+    rot_step: float = 0.0
     box: object = None                  # oriented box in the anchor frame
     born: int = 0
     last_seed: int = -999
@@ -217,6 +258,7 @@ class NaivePartTracker:
         self.parts = []
         self.n = 0
         self.last_timings = {}
+        self.last_mode = ""
         self.split_log = []
 
     def start(self, rgb, depth, mask):
@@ -269,10 +311,19 @@ class NaivePartTracker:
         mask = clean_mask(mask, depth)
         self.mask = mask
 
-        tracks, _, vis = self.tracker.track_once(
+        tracks, unc, vis = self.tracker.track_once(
             Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K))
         vis = vis.astype(bool)
+        unc = np.asarray(unc, np.float32).reshape(-1)
         cur, cur_ok = lift(tracks, depth, self.K)
+        if cfg.unc_gate and unc.size == len(cur_ok):
+            med = float(np.median(unc)) if unc.size else 0.0
+            bad = unc > cfg.unc_max
+            if cfg.unc_rel > 0:
+                bad |= unc > cfg.unc_rel * max(med, 1e-3)
+            cur_ok = cur_ok & ~bad
+            self.unc_dropped = getattr(self, "unc_dropped", 0) + int(bad.sum())
+        self.unc = unc
         if cfg.mask_gate:
             cur_ok = cur_ok & self._on_object(tracks, mask)
         self.cur = (cur, cur_ok, vis)
@@ -320,9 +371,9 @@ class NaivePartTracker:
                     if p.joint.fit():
                         self._note_controllable(j, p, i)
 
-        self.reproj = None
-        if cfg.reproject and len(self.parts) > 1:
-            self.reproj, _ = self._reproject_owner(tracks, depth)
+        self.reproj, self.covdist = None, None
+        if cfg.reproject:
+            self.reproj, self.covdist = self._reproject_owner(tracks, depth)
         if cfg.pending:
             self._place_pending(i)
 
@@ -409,6 +460,10 @@ class NaivePartTracker:
         for j, p in enumerate(self.parts):
             idx = p.idx[p.idx < len(cok)]
             live = int((cok[idx] & cvi[idx]).sum()) if idx.size else 0
+            # points already asked for but not yet placed are still points: not
+            # counting them made starvation re-seed for ever, since a pending
+            # track never joins p.idx
+            live += sum(1 for k in self.pend if k < len(cok) and cok[k] and cvi[k])
             if p.view_dirs is None:
                 p.view_dirs = [np.array([0., 0., 1.])]
             u = p.pose[:3, :3] @ p.view_dirs[0]
@@ -417,7 +472,9 @@ class NaivePartTracker:
             # a direction already covered is never sampled twice; comparing only
             # against the last one re-seeds forever once a part oscillates
             new_view = bool(cfg.key_view and np.all(ang >= cfg.key_angle_deg))
-            if not new_view and live >= cfg.min_live:
+            # Point2Pose's own pair: a viewpoint not yet sampled, or a part
+            # that still shows surface but has run out of live tracks.
+            if not (new_view or live < cfg.min_live):
                 continue
             if len(self.anchor_xyz) >= cfg.max_points:
                 continue
@@ -425,17 +482,24 @@ class NaivePartTracker:
                 continue
             if p.resid > cfg.reseed_max_resid:
                 continue        # do not anchor through a pose that has slipped
+            # the surface this part shows now, which is what _reseed samples
+            # in the dense pipeline; the sampler's own novelty term is what
+            # keeps the new points off the ones already there
             m = mask.copy()
-            if idx.size >= 3 and len(self.parts) > 1:
+            if self.reproj is not None and len(self.parts) > 1:
+                own = (self.reproj == j) & (mask > 0) & (depth > 0.05)
+                if own.sum() >= 200:
+                    m = own.astype(np.uint8)
+            elif idx.size >= 3 and len(self.parts) > 1:
                 q = t2[idx].astype(int)
                 box = np.zeros_like(m)
                 x0, y0 = np.clip(q.min(0) - 20, 0, None)
                 x1, y1 = q.max(0) + 20
                 box[y0:y1, x0:x1] = 1
                 m = m * box
-            new = np.asarray(sample_superpoint(self.sampler, rgb, depth, m,
-                                                self.K, cfg.reseed_points),
-                             np.float32)
+            new = np.asarray(sample_superpoint(
+                self.sampler, rgb, depth, m, self.K, cfg.reseed_points,
+                existing=t2[idx] if idx.size else None), np.float32)
             _, nok = lift(new, depth, self.K)
             new = new[nok][:cfg.reseed_points]
             if len(new) < 4:
@@ -587,6 +651,19 @@ class NaivePartTracker:
             N[:m, :m] = M
             setattr(self, a, N)
 
+    def _moved_enough(self, part, sel, cur):
+        """Did this part actually move since the last frame it was measured?"""
+        prev, prev_sel = part._last_seen, part._last_sel
+        now = cur[sel]
+        part._last_sel, part._last_seen = sel.copy(), now.copy()
+        if prev is None or prev_sel is None:
+            return False
+        _, i0, i1 = np.intersect1d(sel, prev_sel, return_indices=True)
+        if i0.size < 4:
+            return False
+        d = np.linalg.norm(now[i0] - prev[i1], axis=1)
+        return float(np.median(d)) > self.cfg.motion_sigma * max(part.sigma, 1e-4)
+
     def _accumulate(self, part, cur, cur_ok, vis):
         """Soft votes for which points move together, over several motions."""
         cfg = self.cfg
@@ -597,6 +674,9 @@ class NaivePartTracker:
         # the grace on the trigger and on the split is where it belongs.
         sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
         if sel.size < 2 * cfg.min_inliers or self.reg is None:
+            return
+        if cfg.motion_gate and not self._moved_enough(part, sel, cur):
+            self.still_frames = getattr(self, "still_frames", 0) + 1
             return
         rem = np.ones(sel.size, bool)
         motions = []
@@ -640,6 +720,7 @@ class NaivePartTracker:
             return None
 
     def _reproject_owner(self, t2, depth):
+        # returns (owner per pixel, distance to the nearest tracked point)
         """Part id per pixel, from where each part's own points are right now.
 
         Not a rendering -- the tracked points ARE the surface we have observed,
@@ -875,6 +956,36 @@ class NaivePartTracker:
         b2 = n2 * float(np.mean(two ** 2)) / s2 + 12 * np.log(max(n2, 2))
         return bool(b2 + self.cfg.split_bic_margin < b1), float(b1 - b2)
 
+    def _joint_sized(self, motions, groups=None):
+        """Is the relative motion big enough to be a joint anyone would name?
+
+        The two thresholds are in different units, so which one applies has to
+        be decided first. Taking either as sufficient made the rotation limit
+        useless: a hand turning an object produces centimetres of relative
+        translation between any two groups, so every rotation slipped through
+        the translation door. The mode is decided by which part of the motion
+        actually moves the points -- a turn of dtheta moves a point at radius r
+        by r*dtheta -- and only that mode's threshold is asked for.
+        """
+        cfg = self.cfg
+        D = np.linalg.inv(motions[0]) @ motions[1]
+        rot = float(np.degrees(np.arccos(np.clip(
+            (np.trace(D[:3, :3]) - 1) / 2, -1, 1))))
+        trans = float(np.linalg.norm(D[:3, 3]))
+        r = 0.05
+        if groups:
+            q = [self.anchor_xyz[np.asarray(g)] for g in groups
+                 if np.asarray(g).size >= 3]
+            if q:
+                q = np.concatenate(q)
+                r = float(np.linalg.norm(q - q.mean(0), axis=1).mean()) + 1e-3
+        turning = np.radians(rot) * r > trans
+        self.last_mode = (f"turning {rot:.0f} deg" if turning
+                          else f"sliding {1000 * trans:.0f} mm")
+        big = (rot >= cfg.split_min_rot_deg) if turning \
+            else (trans >= cfg.split_min_trans_m)
+        return bool(big), rot, trans
+
     def _sep_sigma(self, groups, motions, part):
         """How far the groups' own points move if you swap the two motions.
 
@@ -946,7 +1057,10 @@ class NaivePartTracker:
                                      init_pose=None)
                 motions.append(np.asarray(c["T"]) if c is not None else part.pose)
             ss = self._sep_sigma(groups, motions, part)
-            if ss >= cfg.split_sep_sigma:
+            big, rot_d, tr_m = self._joint_sized(motions, groups)
+            if not big:
+                self.small_blocked = getattr(self, "small_blocked", 0) + 1
+            if ss >= cfg.split_sep_sigma and big:
                 if cfg.cohort_veto and self._cohort_split(groups):
                     self.cohort_blocked = getattr(self, "cohort_blocked", 0) + 1
                     return False
@@ -971,7 +1085,10 @@ class NaivePartTracker:
         if len(motions) < 2:
             return False
         ss = self._sep_sigma([sel, sel], motions, part)
-        if ss < cfg.split_sep_sigma:
+        big, rot_d, tr_m = self._joint_sized(motions, [sel, sel])
+        if not big:
+            self.small_blocked = getattr(self, "small_blocked", 0) + 1
+        if ss < cfg.split_sep_sigma or not big:
             return False
         D = np.stack([np.linalg.norm(
             self.anchor_xyz[sel] @ T[:3, :3].T + T[:3, 3] - cur[sel], axis=1)
@@ -1044,7 +1161,8 @@ class NaivePartTracker:
         mm = sep_sigma * part.sigma * 1000
         self.split_evidence = (self.n, mm, part.sigma * 1000)
         print(f"[naive] split at frame {self.n} via {via}: {len(self.parts)} "
-              f"parts (motion {mm:.0f} mm = {sep_sigma:.1f} sigma, "
+              f"parts ({self.last_mode}, motion {mm:.0f} mm = "
+              f"{sep_sigma:.1f} sigma, "
               f"noise {part.sigma * 1000:.1f} mm, outliers "
               f"{100 * part.out_frac:.0f}%, "
               f"{len(groups[0])}/{len(groups[1])} pts"

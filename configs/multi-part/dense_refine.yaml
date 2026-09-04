@@ -1,0 +1,6 @@
+# Adds step 5: pose polished against the rendered RGB-D residual, labels moved
+# by multi-frame residual, joint parameters refined under the same loss.
+extends: dense.yaml
+
+refine: true
+refine_every: 3

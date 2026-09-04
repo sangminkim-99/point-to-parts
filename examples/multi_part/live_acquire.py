@@ -21,7 +21,8 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 import cv2
 import numpy as np
 
-from examples.multi_part.acquire import Acquisition, ADVICE
+from examples.multi_part.acquire import (Acquisition, ADVICE, apply_config,
+                                         apply_overrides)
 
 
 class LiveAcquire:
@@ -202,12 +203,28 @@ class LiveAcquire:
         from examples.multi_part.naive import NaiveConfig, NaivePartTracker
         from examples.multi_part.streaming import clean_mask
 
-        cfg = NaiveConfig(n_points=self.args.n_points, sampler=self.args.sampler)
+        cfg = NaiveConfig()
+        apply_config(cfg, self.args.config)
+        if self.args.n_points:
+            cfg.n_points = self.args.n_points
+        if self.args.sampler:
+            cfg.sampler = self.args.sampler
         for k, v in (("pending", self.args.pending),
                      ("merge_rigid", self.args.merge_rigid),
                      ("reproject", self.args.reproject)):
             if v is not None:
                 setattr(cfg, k, bool(v))
+        for k, v in (("reseed_points", self.args.reseed_points),
+                     ("reseed_gap", self.args.reseed_gap),
+                     ("min_live", self.args.min_live),
+                     ("key_angle_deg", self.args.key_angle_deg),
+                     ("motion_sigma", self.args.motion_sigma),
+                     ("split_min_rot_deg", self.args.split_min_rot_deg),
+                     ("split_min_trans_m", self.args.split_min_trans_m),
+                     ("rot_tol", self.args.rot_tol)):
+            if v is not None:
+                setattr(cfg, k, v)
+        apply_overrides(cfg, self.args.set)
         tracker = reg = None
         i = 0
         try:
@@ -327,8 +344,10 @@ class LiveAcquire:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--serial", default=None)
-    ap.add_argument("--n-points", type=int, default=200)
-    ap.add_argument("--sampler", default="uniform_fps")
+    ap.add_argument("--config", default=None,
+                    help="a file in configs/multi-part, or a path")
+    ap.add_argument("--n-points", type=int, default=None)
+    ap.add_argument("--sampler", default=None)
     ap.add_argument("--thresh", type=float, default=0.6)
     ap.add_argument("--hold", type=int, default=8)
     ap.add_argument("--depth", type=int, default=0,
@@ -336,6 +355,17 @@ def main():
     ap.add_argument("--pending", type=int, default=None)
     ap.add_argument("--merge-rigid", type=int, default=None)
     ap.add_argument("--reproject", type=int, default=None)
+    ap.add_argument("--reseed-points", type=int, default=None)
+    ap.add_argument("--reseed-gap", type=int, default=None)
+    ap.add_argument("--min-live", type=int, default=None)
+    ap.add_argument("--key-angle-deg", type=float, default=None)
+    ap.add_argument("--motion-sigma", type=float, default=None)
+    ap.add_argument("--split-min-rot-deg", type=float, default=None)
+    ap.add_argument("--split-min-trans-m", type=float, default=None)
+    ap.add_argument("--rot-tol", type=float, default=None)
+    ap.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE",
+                    help="override any NaiveConfig field, e.g. --set "
+                         "split_out_frac=0.2 --set co_gap=0.3")
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
     ap.add_argument("--sam-checkpoint",

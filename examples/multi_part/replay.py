@@ -88,11 +88,24 @@ def main():
     ap.add_argument("--merge-smooth", type=float, default=None)
     ap.add_argument("--axis-prior", type=float, default=None)
     ap.add_argument("--pending", type=int, default=None)
+    ap.add_argument("--motion-gate", type=int, default=None)
+    ap.add_argument("--motion-sigma", type=float, default=None)
+    ap.add_argument("--unc-gate", type=int, default=None)
+    ap.add_argument("--unc-max", type=float, default=None)
+    ap.add_argument("--rot-tol", type=float, default=None)
+    ap.add_argument("--split-min-rot-deg", type=float, default=None)
+    ap.add_argument("--split-min-trans-m", type=float, default=None)
+    ap.add_argument("--config", default=None,
+                    help="a file in configs/multi-part, or a path")
+    ap.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE",
+                    help="override any NaiveConfig field")
     ap.add_argument("--seed-prior", type=float, default=None)
     ap.add_argument("--max-parts", type=int, default=None)
     ap.add_argument("--key-view", type=int, default=None)
     ap.add_argument("--key-angle-deg", type=float, default=None)
     ap.add_argument("--min-live", type=int, default=None)
+    ap.add_argument("--reseed-points", type=int, default=None)
+    ap.add_argument("--reseed-gap", type=int, default=None)
     ap.add_argument("--frame-fallback", type=int, default=None)
     ap.add_argument("--frame-after", type=int, default=None)
     ap.add_argument("--sampler", default=None,
@@ -221,12 +234,12 @@ def main():
 
     if args.method == "naive":
         from examples.multi_part.naive import NaiveConfig, NaivePartTracker
-        ncfg = NaiveConfig(n_points=cfg.n_points, inlier_thres=cfg.inlier_thres,
-                           min_inliers=cfg.min_inliers,
-                           ransac_iters=cfg.ransac_iters,
-                           num_pips_iter=cfg.num_pips_iter,
-                           dense=bool(args.dense),
+        from examples.multi_part.acquire import apply_config
+        # NaiveConfig owns its own defaults; injecting the dense Config's here
+        # meant the file said one thing and every run did another
+        ncfg = NaiveConfig(dense=bool(args.dense),
                            refine=bool(args.dense and args.refine))
+        apply_config(ncfg, args.config)
         for k, v in (("split_out_frac", args.split_out_frac),
                      ("ambiguous_band", args.ambiguous_band),
                      ("min_part_pts", args.min_part_pts),
@@ -251,6 +264,15 @@ def main():
                      ("axis_prior", args.axis_prior),
                      ("pending", None if args.pending is None
                       else bool(args.pending)),
+                     ("motion_gate", None if args.motion_gate is None
+                      else bool(args.motion_gate)),
+                     ("motion_sigma", args.motion_sigma),
+                     ("unc_gate", None if args.unc_gate is None
+                      else bool(args.unc_gate)),
+                     ("unc_max", args.unc_max),
+                     ("rot_tol", args.rot_tol),
+                     ("split_min_rot_deg", args.split_min_rot_deg),
+                     ("split_min_trans_m", args.split_min_trans_m),
                      ("seed_prior", args.seed_prior),
                      ("max_parts", args.max_parts),
                      ("cohort_veto", None if args.cohort_veto is None
@@ -259,12 +281,20 @@ def main():
                       else bool(args.key_view)),
                      ("key_angle_deg", args.key_angle_deg),
                      ("min_live", args.min_live),
+                     ("reseed_points", args.reseed_points),
+                     ("reseed_gap", args.reseed_gap),
                      ("frame_fallback", None if args.frame_fallback is None
                       else bool(args.frame_fallback)),
                      ("frame_after", args.frame_after),
                      ("sampler", args.sampler)):
             if v is not None:
                 setattr(ncfg, k, v)
+        if args.n_points:
+            ncfg.n_points = args.n_points
+        if args.sampler:
+            ncfg.sampler = args.sampler
+        from examples.multi_part.acquire import apply_overrides
+        apply_overrides(ncfg, args.set)
         s = NaivePartTracker(r.K, ncfg, tracker, reg)
         cfg = ncfg
     else:
@@ -405,6 +435,15 @@ def main():
                       f"(smooth {cc.get('smooth', float('nan')):.2f}), "
                       f"axis {100 * getattr(p.joint, 'axis_far', 0.0):.0f} cm "
                       f"from the object)")
+        if getattr(s, "small_blocked", 0):
+            print(f"[replay] {s.small_blocked} splits refused: the relative "
+                  f"motion was too small to be a joint")
+        if getattr(s, "unc_dropped", 0):
+            print(f"[replay] {s.unc_dropped} track-frames ignored: the tracker "
+                  f"was not sure of them")
+        if getattr(s, "still_frames", 0):
+            print(f"[replay] {s.still_frames} part-frames carried no evidence: "
+                  f"the part had not moved past its own noise")
         if getattr(s, "placed_total", 0) or getattr(s, "dropped_total", 0):
             print(f"[replay] {getattr(s, 'placed_total', 0)} new tracks placed "
                   f"by the motion they follow, "
