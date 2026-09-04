@@ -82,6 +82,15 @@ def main():
     ap.add_argument("--co-min-seen", type=float, default=None)
     ap.add_argument("--split-sep-sigma", type=float, default=None)
     ap.add_argument("--split-out-band", type=float, default=None)
+    ap.add_argument("--split-bic", type=int, default=None)
+    ap.add_argument("--cohort-veto", type=int, default=None)
+    ap.add_argument("--merge-rigid", type=int, default=None)
+    ap.add_argument("--merge-smooth", type=float, default=None)
+    ap.add_argument("--seed-prior", type=float, default=None)
+    ap.add_argument("--max-parts", type=int, default=None)
+    ap.add_argument("--key-view", type=int, default=None)
+    ap.add_argument("--key-angle-deg", type=float, default=None)
+    ap.add_argument("--min-live", type=int, default=None)
     ap.add_argument("--frame-fallback", type=int, default=None)
     ap.add_argument("--frame-after", type=int, default=None)
     ap.add_argument("--sampler", default=None,
@@ -232,6 +241,19 @@ def main():
                      ("co_min_seen", args.co_min_seen),
                      ("split_sep_sigma", args.split_sep_sigma),
                      ("split_out_band", args.split_out_band),
+                     ("split_bic", None if args.split_bic is None
+                      else bool(args.split_bic)),
+                     ("merge_rigid", None if args.merge_rigid is None
+                      else bool(args.merge_rigid)),
+                     ("merge_smooth", args.merge_smooth),
+                     ("seed_prior", args.seed_prior),
+                     ("max_parts", args.max_parts),
+                     ("cohort_veto", None if args.cohort_veto is None
+                      else bool(args.cohort_veto)),
+                     ("key_view", None if args.key_view is None
+                      else bool(args.key_view)),
+                     ("key_angle_deg", args.key_angle_deg),
+                     ("min_live", args.min_live),
                      ("frame_fallback", None if args.frame_fallback is None
                       else bool(args.frame_fallback)),
                      ("frame_after", args.frame_after),
@@ -371,7 +393,17 @@ def main():
                 print(f"[replay]   part {j} joint {p.joint.kind}: "
                       f"conf {cc['conf']:.2f} (type {cc['type_p']:.2f}, "
                       f"axis +-{cc['axis_std_deg']:.1f} deg, "
-                      f"exercised {100 * cc['excitation']:.0f}%)")
+                      f"exercised {100 * cc['excitation']:.0f}%, "
+                      f"smooth {cc.get('smooth', float('nan')):.2f})")
+        if getattr(s, "merged_total", 0):
+            print(f"[replay] {s.merged_total} parts merged back: their joint "
+                  f"never opened")
+        if getattr(s, "cohort_blocked", 0):
+            print(f"[replay] {s.cohort_blocked} splits refused: the groups were "
+                  f"two seeding batches, not two parts")
+        if getattr(s, "bic_blocked", 0):
+            print(f"[replay] {s.bic_blocked} splits refused: not worth six more "
+                  f"parameters")
         print(f"[replay] naive: {len(s.parts)} parts, splits {s.split_log}"
               + f", joint-tracked {getattr(s, 'joint_frames', 0)} part-frames"
               + (f", grown {getattr(s, 'grown', 0)}, carved "

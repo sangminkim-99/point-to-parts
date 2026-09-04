@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from scipy.spatial.transform import Rotation as _R
+
 from point2pose.pipeline.components.joint_model import JointModel
 
 
@@ -27,7 +29,7 @@ def lift(pts2d, depth, K):
 @dataclass
 class NaiveConfig:
     n_points: int = 100
-    inlier_thres: float = 0.01
+    inlier_thres: float = 0.02
     min_inliers: int = 3
     ransac_iters: int = 200
     num_pips_iter: int = 1
@@ -50,6 +52,35 @@ class NaiveConfig:
     # The two motions must actually differ, or a noisy fit splits a rigid body:
     # foldingrule01 ran to 6 parts against a ground truth of 3.
     split_gain: float = 0.7             # new residual must be this x the old
+    # A split adds a second 6-DoF body, so it must pay for six parameters before
+    # it is worth making. Without this the co-association path has no test that
+    # the split explains the points better at all, and opening and closing a
+    # joint repeatedly shaves off a new part every time.
+    split_bic: bool = True
+    split_bic_margin: float = 0.0       # extra BIC the split must win by
+    # Points seeded together are anchored through one pose, so an error in that
+    # pose is written into all of them as a single rigid offset -- which is
+    # indistinguishable from a second part, and spatially coherent, so the
+    # clustering finds it every time. Measured on RBO: three of five late splits
+    # separated the tracks exactly along seeding batches.
+    # Provenance is the wrong test: re-seeded points that move WITH the part are
+    # the part. What separates an anchoring artefact from a joint is that the
+    # artefact is a constant offset -- the two groups never move relative to
+    # each other -- while a joint's relative transform varies. So parts are
+    # allowed to form and are merged back when their joint never opens.
+    cohort_veto: bool = False
+    cohort_pure: float = 0.8            # share of one batch that counts as pure
+    merge_rigid: bool = True
+    merge_every: int = 10               # frames between merge checks
+    merge_min_obs: int = 12             # relative poses needed to judge
+    # A real joint beats the rigid model by thousands of BIC; a jittery pose on
+    # a small part beats it by about nine. Kass & Raftery call dBIC > 10 very
+    # strong evidence, and that is the line between a part and an artefact.
+    merge_bic: float = 10.0
+    # Residual evidence cannot separate a joint from correlated tracking error;
+    # the smoothness of q(t) can, because a real joint is driven and error is
+    # white. Measured on synthetic data: real joints 1.00, pure jitter 0.00.
+    merge_smooth: float = 0.35
     # Stage B: a single frame's RANSAC split is a coin toss on noisy depth. What
     # marks a real part is the SAME point subset backing a different motion frame
     # after frame, so co-association is accumulated and clustered instead.
@@ -94,9 +125,22 @@ class NaiveConfig:
     # disagree with the older tracks, the outlier share rises and the part
     # splits again. Fresh tracks therefore carry no split evidence until they
     # have been watched, and no part re-seeds through a pose it cannot trust.
+    # A track seeded inside a part, anchored through that part's pose, IS that
+    # part -- we put it there. Starting its co-association at zero throws that
+    # away and lets a few noisy frames carve it back out. It starts instead with
+    # recorded agreement with its part, which evidence then has to overcome.
+    seed_prior: float = 6.0             # weighted frames of assumed agreement
     track_grace: int = 12               # frames before a track may vote
     reseed_max_resid: float = 0.012     # metres; pose must explain the old ones
-    reseed_gap: int = 20                # frames between re-seeds of one part
+    reseed_gap: int = 5                # frames between re-seeds of one part
+    # Point2Pose's own criterion -- sample a viewpoint once, when it first turns
+    # towards the camera -- implemented and measured to be worse here, so off.
+    # It re-seeds every 15 degrees of rotation, and every seeding batch shares
+    # one anchor pose whose error becomes a coherent fake part: pliers01 2 -> 3
+    # parts, cardboardbox02 2 -> 3, laptop02's pose 64.5 -> 379.8 mm. Spinning a
+    # rigid object in place is its worst case, which is where it was reported.
+    key_view: bool = False
+    key_angle_deg: float = 15.0
     sampler: str = "super_point_balanced"
     sampler_cell: int = -1
     sampler_nms: float = 0.0
@@ -127,6 +171,7 @@ class NaivePart:
     out_frac: float = 0.0
     n_mature: int = 0
     on_joint: bool = False
+    view_dirs: list = None              # viewing directions already sampled
     box: object = None                  # oriented box in the anchor frame
     born: int = 0
     last_seed: int = -999
@@ -235,6 +280,9 @@ class NaivePartTracker:
                     if p.joint.fit():
                         self._note_controllable(j, p, i)
 
+        if cfg.merge_rigid and len(self.parts) > 1 and i % cfg.merge_every == 0:
+            self._merge_rigid(i)
+
         if cfg.top_up and i % cfg.reseed_every == 0:
             self._reseed(rgb, depth, mask, i)
 
@@ -317,7 +365,17 @@ class NaivePartTracker:
         for j, p in enumerate(self.parts):
             idx = p.idx[p.idx < len(cok)]
             live = int((cok[idx] & cvi[idx]).sum()) if idx.size else 0
-            if live >= cfg.min_live or len(self.anchor_xyz) >= cfg.max_points:
+            if p.view_dirs is None:
+                p.view_dirs = [np.array([0., 0., 1.])]
+            u = p.pose[:3, :3] @ p.view_dirs[0]
+            ang = np.degrees(np.arccos(np.clip(
+                [float(u @ v) for v in p.view_dirs], -1.0, 1.0)))
+            # a direction already covered is never sampled twice; comparing only
+            # against the last one re-seeds forever once a part oscillates
+            new_view = bool(cfg.key_view and np.all(ang >= cfg.key_angle_deg))
+            if not new_view and live >= cfg.min_live:
+                continue
+            if len(self.anchor_xyz) >= cfg.max_points:
                 continue
             if i - p.last_seed < cfg.reseed_gap:
                 continue
@@ -351,12 +409,24 @@ class NaivePartTracker:
             self.track_born = np.concatenate(
                 [self.track_born, np.full(len(new), i, np.int32)])
             p.last_seed = i
+            p.view_dirs.append(u)
+            fresh = base + np.where(ok)[0]
+            if cfg.seed_prior > 0 and fresh.size:
+                self._grow_co(len(self.anchor_xyz))
+                old = p.idx[(p.idx < len(self.anchor_xyz))
+                            & ~np.isin(p.idx, fresh)]
+                w = cfg.seed_prior
+                for a_, b_ in ((fresh, old), (old, fresh), (fresh, fresh)):
+                    if a_.size and b_.size:
+                        self.co_same[np.ix_(a_, b_)] += w
+                        self.co_seen[np.ix_(a_, b_)] += w
             added += int(ok.sum())
         if added:
             for p in self.parts:
                 p.box = self._fit_box(p)
             print(f"[naive] frame {i}: re-seeded {added} tracks "
-                  f"({len(self.anchor_xyz)} total)")
+                  f"({len(self.anchor_xyz)} total, "
+                  f"{sum(len(q.view_dirs or []) for q in self.parts)} views)")
         return added
 
     def _note_controllable(self, j, part, i):
@@ -466,6 +536,9 @@ class NaivePartTracker:
         cfg = self.cfg
         self._grow_co(len(self.anchor_xyz))
         idx = part.idx[(part.idx < len(cur_ok)) & (part.idx < len(self.anchor_ok))]
+        # Excluding young tracks here as well was tried and measured worse --
+        # pliers01 went from 2 parts to 5. Co-association needs the population;
+        # the grace on the trigger and on the split is where it belongs.
         sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
         if sel.size < 2 * cfg.min_inliers or self.reg is None:
             return
@@ -509,6 +582,93 @@ class NaivePartTracker:
             return fit_oriented_box(q[d <= np.percentile(d, 90)])
         except Exception:
             return None
+
+    def _merge_rigid(self, i):
+        """Undo a split whose relative motion is best explained by no joint.
+
+        A part built from a handful of points has a noisy pose, and that noise
+        looks like relative motion -- 60 to 200 mm of it on RBO, far above the
+        sensor noise. Nor can the residual decide: a 1-DoF model fits any jitter
+        better than a rigid one, because random 3D points project onto their
+        principal axis. What decides is that a real joint is DRIVEN, so its q(t)
+        is smooth, while tracking error gives a white one.
+        """
+        cfg = self.cfg
+        gone = []
+        for j, p in enumerate(self.parts):
+            jm, par = p.joint, p.parent
+            # part 0's parent is 1 and part 1's parent is 0, so without this
+            # both sides merge into each other and nothing is left
+            if jm is None or par >= len(self.parts) or par == j:
+                continue
+            if j in gone or par in gone or len(self.parts) - len(gone) < 2:
+                continue
+            if len(jm.A) < cfg.merge_min_obs:
+                continue
+            c = jm.confidence()
+            if c.get("smooth", 1.0) >= cfg.merge_smooth:
+                continue        # q(t) is driven, so this is a joint
+            keep = self.parts[par]
+            keep.idx = np.unique(np.concatenate([keep.idx, p.idx]))
+            keep.box = self._fit_box(keep)
+            keep.born = self.n              # earn the right to split again
+            gone.append(j)
+            print(f"[naive] frame {i}: merged part {j} back into {par} "
+                  f"(q(t) is not driven: smoothness {c['smooth']:.2f}, "
+                  f"axis +-{c['axis_std_deg']:.1f} deg, {len(jm.A)} poses)")
+        if not gone:
+            return 0
+        for j in sorted(gone, reverse=True):
+            self.parts.pop(j)
+        for k, p in enumerate(self.parts):
+            p.parent = 0 if k else (1 if len(self.parts) > 1 else 0)
+            if p.joint is None and k != p.parent:
+                p.joint = JointModel()
+        if len(self.parts) < 2:
+            self.state = self.RIGID
+        self.merged_total = getattr(self, "merged_total", 0) + len(gone)
+        return len(gone)
+
+    def _cohort_split(self, groups):
+        """True when the two groups are just two different seeding batches."""
+        tops = []
+        for g in groups:
+            g = np.asarray(g)
+            b = self.track_born[g[g < len(self.track_born)]]
+            if b.size < 3:
+                return False
+            vals, cnt = np.unique(b, return_counts=True)
+            tops.append((vals[cnt.argmax()], cnt.max() / b.size))
+        if len(tops) < 2:
+            return False
+        (b0, p0), (b1, p1) = tops[0], tops[1]
+        return bool(b0 != b1 and min(p0, p1) >= self.cfg.cohort_pure)
+
+    def _bic_split(self, part, sel, groups, motions, cur):
+        """Is a second rigid body worth six more parameters?
+
+        Same model selection as the joint type: n log-likelihood against
+        k log n, with the noise the part's own fit reveals. A rigid part
+        re-examined after more motion gains almost nothing and is left alone.
+        """
+        s2 = max(part.sigma, 1e-4) ** 2
+        one = np.linalg.norm(
+            self.anchor_xyz[sel] @ part.pose[:3, :3].T + part.pose[:3, 3]
+            - cur[sel], axis=1)
+        two = []
+        for g, T in zip(groups, motions):
+            g = np.asarray(g)
+            if g.size == 0:
+                continue
+            two.append(np.linalg.norm(
+                self.anchor_xyz[g] @ T[:3, :3].T + T[:3, 3] - cur[g], axis=1))
+        if not two:
+            return False, 0.0
+        two = np.concatenate(two)
+        n1, n2 = len(one), len(two)
+        b1 = n1 * float(np.mean(one ** 2)) / s2 + 6 * np.log(max(n1, 2))
+        b2 = n2 * float(np.mean(two ** 2)) / s2 + 12 * np.log(max(n2, 2))
+        return bool(b2 + self.cfg.split_bic_margin < b1), float(b1 - b2)
 
     def _sep_sigma(self, groups, motions, part):
         """How far the groups' own points move if you swap the two motions.
@@ -582,8 +742,15 @@ class NaivePartTracker:
                 motions.append(np.asarray(c["T"]) if c is not None else part.pose)
             ss = self._sep_sigma(groups, motions, part)
             if ss >= cfg.split_sep_sigma:
-                return self._accept(j, part, groups, motions, cur, cur_ok,
-                                    "coassoc", gap, None, ss)
+                if cfg.cohort_veto and self._cohort_split(groups):
+                    self.cohort_blocked = getattr(self, "cohort_blocked", 0) + 1
+                    return False
+                ok, dbic = ((True, float("nan")) if not cfg.split_bic
+                            else self._bic_split(part, sel, groups, motions, cur))
+                if ok:
+                    return self._accept(j, part, groups, motions, cur, cur_ok,
+                                        "coassoc", gap, None, ss, dbic)
+                self.bic_blocked = getattr(self, "bic_blocked", 0) + 1
 
         if cfg.persist and (not cfg.frame_fallback
                             or part.over < cfg.frame_after * cfg.split_frames):
@@ -619,15 +786,25 @@ class NaivePartTracker:
             [D[k][keep & (best == k)] for k in range(2)])))
         if before > 1e-6 and after > cfg.split_gain * before:
             return False
+        if cfg.cohort_veto and self._cohort_split(groups):
+            self.cohort_blocked = getattr(self, "cohort_blocked", 0) + 1
+            return False
+        dbic = float("nan")
+        if cfg.split_bic:
+            ok, dbic = self._bic_split(part, sel, groups, motions, cur)
+            if not ok:
+                self.bic_blocked = getattr(self, "bic_blocked", 0) + 1
+                return False
         return self._accept(j, part, groups, motions, cur, cur_ok, "frame",
-                            float("nan"), keep, ss)
+                            float("nan"), keep, ss, dbic)
 
     def _accept(self, j, part, groups, motions, cur, cur_ok, via, gap, keep,
-                sep_sigma=float("nan")):
+                sep_sigma=float("nan"), dbic=float("nan")):
         """Install the two groups as parts and hand the gaussian labels over."""
         order = np.argsort([-len(g) for g in groups])
         new = [NaivePart(idx=np.asarray(groups[k]), pose=motions[k],
-                         born=self.n) for k in order]
+                         born=self.n, view_dirs=[np.array([0., 0., 1.])])
+               for k in order]
         # the affinity that justified this split has been spent; each new part
         # has to earn its own before it may split again
         all_idx = np.concatenate([np.asarray(g) for g in groups])
@@ -644,6 +821,19 @@ class NaivePartTracker:
             p.box = self._fit_box(p)
         self.state = self.SPLIT
         self.split_log.append((self.n, len(self.parts)))
+        # Points seeded together share one anchor pose, so a pose error at that
+        # moment is written into all of them as one rigid offset -- which looks
+        # exactly like a second part. If a group is one birth cohort, that is
+        # what happened, not articulation.
+        coh = []
+        for g in groups:
+            g = np.asarray(g)
+            b = self.track_born[g[g < len(self.track_born)]]
+            if b.size:
+                vals, cnt = np.unique(b, return_counts=True)
+                coh.append(f"{100 * cnt.max() / b.size:.0f}%@f{vals[cnt.argmax()]}")
+        self.last_cohort = coh
+
         # how much relative motion it actually took, which is the number the
         # "wiggle and it becomes controllable" claim lives or dies on
         mm = sep_sigma * part.sigma * 1000
@@ -654,6 +844,8 @@ class NaivePartTracker:
               f"{100 * part.out_frac:.0f}%, "
               f"{len(groups[0])}/{len(groups[1])} pts"
               + (f", gap {gap:.2f}" if gap == gap else "")
+              + (f", dBIC {dbic:.0f}" if dbic == dbic else "")
+              + (f", cohorts {'/'.join(coh)}" if coh else "")
               + (f", {int((~keep).sum())} dropped" if keep is not None else "")
               + ")")
         return True

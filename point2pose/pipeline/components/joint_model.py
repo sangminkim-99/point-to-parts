@@ -51,6 +51,7 @@ class JointModel:
         self.A0 = None            # the relative transform at value 0
         self.conf = None          # dict from confidence(); None until fitted
         self.sigma = 0.003        # metres of observation noise, for the BIC
+        self.sigma_eff = 0.003    # scale actually used, from the best fit
         self.bic = {}             # per-candidate BIC, lowest wins
 
     def add(self, A):
@@ -101,7 +102,12 @@ class JointModel:
 
     # Sturm, Stachniss & Burgard (JAIR 2011) count k = 6 for a rigid link,
     # 9 for prismatic and 12 for revolute, and select on the lowest BIC.
+    # "disconnected" is free 6-DoF motion: it explains anything, and pays 6
+    # parameters per observation for it, the way Sturm's non-parametric model
+    # does. Without it in the set a spurious part must be typed revolute or
+    # prismatic, because those are the only answers on offer.
     K_PARAMS = {"rigid": 6, "prismatic": 9, "revolute": 12}
+    K_FREE_PER_OBS = 6
 
     def _score(self, model, A):
         """Mean squared residual of a candidate over the offset-free history."""
@@ -112,7 +118,30 @@ class JointModel:
         self.kind, self.axis, self.point, self.A0 = keep
         return r
 
-    def _bic(self, kind, mse, n):
+    @staticmethod
+    def _noise_from_smoothness(A):
+        """Noise scale from the high-frequency content of the pose sequence.
+
+        Real relative motion is smooth in time and noise is not, so the second
+        difference is almost all noise. Independent of every candidate model,
+        which is what makes the comparison between them mean anything.
+        """
+        if len(A) < 5:
+            return 0.0
+        t = A[:, :3, 3]
+        d2 = t[2:] - 2 * t[1:-1] + t[:-2]
+        m = np.linalg.norm(d2, axis=1)
+        if not m.size:
+            return 0.0
+        # var of a second difference of white noise is 6 sigma^2
+        return float(1.4826 * np.median(np.abs(m - np.median(m)))
+                     + np.median(m)) / np.sqrt(6.0)
+
+    def _bic_free(self, n):
+        """A model that fits everything and pays for every degree of freedom."""
+        return self.K_FREE_PER_OBS * n * np.log(max(n, 2))
+
+    def _bic(self, kind, mse, n, sigma=None):
         """BIC(M) = -2 log p + k log n, Gaussian noise, constants dropped.
 
         A pure translation is explained perfectly by a revolute joint with a
@@ -120,7 +149,7 @@ class JointModel:
         1.6 mm for the prismatic fit -- so residual alone can never separate
         them. Revolute pays for its three extra parameters instead.
         """
-        s2 = max(self.sigma, 1e-4) ** 2
+        s2 = max(self.sigma if sigma is None else sigma, 1e-4) ** 2
         return n * mse / s2 + self.K_PARAMS[kind] * np.log(max(n, 2))
 
     def fit(self):
@@ -145,7 +174,11 @@ class JointModel:
         A = np.einsum("ij,njk->nik", A0i, raw)
         ang = np.linalg.norm(R.from_matrix(A[:, :3, :3]).as_rotvec(), axis=1)
         t = A[:, :3, 3]
-        cands = []
+        # Sturm's model set includes a rigid link, and it is what says "these
+        # two are one body": unstructured relative motion from a noisy pose on a
+        # handful of points fits no 1-DoF manifold, so rigid wins on BIC even
+        # though the parts appear to move.
+        cands = [("rigid", np.array([0., 0., 1.]), np.zeros(3))]
         if ang.max() >= self.min_angle:
             m = self._fit_revolute(A, ang, t)
             if m is not None:
@@ -156,10 +189,18 @@ class JointModel:
         if not cands:
             return False
         n = len(A)
-        rows = []
-        for m in cands:
-            mse = self._score(m, A)
-            rows.append((self._bic(m[0], mse, n), mse, m))
+        mses = {m[0]: self._score(m, A) for m in cands}
+        # The observations are relative POSES from a RANSAC fit on a handful of
+        # points, not points, so the per-point noise underestimates them by
+        # orders of magnitude and no rigid model could ever compete. The scale
+        # must not come from the model being judged either -- taking it from the
+        # best 1-DoF fit makes that fit adequate by construction, and nothing
+        # can ever beat it. It comes from the data alone instead.
+        self.sigma_eff = max(self.sigma, self._noise_from_smoothness(A))
+        rows = [(self._bic(m[0], mses[m[0]], n, self.sigma_eff), mses[m[0]], m)
+                for m in cands]
+        rows.append((self._bic_free(n), 0.0,
+                     ("disconnected", np.array([0., 0., 1.]), np.zeros(3))))
         rows.sort(key=lambda x: x[0])
         self.bic = {m[0]: b for b, _, m in rows}
         self.kind, self.axis, self.point = rows[0][2]
@@ -206,6 +247,18 @@ class JointModel:
         a0, self.A0 = self.A0, None
         vals = np.array([self.value_of(a) for a in A])
         self.A0 = a0
+
+        # Smoothness of q(t). Residual-based evidence cannot separate a joint
+        # from correlated tracking error -- a 1-DoF model fits any jitter better
+        # than a rigid one, because random 3D points project onto their
+        # principal axis. But a real joint is DRIVEN, so q(t) is smooth, while
+        # error gives a q(t) that is white. Independent of every residual.
+        smooth = 0.0
+        if vals.size >= 5:
+            d2 = vals[2:] - 2 * vals[1:-1] + vals[:-2]
+            v_all = float(np.var(vals))
+            v_hf = float(np.var(d2)) / 6.0     # white noise inflates by 6
+            smooth = float(np.clip(1.0 - v_hf / max(v_all, 1e-12), 0.0, 1.0))
         span = float(vals.max() - vals.min()) if vals.size else 0.0
         need = np.radians(min_range_deg) if self.kind == "revolute" else min_range_m
         exc = float(np.clip(span / max(need, 1e-9), 0.0, 1.0))
@@ -213,16 +266,17 @@ class JointModel:
         axis_ok = 1.0 if axis_std != axis_std else \
             float(np.exp(-axis_std / axis_scale_deg))
         self.conf = {"type_p": type_p, "axis_std_deg": axis_std, "span": span,
-                     "excitation": exc, "n": int(n),
+                     "excitation": exc, "smooth": smooth, "n": int(n),
                      "rmse": float(np.sqrt(rows[0][1])),
                      "bic": dict(self.bic),
-                     "conf": float(type_p * axis_ok * exc)}
+                     "conf": float(type_p * axis_ok * exc * smooth)}
         return self.conf
 
     def confidence(self):
         """The last fit's confidence, or zeros if it has never been fitted."""
         return self.conf or {"type_p": 0.0, "axis_std_deg": float("nan"),
-                             "span": 0.0, "excitation": 0.0, "n": len(self.A),
+                             "span": 0.0, "excitation": 0.0, "smooth": 0.0,
+                             "n": len(self.A),
                              "rmse": float("nan"), "bic": {}, "conf": 0.0}
 
     # --------------------------------------------------------------- pose --
@@ -233,6 +287,8 @@ class JointModel:
     def _local(self, value):
         """Joint motion away from the rest pose."""
         A = np.eye(4)
+        if self.kind in ("rigid", "disconnected"):
+            return A
         if self.kind == "revolute":
             Rm = R.from_rotvec(self.axis * value).as_matrix()
             A[:3, :3] = Rm
@@ -251,7 +307,7 @@ class JointModel:
             return float(rv @ self.axis)
         if self.kind == "prismatic":
             return float(A[:3, 3] @ self.axis)
-        return 0.0
+        return 0.0        # rigid and unfitted both have no configuration
 
     def residual(self, A):
         """How far a relative transform is from the joint manifold, in metres."""
