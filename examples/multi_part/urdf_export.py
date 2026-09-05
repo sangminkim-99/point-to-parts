@@ -88,11 +88,34 @@ def export(path, parts, points_of, colors_of=None, name="discovered",
         ET.SubElement(ine, "inertia", {"ixx": "1e-3", "iyy": "1e-3", "izz": "1e-3",
                                        "ixy": "0", "ixz": "0", "iyz": "0"})
 
+    # The tracker's root is part 0, which is simply the part that existed
+    # first, and that is often a drawer rather than the body it slides in. A
+    # URDF rooted on a drawer is kinematically fine and reads as nonsense: you
+    # hold the drawer still and push the cabinet. Measured on ikeasmall02, the
+    # axis was within 1 degree of the truth and pointed the opposite way for
+    # exactly this reason. So the biggest part becomes the root here, and any
+    # relation that has to be reversed is inverted rather than re-fitted --
+    # the child moves by +axis q relative to the parent, so the parent moves
+    # by -axis q relative to the child, and the observed range flips with it.
+    def _extent(j):
+        q = points_of(j)
+        if q is None or len(q) < 4:
+            return 0.0
+        q = np.asarray(q)
+        return float(np.linalg.norm(q.max(0) - q.min(0)))
+    # by size, not by point count: on ikeasmall02 the body has the FEWEST
+    # gaussians of the three parts, 5,510 against 11,000 for each drawer,
+    # because the drawers face the camera and the body is mostly behind them
+    hub = max(range(len(parts)), key=_extent) if len(parts) else 0
     for j, p in enumerate(parts):
         jm = getattr(p, "joint", None)
         par = getattr(p, "parent", 0)
         if jm is None or jm.kind is None or par == j or par >= len(parts):
             continue
+        vs = [jm.value_of(A) for A in jm.A] if jm.A else [0.0]
+        axis, lo, hi = np.asarray(jm.axis, float), min(vs), max(vs)
+        if j == hub:                    # this relation points the wrong way
+            par, j, axis, lo, hi = j, par, -axis, -hi, -lo
         jt = ET.SubElement(root, "joint", {"name": f"j{par}_{j}",
                                            "type": jm.kind})
         ET.SubElement(jt, "parent", {"link": f"part{par}"})
@@ -100,11 +123,9 @@ def export(path, parts, points_of, colors_of=None, name="discovered",
         _xyz(ET.SubElement(jt, "origin"),
              jm.point if (jm.kind == "revolute" and jm.point is not None)
              else np.zeros(3))
-        _xyz(ET.SubElement(jt, "axis"), jm.axis)
-        vs = [jm.value_of(A) for A in jm.A] if jm.A else [0.0]
+        _xyz(ET.SubElement(jt, "axis"), axis)
         # only the range that was actually observed is claimed as the limit
-        ET.SubElement(jt, "limit", {"lower": f"{min(vs):.4f}",
-                                    "upper": f"{max(vs):.4f}",
+        ET.SubElement(jt, "limit", {"lower": f"{lo:.4f}", "upper": f"{hi:.4f}",
                                     "effort": "50", "velocity": "1.0"})
     ET.indent(root)
     out = path if path.endswith(".urdf") else path + ".urdf"
