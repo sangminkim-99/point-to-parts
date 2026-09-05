@@ -181,6 +181,8 @@ class NaiveConfig:
     top_up: bool = True
     min_live: int = 24                  # per part, before new points are sought
     reseed_min_region: int = 200   # px of its own before a part may re-seed
+    mask_jump: float = 0.15        # metres behind the local surface; 0 = slope rule
+    mask_slope_deg: float = 85.0   # steepest surface kept, when mask_jump is 0
     reseed_points: int = 24             # how many to add each time
     reseed_every: int = 6
     max_points: int = 400
@@ -306,7 +308,8 @@ class NaivePartTracker:
         from point2pose.data_types.frame import Frame
         from examples.multi_part.streaming import (build_sampler,
                                                    sample_superpoint, clean_mask)
-        mask = clean_mask(mask, depth, K=self.K)
+        mask = clean_mask(mask, depth, K=self.K, jump=self.cfg.mask_jump,
+                          slope_deg=self.cfg.mask_slope_deg)
         self.mask = mask
         self.sampler = build_sampler(self.cfg)
         pts0 = sample_superpoint(self.sampler, rgb, depth, mask, self.K,
@@ -349,7 +352,8 @@ class NaivePartTracker:
         # one mask for the whole frame: the gate, the re-seeding and the viewer
         # were each using a different one, so a track could be judged on-object
         # against pixels the sampler had already discarded
-        mask = clean_mask(mask, depth, K=self.K)
+        mask = clean_mask(mask, depth, K=self.K, jump=cfg.mask_jump,
+                          slope_deg=cfg.mask_slope_deg)
         self.mask = mask
 
         tracks, unc, vis = self.tracker.track_once(

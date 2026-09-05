@@ -143,7 +143,7 @@ def sample_superpoint(sampler, rgb, depth, mask, K, n, min_px=20000,
 
 
 def clean_mask(mask, depth, K=None, slope_deg=85.0, noise=0.005,
-               jump=0.0, win=7, min_frac=0.02):
+               jump=0.15, win=7, min_frac=0.02):
     """Drop mask pixels that sit well BEHIND the object's local surface.
 
     A propagated mask leaks background at the silhouette, and the leak is always
@@ -164,8 +164,17 @@ def clean_mask(mask, depth, K=None, slope_deg=85.0, noise=0.005,
     depth-separable at all, and only the part that falls on genuinely distant
     background can go -- 23% of it on cabinet01, 0% on pliers01. What removes
     the rest is downstream: a point left on the static table does not move with
-    the object and fails the rigid fit. So this stays conservative, keeping 97
-    to 100% of the true mask on every RBO class, and is not asked to do more.
+    the object and fails the rigid fit.
+
+    The local rule is therefore NOT the default, and RBO cannot be used to
+    choose one: its masks are rendered from ground truth and have no leak at
+    all, so any filter there can only do damage. Switching the whole benchmark
+    to the local rule cost part count 42 -> 37 of 81, coverage 159 -> 151,
+    purity 85.3 -> 82.9%, and axis error 21.3 -> 43.2 degrees, which measures
+    the filter's damage and nothing about its benefit. The generous 0.15 m
+    stays the default because on that data it is very nearly inert. Pass
+    jump=0 to select the local rule where the mask really does leak, which is
+    the live SAM2 path.
     """
     import cv2
     m = (mask > 0) & (depth > 0)

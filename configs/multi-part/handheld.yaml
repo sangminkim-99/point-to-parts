@@ -20,3 +20,10 @@ split_out_pts: 4
 # co-association evidence splits the same recording into rings vs base and
 # types it prismatic.
 frame_fallback: false
+
+# The mask here comes from SAM 2 and really does leak at the silhouette, so the
+# depth filter is switched from the generous fixed 0.15 m to the local rule:
+# tolerance from the window's own footprint at that depth times the steepest
+# slope worth keeping. Not the default, because RBO's masks are rendered from
+# ground truth and have no leak, so there the filter can only do damage.
+mask_jump: 0.0

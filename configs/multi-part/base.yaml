@@ -30,6 +30,8 @@ key_view: true
 key_angle_deg: 15.0
 min_live: 24
 reseed_min_region: 200
+mask_jump: 0.15
+mask_slope_deg: 85.0
 reseed_points: 24
 reseed_every: 6
 reseed_gap: 5
