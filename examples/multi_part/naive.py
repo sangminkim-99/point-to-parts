@@ -1118,15 +1118,26 @@ class NaivePartTracker:
             return 0.0
         return float(np.median(np.concatenate(d)) / max(part.sigma, 1e-6))
 
+    def _co_why(self, tag):
+        """Why the affinity would not group, so a refusal is never silent."""
+        d = getattr(self, "co_why", None)
+        if d is None:
+            from collections import Counter
+            d = self.co_why = Counter()
+        d[tag] += 1
+
     def _cluster_co(self, sel):
         """Two groups from the accumulated affinity, or None if not separable."""
         cfg = self.cfg
         seen = self.co_seen[np.ix_(sel, sel)]
         if seen.size == 0 or np.median(seen) < cfg.co_min_seen:
+            self._co_why("seen<%.1f (median %.1f)" % (cfg.co_min_seen,
+                         float(np.median(seen)) if seen.size else -1))
             return None
         A = self.co_same[np.ix_(sel, sel)] / np.maximum(seen, 1e-6)
         keep = seen.sum(axis=1) > 0
         if keep.sum() < 2 * cfg.min_part_pts:
+            self._co_why("only %d tracks have any history" % int(keep.sum()))
             return None
         A = A[np.ix_(keep, keep)]
         sub = sel[keep]
@@ -1139,11 +1150,13 @@ class NaivePartTracker:
             return None
         g0, g1 = sub[lab == 0], sub[lab == 1]
         if min(len(g0), len(g1)) < cfg.min_part_pts:
+            self._co_why("smaller group only %d points" % min(len(g0), len(g1)))
             return None
         within = 0.5 * (A[np.ix_(lab == 0, lab == 0)].mean()
                         + A[np.ix_(lab == 1, lab == 1)].mean())
         across = A[np.ix_(lab == 0, lab == 1)].mean()
         if within - across < cfg.co_gap:
+            self._co_why("gap %.2f under %.2f" % (within - across, cfg.co_gap))
             return None
         return [g0, g1], float(within - across)
 
@@ -1155,11 +1168,16 @@ class NaivePartTracker:
         idx = idx[self.track_born[idx] <= self.n - cfg.track_grace]
         sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
         if sel.size < 2 * cfg.min_part_pts:
+            self.thin_blocked = getattr(self, "thin_blocked", 0) + 1
             return False
 
         # Stage B first: groups that held together over frames, not one frame's
         # RANSAC. The single frame decides only when the history is too thin.
         cc = self._cluster_co(sel) if cfg.persist else None
+        if cc is None and cfg.persist:
+            # the commonest silent refusal: the points that disagree have not
+            # been seen together often enough to form a group
+            self.co_none = getattr(self, "co_none", 0) + 1
         if cc is not None:
             groups, gap = cc
             motions = []
@@ -1172,6 +1190,8 @@ class NaivePartTracker:
             big, rot_d, tr_m = self._joint_sized(motions, groups)
             if not big:
                 self.small_blocked = getattr(self, "small_blocked", 0) + 1
+            if ss < cfg.split_sep_sigma:
+                self.sep_blocked = getattr(self, "sep_blocked", 0) + 1
             if ss >= cfg.split_sep_sigma and big:
                 if cfg.cohort_veto and self._cohort_split(groups):
                     self.cohort_blocked = getattr(self, "cohort_blocked", 0) + 1

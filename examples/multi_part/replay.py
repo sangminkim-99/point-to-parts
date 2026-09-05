@@ -462,6 +462,17 @@ def main():
         if getattr(s, "cohort_blocked", 0):
             print(f"[replay] {s.cohort_blocked} splits refused: the groups were "
                   f"two seeding batches, not two parts")
+        if getattr(s, "co_none", 0):
+            print(f"[replay] {s.co_none} splits refused: the disagreeing points "
+                  f"had not been seen together often enough to group")
+            for k, v in getattr(s, "co_why", {}).most_common():
+                print(f"[replay]     {v:4d} x {k}")
+        if getattr(s, "sep_blocked", 0):
+            print(f"[replay] {s.sep_blocked} splits refused: the two groups' "
+                  f"motions were not separated above the noise")
+        if getattr(s, "thin_blocked", 0):
+            print(f"[replay] {s.thin_blocked} splits refused: too few live "
+                  f"tracks left on the part to fit two bodies")
         if getattr(s, "bic_blocked", 0):
             print(f"[replay] {s.bic_blocked} splits refused: not worth six more "
                   f"parameters")
