@@ -280,6 +280,16 @@ class NaivePart:
     _last_seen: object = None           # last measured positions, for the gate
     _last_sel: object = None
     _last_pose: object = None           # for the rotation the band allows for
+    t_lo: object = None                 # corner of the box this part's origin
+    t_hi: object = None                 # has visited, in the camera
+    #   The base of an articulated object is the part everything else moves
+    #   against, and with a fixed camera that is the part whose origin went
+    #   nowhere -- readable from the poses we already have, with no guess from
+    #   size or point count. It is the SPREAD of the trajectory, not its
+    #   length: summing |dt| per frame integrates the tracking noise, so a
+    #   static part carrying a noisier pose outscores a drawer that really
+    #   moved. Measured on ikeasmall02, path length ranked the cabinet body
+    #   above a drawer that had barely opened.
     rot_step: float = 0.0
     coherence: float = 0.0              # how aligned the disagreement is
     n_off: int = 0                      # how many points disagree
@@ -692,6 +702,9 @@ class NaivePartTracker:
         d = np.linalg.norm(
             self.anchor_xyz[sel] @ T_free[:3, :3].T + T_free[:3, 3]
             - cur[sel], axis=1)
+        t = T_free[:3, 3]
+        part.t_lo = t.copy() if part.t_lo is None else np.minimum(part.t_lo, t)
+        part.t_hi = t.copy() if part.t_hi is None else np.maximum(part.t_hi, t)
         part.pose = T_free
         jf = self._fit_joint(part, sel, cur)
         if jf is not None and jf[1] <= max(float(np.median(d)), 1e-4) * cfg.joint_tol:
