@@ -8,5 +8,15 @@ split_min_rot_deg: 30.0
 split_min_trans_m: 0.03
 rot_tol: 3.0
 motion_sigma: 1.0
-key_angle_deg: 25.0
-n_points: 60
+key_angle_deg: 10.0
+n_points: 200
+split_out_pts: 4
+# A single frame must not be allowed to decide a split here.  When a hand
+# carries the whole object, one frame's residual is large everywhere, and the
+# cut it makes runs through the object rather than between its parts: measured
+# on lift01, the frame-90 fallback split produced two point sets both spread
+# over the whole toy, whose relative pose was noise -- 37 deg of spurious
+# rotation that typed the sliding rings revolute.  Waiting for the
+# co-association evidence splits the same recording into rings vs base and
+# types it prismatic.
+frame_fallback: false

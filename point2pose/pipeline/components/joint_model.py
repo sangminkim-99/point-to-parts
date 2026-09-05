@@ -238,6 +238,15 @@ class JointModel:
         if not cands:
             return False
         n = len(A)
+        # The noise MUST be estimated before the models are scored: _score
+        # returns a residual in units of sigma, so scoring first normalises
+        # by whatever the PREVIOUS fit left behind and makes the winner a
+        # function of the fit history rather than of the observations.
+        st, sr = self._noise_from_smoothness(A)
+        self.sigma_t = max(self.sigma, st)
+        self.sigma_r = max(0.002, sr, self.sigma_r_floor)
+        self.sigma_eff = self.sigma_t
+
         mses = {m[0]: self._score(m, A) for m in cands}
         # The observations are relative POSES from a RANSAC fit on a handful of
         # points, not points, so the per-point noise underestimates them by
@@ -245,10 +254,6 @@ class JointModel:
         # must not come from the model being judged either -- taking it from the
         # best 1-DoF fit makes that fit adequate by construction, and nothing
         # can ever beat it. It comes from the data alone instead.
-        st, sr = self._noise_from_smoothness(A)
-        self.sigma_t = max(self.sigma, st)
-        self.sigma_r = max(0.002, sr, self.sigma_r_floor)
-        self.sigma_eff = self.sigma_t
         # MAP, not ML: the axis has a prior that says a hinge is on the object.
         # Scaled by the object's own extent, so it is a shape claim, not a size.
         scale = (float(np.percentile(

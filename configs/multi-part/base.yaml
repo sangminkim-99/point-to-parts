@@ -29,6 +29,7 @@ top_up: true
 key_view: true
 key_angle_deg: 15.0
 min_live: 24
+reseed_min_region: 200
 reseed_points: 24
 reseed_every: 6
 reseed_gap: 5
@@ -46,7 +47,7 @@ reproj_px: 24.0
 reproj_depth: 0.03
 
 # ---- splitting ----
-split_out_frac: 0.01
+split_out_pts: 6
 split_out_band: 3.0
 sigma_floor: 0.002
 sigma_ceil: 0.02
@@ -88,6 +89,7 @@ joint_grid: 61
 joint_conf: 0.6
 joint_exc: 0.5
 axis_prior: 0.2
+allow_free: false
 merge_rigid: true
 merge_every: 10
 merge_min_obs: 12

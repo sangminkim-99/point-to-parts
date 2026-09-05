@@ -45,7 +45,17 @@ class NaiveConfig:
     # same way is overwhelming evidence against one rigid body even though no
     # single point moved far, so the trigger and the separation test are both
     # measured in units of the depth noise the fit itself reveals.
-    split_out_frac: float = 0.12        # share of points beyond the inlier band
+    split_out_pts: int = 6              # this many points beyond the inlier band
+    #   A count, not a share.  A share asks "is this part badly explained",
+    #   which a small sub-part on a large body can never make true: eight
+    #   points turning on a two-hundred-point object is 4%, below any
+    #   threshold that survives noise, and yet those eight points are a
+    #   whole part.  A count asks the question we actually mean -- are there
+    #   enough points that consistently disagree to fit a second body -- and
+    #   its answer does not depend on how big the rest of the object is.
+    #   What keeps this from firing on noise is no longer the share but the
+    #   two size gates downstream: the disagreement must also resolve into a
+    #   joint of at least split_min_rot_deg or split_min_trans_m.
     split_out_band: float = 3.0         # x the estimated noise sigma
     # Rotation is where the tracker gives out: TAPIR matches patches, so an
     # in-plane turn degrades it, and a rotation error of dtheta moves a point
@@ -106,6 +116,15 @@ class NaiveConfig:
     # adds: at 0.5 the fit prefers a revolute joint pivoting 1.3 m away, at 0.2
     # it does not. Real hinges sit 0-4 cm from the surface and pay nothing.
     axis_prior: float = 0.2             # x the object radius; 0 disables
+    allow_free: bool = False            # admit a 6-DoF "disconnected" model
+    #   A part that is lifted OFF its parent -- a ring taken off its post, a
+    #   lid carried away -- has no joint at all, and with only rigid,
+    #   prismatic and revolute on offer the fit is forced into the most
+    #   flexible of the three.  Measured on a ring-stacker recording: the
+    #   removed ring scores free 1690 against revolute 9053, while a ring
+    #   still on the post scores revolute 148 against free 612, so the free
+    #   model does not simply swallow real joints.  Off by default until it
+    #   is measured on RBO.
     # Stage B: a single frame's RANSAC split is a coin toss on noisy depth. What
     # marks a real part is the SAME point subset backing a different motion frame
     # after frame, so co-association is accumulated and clustered instead.
@@ -152,6 +171,7 @@ class NaiveConfig:
     # kept 10 of 100 -- and a part can never split below 2 * min_part_pts.
     top_up: bool = True
     min_live: int = 24                  # per part, before new points are sought
+    reseed_min_region: int = 200   # px of its own before a part may re-seed
     reseed_points: int = 24             # how many to add each time
     reseed_every: int = 6
     max_points: int = 400
@@ -187,7 +207,15 @@ class NaiveConfig:
     reproj_depth: float = 0.03          # and in metres
     seed_prior: float = 6.0             # weighted frames of assumed agreement
     track_grace: int = 12               # frames before a track may vote
-    reseed_max_resid: float = 0.012     # metres; pose must explain the old ones
+    # Relative to the part's own noise, not an absolute distance: a small part
+    # has a shakier pose by construction, so a fixed 12 mm shut it out of
+    # re-seeding for ever while the big one kept being topped up.
+    reseed_max_resid: float = 0.012     # metres, as a floor
+    reseed_resid_sigma: float = 4.0     # or this many of the part's own sigma
+    # Budget shared between parts rather than spent in size order. The parts are
+    # sorted largest first, so a global cap was consumed by part 0 before the
+    # small parts -- the ones that most need points -- were ever reached.
+    fair_share: bool = True
     reseed_gap: int = 5                # frames between re-seeds of one part
     # Point2Pose's own criterion, and the primary one. It is not a proxy for
     # "new surface": it is a proxy for the tracker going bad. TAPIR matches
@@ -234,7 +262,7 @@ class NaivePart:
     joint: JointModel = None
     resid: float = 0.0
     sigma: float = 0.004                # robust noise scale of this part's fit
-    out_frac: float = 0.0
+    out_pts: int = 0
     n_mature: int = 0
     on_joint: bool = False
     view_dirs: list = None              # viewing directions already sampled
@@ -343,7 +371,7 @@ class NaivePartTracker:
         if os.environ.get("NAIVE_DEBUG") and i % 10 == 0:
             print("[naive] f%d " % i + "  ".join(
                 f"p{j}: n={len(p.idx)} resid={p.resid*1000:.0f}mm "
-                f"out={100*p.out_frac:.0f}% over={p.over}"
+                f"out={p.out_pts}pt over={p.over}"
                 for j, p in enumerate(self.parts)), flush=True)
 
         if i >= cfg.min_frames_before_split and len(self.parts) < cfg.max_parts \
@@ -365,6 +393,7 @@ class NaivePartTracker:
                 # is the only thing that knows it
                 p.joint.sigma = max(p.sigma, self.parts[p.parent].sigma)
                 p.joint.axis_prior = cfg.axis_prior
+                p.joint.allow_free = cfg.allow_free
                 p.joint.geom = self._joint_geom(j, p)
                 # rotation is only as well determined as the lever arm allows
                 p.joint.sigma_r_floor = max(
@@ -460,8 +489,16 @@ class NaivePartTracker:
         cfg = self.cfg
         cur, cok, cvi = self.cur
         t2 = self.cur_tracks_2d
-        added = 0
-        for j, p in enumerate(self.parts):
+        added, why, got = 0, {}, {}
+        # neediest first, so the budget does not go to whoever is listed first
+        order = sorted(range(len(self.parts)),
+                       key=lambda j: len(self.parts[j].idx)) \
+            if cfg.fair_share else list(range(len(self.parts)))
+        share = max(cfg.reseed_points,
+                    cfg.max_points // max(len(self.parts), 1)) \
+            if cfg.fair_share else cfg.max_points
+        for j in order:
+            p = self.parts[j]
             idx = p.idx[p.idx < len(cok)]
             live = int((cok[idx] & cvi[idx]).sum()) if idx.size else 0
             # points already asked for but not yet placed are still points: not
@@ -479,28 +516,47 @@ class NaivePartTracker:
             # Point2Pose's own pair: a viewpoint not yet sampled, or a part
             # that still shows surface but has run out of live tracks.
             if not (new_view or live < cfg.min_live):
+                why[j] = "no new view, not starved"
                 continue
             if len(self.anchor_xyz) >= cfg.max_points:
+                why[j] = "global budget spent"
                 continue
+            if cfg.fair_share and len(p.idx) >= share:
+                why[j] = "had its share"
+                continue        # this part has had its share of the budget
             if i - p.last_seed < cfg.reseed_gap:
+                why[j] = "too soon"
                 continue
-            if p.resid > cfg.reseed_max_resid:
+            if p.resid > max(cfg.reseed_max_resid,
+                             cfg.reseed_resid_sigma * p.sigma):
+                why[j] = "pose not trusted"
                 continue        # do not anchor through a pose that has slipped
             # the surface this part shows now, which is what _reseed samples
             # in the dense pipeline; the sampler's own novelty term is what
             # keeps the new points off the ones already there
             m = mask.copy()
-            if self.reproj is not None and len(self.parts) > 1:
-                own = (self.reproj == j) & (mask > 0) & (depth > 0.05)
-                if own.sum() >= 200:
-                    m = own.astype(np.uint8)
-            elif idx.size >= 3 and len(self.parts) > 1:
-                q = t2[idx].astype(int)
-                box = np.zeros_like(m)
-                x0, y0 = np.clip(q.min(0) - 20, 0, None)
-                x1, y1 = q.max(0) + 20
-                box[y0:y1, x0:x1] = 1
-                m = m * box
+            if len(self.parts) > 1:
+                # Sample inside this part's OWN region or not at all. The old
+                # code widened to the whole object mask whenever the region
+                # came out under 200 px and still filed every point it found
+                # under part j, so a part whose surface was mostly hidden
+                # quietly annexed its neighbour's points: on lift01 the split
+                # was clean at frame 96 and mixed again by 130. A part with no
+                # visible region of its own has nothing to re-seed from.
+                own = None
+                if self.reproj is not None:
+                    own = (self.reproj == j) & (mask > 0) & (depth > 0.05)
+                elif idx.size >= 3:
+                    q = t2[idx].astype(int)
+                    box = np.zeros_like(m)
+                    x0, y0 = np.clip(q.min(0) - 20, 0, None)
+                    x1, y1 = q.max(0) + 20
+                    box[y0:y1, x0:x1] = 1
+                    own = (m > 0) & (box > 0)
+                if own is None or own.sum() < cfg.reseed_min_region:
+                    why[j] = "no region of its own"
+                    continue
+                m = own.astype(np.uint8)
             new = np.asarray(sample_superpoint(
                 self.sampler, rgb, depth, m, self.K, cfg.reseed_points,
                 existing=t2[idx] if idx.size else None), np.float32)
@@ -542,13 +598,16 @@ class NaivePartTracker:
                     if a_.size and b_.size:
                         self.co_same[np.ix_(a_, b_)] += w
                         self.co_seen[np.ix_(a_, b_)] += w
+            got[j] = got.get(j, 0) + int(ok.sum())
             added += int(ok.sum())
         if added:
             for p in self.parts:
                 p.box = self._fit_box(p)
-            print(f"[naive] frame {i}: re-seeded {added} tracks "
-                  f"({len(self.pend)} awaiting a part, "
-                  f"{sum(len(q.view_dirs or []) for q in self.parts)} views)")
+            print(f"[naive] frame {i}: re-seeded "
+                  + ", ".join(f"{n} on p{k}" for k, n in sorted(got.items()))
+                  + (f"   (skipped: "
+                     + ", ".join(f"p{k} {v}" for k, v in sorted(why.items())) + ")"
+                     if why else ""))
         return added
 
     def _note_controllable(self, j, part, i):
@@ -639,9 +698,9 @@ class NaivePartTracker:
         # a track only a few frames old has not earned a vote on articulation
         mature = self.track_born[sel] <= self.n - cfg.track_grace
         dm = d[mature] if mature.any() else d
-        part.out_frac = float(np.mean(dm > cfg.split_out_band * part.sigma))
+        part.out_pts = int(np.sum(dm > cfg.split_out_band * part.sigma))
         part.n_mature = int(mature.sum())
-        hot = (part.out_frac > cfg.split_out_frac) or (part.resid > cfg.split_res)
+        hot = (part.out_pts >= cfg.split_out_pts) or (part.resid > cfg.split_res)
         part.over = part.over + 1 if hot else 0
 
     def _grow_co(self, n):
@@ -935,14 +994,30 @@ class NaivePartTracker:
             return 0
         for j in sorted(gone, reverse=True):
             self.parts.pop(j)
-        for k, p in enumerate(self.parts):
-            p.parent = 0 if k else (1 if len(self.parts) > 1 else 0)
-            if p.joint is None and k != p.parent:
-                p.joint = JointModel()
+        self._reparent()
         if len(self.parts) < 2:
             self.state = self.RIGID
         self.merged_total = getattr(self, "merged_total", 0) + len(gone)
         return len(gone)
+
+    def _reparent(self):
+        """Part 0 is the root; every other part hangs off it.
+
+        Part 0 used to take part 1 as ITS parent so that a two-part object
+        gave both sides a joint, but that makes the pair a two-cycle: the same
+        relative motion is fitted twice, in opposite directions, with
+        different rest offsets and different geometry, and the two fits
+        disagree -- on lift01 the same pair came out revolute one way (axis 33
+        cm off the object) and prismatic the other. One relation, one joint.
+        """
+        for k, p in enumerate(self.parts):
+            p.parent = 0
+            if k == 0:
+                p.joint = None          # the root has nothing to hinge on
+            elif p.joint is None:
+                p.joint = JointModel()
+                p.joint.allow_free = self.cfg.allow_free
+                p.joint.axis_prior = self.cfg.axis_prior
 
     def _cohort_split(self, groups):
         """True when the two groups are just two different seeding batches."""
@@ -988,27 +1063,35 @@ class NaivePartTracker:
     def _joint_sized(self, motions, groups=None):
         """Is the relative motion big enough to be a joint anyone would name?
 
-        The two thresholds are in different units, so which one applies has to
-        be decided first. Taking either as sufficient made the rotation limit
-        useless: a hand turning an object produces centimetres of relative
-        translation between any two groups, so every rotation slipped through
-        the translation door. The mode is decided by which part of the motion
-        actually moves the points -- a turn of dtheta moves a point at radius r
-        by r*dtheta -- and only that mode's threshold is asked for.
+        Both quantities come from what the points actually do, not from the
+        transform's components. |D[:3,3]| is not a displacement: a turn about a
+        pivot a metre away puts a metre in it while the points move a few
+        centimetres, so reading it as translation classified almost every
+        rotation as a slide and the rotation limit never applied.
+
+        The points' mean displacement is the translation; their spread about
+        that mean is the turn. Whichever moves them more decides which limit
+        they have to clear.
         """
         cfg = self.cfg
         D = np.linalg.inv(motions[0]) @ motions[1]
         rot = float(np.degrees(np.arccos(np.clip(
             (np.trace(D[:3, :3]) - 1) / 2, -1, 1))))
-        trans = float(np.linalg.norm(D[:3, 3]))
-        r = 0.05
+        q = None
         if groups:
-            q = [self.anchor_xyz[np.asarray(g)] for g in groups
-                 if np.asarray(g).size >= 3]
-            if q:
-                q = np.concatenate(q)
-                r = float(np.linalg.norm(q - q.mean(0), axis=1).mean()) + 1e-3
-        turning = np.radians(rot) * r > trans
+            qs = [self.anchor_xyz[np.asarray(g)] for g in groups
+                  if np.asarray(g).size >= 3]
+            if qs:
+                q = np.concatenate(qs)
+        if q is None or len(q) < 3:
+            trans = float(np.linalg.norm(D[:3, 3]))
+            turn_disp = np.radians(rot) * 0.05
+        else:
+            disp = q @ D[:3, :3].T + D[:3, 3] - q
+            trans = float(np.linalg.norm(disp.mean(axis=0)))
+            turn_disp = float(np.median(
+                np.linalg.norm(disp - disp.mean(axis=0), axis=1)))
+        turning = turn_disp > trans
         self.last_mode = (f"turning {rot:.0f} deg" if turning
                           else f"sliding {1000 * trans:.0f} mm")
         big = (rot >= cfg.split_min_rot_deg) if turning \
@@ -1162,10 +1245,7 @@ class NaivePartTracker:
         self.co_same[np.ix_(all_idx, all_idx)] = 0.0
         self.co_seen[np.ix_(all_idx, all_idx)] = 0.0
         self.parts[j:j + 1] = new
-        for k, p in enumerate(self.parts):
-            p.parent = 0 if k else (1 if len(self.parts) > 1 else 0)
-            if p.joint is None and k != p.parent:
-                p.joint = JointModel()
+        self._reparent()
         if self.model is not None:
             self._split_labels(j, new, cur, cur_ok)
         for p in self.parts:
@@ -1193,7 +1273,7 @@ class NaivePartTracker:
               f"parts ({self.last_mode}, motion {mm:.0f} mm = "
               f"{sep_sigma:.1f} sigma, "
               f"noise {part.sigma * 1000:.1f} mm, outliers "
-              f"{100 * part.out_frac:.0f}%, "
+              f"{part.out_pts}pt, "
               f"{len(groups[0])}/{len(groups[1])} pts"
               + (f", gap {gap:.2f}" if gap == gap else "")
               + (f", dBIC {dbic:.0f}" if dbic == dbic else "")
@@ -1226,95 +1306,137 @@ class NaivePartTracker:
         self.model.labels[held] = own[nn]
 
     # ---- visualisation ----
-    def render(self, bgr, palette=None):
-        """Tracks coloured by part, an oriented 3D box and pose axes per part,
-        and the fitted joint axis -- the same read-out as the dense pipeline."""
+    PAL = [(60, 140, 235), (200, 120, 40), (70, 180, 90), (200, 80, 200),
+           (60, 200, 200), (90, 90, 235)]
+
+    def render(self, bgr, palette=None, style="clean"):
+        """Draw the state. `clean` shows what was found, `debug` shows why.
+
+        Once the parts are known, which point belongs where is better read as a
+        region than as two hundred coloured dots, and the joint -- the thing the
+        whole system exists to find -- should be the most visible mark on the
+        image rather than one line among many.
+        """
         import cv2
-        from point2pose.utils.visualization import draw_oriented_3d_box
-        pal = palette or [(60, 140, 235), (200, 120, 40), (70, 180, 90),
-                          (200, 80, 200), (60, 200, 200), (90, 90, 235)]
-        K = self.K
-        out = bgr
+        pal = palette or self.PAL
+        out, K = bgr, self.K
         cur, cur_ok, vis = getattr(self, "cur", (None, None, None))
         t2 = getattr(self, "cur_tracks_2d", None)
         if t2 is None:
             return out
+        debug = style == "debug"
 
         m = getattr(self, "mask", None)
         if m is not None:
-            edge = cv2.morphologyEx((m > 0).astype(np.uint8), cv2.MORPH_GRADIENT,
-                                    np.ones((3, 3), np.uint8))
-            out[edge > 0] = (235, 235, 235)
+            e = cv2.morphologyEx((m > 0).astype(np.uint8), cv2.MORPH_GRADIENT,
+                                 np.ones((3, 3), np.uint8))
+            out[e > 0] = (90, 90, 90)
+
         owner = np.full(len(t2), -1)
         for j, p in enumerate(self.parts):
             owner[p.idx[p.idx < len(t2)]] = j
+        live = cur_ok & vis
+
+        # the points stay: which point went where is the evidence, and losing
+        # them after the split hides the thing the split was made of
         for k, (x, y) in enumerate(t2):
-            if not (cur_ok[k] and vis[k]):
+            if not live[k]:
                 continue
             col = (110, 110, 110) if owner[k] < 0 else pal[owner[k] % len(pal)]
-            cv2.circle(out, (int(x), int(y)), 3, col, -1, cv2.LINE_AA)
+            cv2.circle(out, (int(x), int(y)), 3 if debug else 2, col, -1,
+                       cv2.LINE_AA)
 
         def proj(P):
-            if P[2] <= 1e-3:
-                return None
-            return (int(P[0] * K[0, 0] / P[2] + K[0, 2]),
-                    int(P[1] * K[1, 1] / P[2] + K[1, 2]))
+            return None if P[2] <= 1e-3 else (
+                int(P[0] * K[0, 0] / P[2] + K[0, 2]),
+                int(P[1] * K[1, 1] / P[2] + K[1, 2]))
+
+        # A thin oriented box: it says where the part is AND how it is turned,
+        # which a hull cannot, and at one pixel it does not crowd the joint.
+        if len(self.parts) > 1:
+            from point2pose.utils.visualization import draw_oriented_3d_box
+            for j, p in enumerate(self.parts):
+                if p.box is None:
+                    p.box = self._fit_box(p)
+                if p.box is None or p.pose is None:
+                    continue
+                try:
+                    out = draw_oriented_3d_box(K, out, p.pose, p.box,
+                                               line_color=pal[j % len(pal)],
+                                               linewidth=2 if debug else 1)
+                except Exception:
+                    pass
 
         for j, p in enumerate(self.parts):
             col = pal[j % len(pal)]
-            if p.box is None:
-                p.box = self._fit_box(p)
-            if p.box is not None and p.pose is not None:
-                try:
-                    out = draw_oriented_3d_box(K, out, p.pose, p.box,
-                                               line_color=col, linewidth=2)
-                except Exception:
-                    pass
             idx = p.idx[p.idx < len(self.anchor_xyz)]
-            q = self.anchor_xyz[idx[self.anchor_ok[idx]]]
-            if q.shape[0] < 3 or p.pose is None:
+            g = self.anchor_xyz[idx[self.anchor_ok[idx]]]
+            if g.shape[0] < 3 or p.pose is None:
                 continue
-            c = q.mean(0)
-            org = p.pose[:3, :3] @ c + p.pose[:3, 3]
-            p0 = proj(org)
-            for ax, acol in zip(np.eye(3) * 0.05,
+            c = g.mean(0)
+            org = proj(p.pose[:3, :3] @ c + p.pose[:3, 3])
+            if org is None:
+                continue
+            # a small triad, enough to read the orientation without dominating
+            for ax, acol in zip(np.eye(3) * (0.06 if debug else 0.035),
                                 [(60, 60, 235), (60, 220, 60), (235, 160, 60)]):
-                p1 = proj(p.pose[:3, :3] @ (c + ax) + p.pose[:3, 3])
-                if p0 and p1:
-                    cv2.arrowedLine(out, p0, p1, acol, 2, cv2.LINE_AA,
-                                    tipLength=0.3)
-            lab = f"p{j} {p.resid * 1000:.0f}mm {100 * p.out_frac:.0f}%"
-            if p.joint is not None and p.joint.kind:
-                c = p.joint.confidence()
-                # the type on its own says nothing; how sure and how much it has
-                # been moved are what tell a person to keep wiggling
-                lab += (f" {p.joint.kind[:4]} {c['conf']:.2f}"
-                        f"/t{c['type_p']:.2f}/x{c['excitation']:.1f}"
-                        + ("*" if p.on_joint else ""))
-            if p0:
-                cv2.putText(out, lab, (p0[0] - 30, p0[1] - 12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+                tip = proj(p.pose[:3, :3] @ (c + ax) + p.pose[:3, 3])
+                if tip:
+                    cv2.arrowedLine(out, org, tip, acol, 2, cv2.LINE_AA,
+                                    tipLength=0.35)
+            cv2.circle(out, org, 4, col, -1, cv2.LINE_AA)
+            cv2.circle(out, org, 4, (25, 25, 25), 1, cv2.LINE_AA)
+            lab = f"p{j}"
+            if debug:
+                lab += f" {p.resid * 1000:.0f}mm {p.out_pts}pt"
+            cv2.putText(out, lab, (org[0] + 8, org[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 3, cv2.LINE_AA)
+            cv2.putText(out, lab, (org[0] + 8, org[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
 
-        # the joint axis, drawn once per pair in the parent's frame
+        # The axis is drawn only in debug.  It is the discovery, but it is
+        # also an inference on top of two noisy poses: a wrong axis drawn
+        # boldly over the object is read as the tracker's belief about where
+        # the object is, and it hides the segmentation that is the thing to
+        # judge.  Its type and confidence are still reported in text.
+        if not debug:
+            return out
+
         drawn = set()
         for j, p in enumerate(self.parts):
             jm = p.joint
-            if jm is None or jm.kind is None or p.parent >= len(self.parts):
+            if jm is None or jm.kind not in ("revolute", "prismatic"):
                 continue
             key = tuple(sorted((j, p.parent)))
-            if key in drawn:
+            if key in drawn or p.parent >= len(self.parts):
                 continue
             drawn.add(key)
             Tp = self.parts[p.parent].pose
             if Tp is None:
                 continue
+            conf = jm.confidence()
             base = jm.point if (jm.kind == "revolute" and jm.point is not None) \
                 else np.zeros(3)
-            a0 = Tp[:3, :3] @ (base - jm.axis * 0.08) + Tp[:3, 3]
-            a1 = Tp[:3, :3] @ (base + jm.axis * 0.08) + Tp[:3, 3]
-            q0, q1 = proj(a0), proj(a1)
-            if q0 and q1:
-                cv2.line(out, q0, q1, (20, 20, 20), 3, cv2.LINE_AA)
-                cv2.putText(out, jm.kind, q1, cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                            (20, 20, 20), 1, cv2.LINE_AA)
+            L = 0.10
+            a0 = proj(Tp[:3, :3] @ (base - jm.axis * L) + Tp[:3, 3])
+            a1 = proj(Tp[:3, :3] @ (base + jm.axis * L) + Tp[:3, 3])
+            if not (a0 and a1):
+                continue
+            sure = conf.get("valid", True) and conf["conf"] >= 0.6
+            shade = (245, 245, 245) if sure else (150, 150, 150)
+            cv2.line(out, a0, a1, (20, 20, 20), 7, cv2.LINE_AA)
+            cv2.line(out, a0, a1, shade, 3 if sure else 2, cv2.LINE_AA)
+            if jm.kind == "revolute":
+                c0 = proj(Tp[:3, :3] @ base + Tp[:3, 3])
+                if c0:
+                    cv2.circle(out, c0, 7, (20, 20, 20), -1, cv2.LINE_AA)
+                    cv2.circle(out, c0, 5, shade, -1, cv2.LINE_AA)
+            else:
+                cv2.arrowedLine(out, a0, a1, shade, 3, cv2.LINE_AA, tipLength=0.18)
+                cv2.arrowedLine(out, a1, a0, shade, 3, cv2.LINE_AA, tipLength=0.18)
+            tag = f"{jm.kind}  {100 * conf['conf']:.0f}%"
+            cv2.putText(out, tag, (a1[0] + 8, a1[1]), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (20, 20, 20), 3, cv2.LINE_AA)
+            cv2.putText(out, tag, (a1[0] + 8, a1[1]), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, shade, 1, cv2.LINE_AA)
         return out

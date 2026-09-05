@@ -305,7 +305,7 @@ class LiveAcquire:
                         self.times.append(dt)
                         i += 1
                         conf, kind, _ = self.acq.step(i, self.stream, dt)
-                        disp = self.stream.render(disp)
+                        disp = self.stream.render(disp, style=self.args.vis)
                         disp = self._panel(disp, conf, kind, i)
 
                 if self.show_depth:
@@ -372,6 +372,8 @@ class LiveAcquire:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--serial", default=None)
+    ap.add_argument("--vis", choices=["clean", "debug"], default="clean",
+                    help="clean shows what was found, debug shows why")
     ap.add_argument("--bbox-prompt", action="store_true",
                     help="drag a box instead of clicking points")
     ap.add_argument("--config", default=None,
@@ -395,7 +397,7 @@ def main():
     ap.add_argument("--rot-tol", type=float, default=None)
     ap.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE",
                     help="override any NaiveConfig field, e.g. --set "
-                         "split_out_frac=0.2 --set co_gap=0.3")
+                         "split_out_pts=4 --set co_gap=0.3")
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
     ap.add_argument("--sam-checkpoint",

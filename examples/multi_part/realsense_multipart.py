@@ -48,7 +48,7 @@ class RealSenseMultiPart:
         if args.n_points:
             self.cfg.n_points = args.n_points
         for k, v in (("sampler", args.sampler),
-                     ("split_out_frac", args.split_out_frac),
+                     ("split_out_pts", args.split_out_pts),
                      ("min_part_pts", args.min_part_pts),
                      ("joint_track", None if args.joint_track is None
                       else bool(args.joint_track)),
@@ -251,10 +251,10 @@ class RealSenseMultiPart:
                     if self.args.method == "naive":
                         # outliers, not the median residual, are what a split
                         # needs: the second part is always the smaller set
-                        hot = any(p.out_frac > self.cfg.split_out_frac
+                        hot = any(p.out_pts >= self.cfg.split_out_pts
                                   for p in self.stream.parts)
                         cv2.putText(bar, "  ".join(
-                            f"p{j} {p.resid*1000:.0f}mm out {100*p.out_frac:.0f}%"
+                            f"p{j} {p.resid*1000:.0f}mm out {p.out_pts}pt"
                             + (" joint" if p.on_joint else "")
                             for j, p in enumerate(self.stream.parts)),
                             (8, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
@@ -262,7 +262,7 @@ class RealSenseMultiPart:
                             cv2.LINE_AA)
                         cv2.putText(bar, f"points {len(self.stream.anchor_xyz)}"
                                          f"   need out > "
-                                         f"{100*self.cfg.split_out_frac:.0f}%"
+                                         f"{self.cfg.split_out_pts}pt"
                                          f" for {self.cfg.split_frames} frames",
                                     (8, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                                     (170, 170, 170), 1, cv2.LINE_AA)
@@ -360,7 +360,7 @@ def main():
     ap.add_argument("--sampler", default=None,
                     help="super_point_balanced | super_point_fps | uniform_fps "
                          "| orb | random")
-    ap.add_argument("--split-out-frac", type=float, default=None)
+    ap.add_argument("--split-out-pts", type=int, default=None)
     ap.add_argument("--min-part-pts", type=int, default=None)
     ap.add_argument("--joint-track", type=int, default=None)
     ap.add_argument("--persist", type=int, default=None)

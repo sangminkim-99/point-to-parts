@@ -199,6 +199,9 @@ def main():
                     help="largest translation a part may move between two tracked "
                          "frames, metres; 0 disables the guard")
     ap.add_argument("--exclusive-mask", type=int, default=1)
+    ap.add_argument("--outside-w", type=float, default=0.0,
+                    help="extra penalty, as a multiple of r_max, for a gaussian "
+                         "rendering where the live mask says there is no object")
     ap.add_argument("--visibility", type=int, default=0,
                     help="mask out gaussians the part's own front face hides. "
                          "Off: measured, it removes the gaussians that carry the "
@@ -933,7 +936,8 @@ def main():
                                                  obs_mask=om_j,
                                                  r_max=args.track_rmax,
                                                  obs_rgb=rgb_i,
-                                                 color_w=args.track_color)
+                                                 color_w=args.track_color,
+                                                 outside_w=args.outside_w)
                     for oi in np.argsort(eg)[:3]:
                         cands.append(Tg[int(oi)])
                 # A hypothesis fitted to THIS part's own tracks. The global
@@ -977,7 +981,8 @@ def main():
                     # part scores best (see fit_energy).
                     e = assign.fit_energy(Tr, w, K, H, W, dep_i, obs_mask=om_j,
                                           r_max=args.track_rmax, obs_rgb=rgb_i,
-                                          color_w=args.track_color, visible=vz)
+                                          color_w=args.track_color, visible=vz,
+                                          outside_w=args.outside_w)
                     dbg.append((ci, e, float(np.linalg.norm(Tr[:3, 3]))))
                     if e < best_e:
                         best_T, best_e, best_i = Tr, e, ci
@@ -991,7 +996,8 @@ def main():
                                             visible=vz)
                     ef = assign.fit_energy(Tf, w, K, H, W, dep_i, obs_mask=om_j,
                                            r_max=args.track_rmax, obs_rgb=rgb_i,
-                                           color_w=args.track_color, visible=vz)
+                                           color_w=args.track_color, visible=vz,
+                                           outside_w=args.outside_w)
                     if ef < best_e:
                         best_T, best_e = Tf, ef
                 T = best_T if best_T is not None else np.eye(4)

@@ -69,7 +69,7 @@ def main():
                     help="naive only: step 4, per-part gaussian model")
     ap.add_argument("--refine", type=int, default=0,
                     help="naive only: step 5, rendering-based refinement")
-    ap.add_argument("--split-out-frac", type=float, default=None)
+    ap.add_argument("--split-out-pts", type=int, default=None)
     ap.add_argument("--ambiguous-band", type=float, default=None)
     ap.add_argument("--min-part-pts", type=int, default=None)
     ap.add_argument("--split-frames", type=int, default=None)
@@ -97,6 +97,7 @@ def main():
     ap.add_argument("--rot-tol", type=float, default=None)
     ap.add_argument("--split-min-rot-deg", type=float, default=None)
     ap.add_argument("--split-min-trans-m", type=float, default=None)
+    ap.add_argument("--vis", choices=["clean", "debug"], default="clean")
     ap.add_argument("--config", default=None,
                     help="a file in configs/multi-part, or a path")
     ap.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE",
@@ -116,6 +117,8 @@ def main():
     ap.add_argument("--occlude", default=None,
                     help="START:END:FRAC -- hide FRAC of the object's bounding "
                          "box (depth and mask) between those frames")
+    ap.add_argument("--dump-joint", default=None,
+                    help="npz of every joint's relative-pose stack, for analysis")
     ap.add_argument("--urdf", default=None,
                     help="write the discovered object out as a URDF")
     ap.add_argument("--resplit-cov-frac", type=float, default=None)
@@ -242,7 +245,7 @@ def main():
         ncfg = NaiveConfig(dense=bool(args.dense),
                            refine=bool(args.dense and args.refine))
         apply_config(ncfg, args.config)
-        for k, v in (("split_out_frac", args.split_out_frac),
+        for k, v in (("split_out_pts", args.split_out_pts),
                      ("ambiguous_band", args.ambiguous_band),
                      ("min_part_pts", args.min_part_pts),
                      ("split_frames", args.split_frames),
@@ -357,7 +360,8 @@ def main():
             gt["log"].append((int(i), [None if p.pose is None else p.pose.copy()
                                        for p in s.parts]))
 
-        vis = s.render(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy())
+        vis = s.render(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy(),
+                       style=(args.vis if args.method == 'naive' else 'clean'))
         if args.hyp_panel and hasattr(s, "hypothesis_panel"):
             panel = s.hypothesis_panel(dep, m, width=vis.shape[1] // 4)
             if panel is not None:
@@ -461,6 +465,16 @@ def main():
         if getattr(s, "bic_blocked", 0):
             print(f"[replay] {s.bic_blocked} splits refused: not worth six more "
                   f"parameters")
+        if args.dump_joint:
+            d = {}
+            for j, p in enumerate(s.parts):
+                if p.joint is not None and p.joint.A:
+                    d[f"p{j}"] = np.stack(p.joint.A)
+                    d[f"p{j}_kind"] = np.array(p.joint.kind)
+                    d[f"p{j}_parent"] = np.array(p.parent)
+            np.savez(args.dump_joint, **d)
+            print(f"[replay] joint observations -> {args.dump_joint} "
+                  f"({len(d)//3} joints)")
         print(f"[replay] naive: {len(s.parts)} parts, splits {s.split_log}"
               + f", joint-tracked {getattr(s, 'joint_frames', 0)} part-frames"
               + (f", grown {getattr(s, 'grown', 0)}, carved "
