@@ -72,7 +72,7 @@ def report(reader, anchor, parts_gt, lab_gt, stream, pose_log, min_group=30):
     return out
 
 
-def joint_metrics(reader, parts_gt, stream, rows, frames):
+def joint_metrics(reader, parts_gt, stream, rows, log):
     """Axis error against a joint fitted to the mocap poses, and type accuracy.
 
     RBO's spec declares each joint's type but not its axis, so the reference axis
@@ -80,6 +80,13 @@ def joint_metrics(reader, parts_gt, stream, rows, frames):
     comparison is then against the mocap, not against our own tracking.
     Metrics follow ArtiPoint (Sturm-style): sign-agnostic axis angle in degrees
     and, for revolute, line-to-line distance.
+
+    BOTH axes are carried into the camera frame before they are compared. Our
+    axis lives in the parent part's anchor frame and the reference lives in the
+    mocap rigid body's own frame, and those two frames differ by an arbitrary
+    rotation, so dotting them directly measures nothing: it scored a median of
+    58 deg over RBO, which is what random gives. `log` supplies our part poses
+    at each evaluated frame, and the mocap pose supplies the other half.
     """
     from point2pose.pipeline.components.joint_model import JointModel
     of = {r["part"]: r["gt"] for r in rows}
@@ -97,7 +104,7 @@ def joint_metrics(reader, parts_gt, stream, rows, frames):
         if chi not in gt_type:
             continue
         ref = JointModel()
-        for i in frames:
+        for i, _ in log:
             Tp, Tc = reader.get_gt_pose(i, par), reader.get_gt_pose(i, chi)
             if Tp is None or Tc is None or not np.all(np.isfinite(Tp)) \
                     or not np.all(np.isfinite(Tc)):
@@ -105,16 +112,35 @@ def joint_metrics(reader, parts_gt, stream, rows, frames):
             ref.add(np.linalg.inv(Tp) @ Tc)
         if not ref.fit() or ref.axis is None:
             continue
-        ang = float(np.degrees(np.arccos(
-            np.clip(abs(float(np.dot(p.joint.axis, ref.axis))), -1, 1))))
-        d = None
-        if p.joint.kind == "revolute" and ref.kind == "revolute" \
-                and p.joint.point is not None and ref.point is not None:
-            w = np.cross(p.joint.axis, ref.axis)
-            nw = np.linalg.norm(w)
-            dv = ref.point - p.joint.point
-            d = float(abs(np.dot(dv, w / nw))) if nw > 1e-6 else \
-                float(np.linalg.norm(dv - np.dot(dv, ref.axis) * ref.axis))
+        # only frames whose part list is the final one: an index into an
+        # earlier, shorter list names a different part
+        angs, dists = [], []
+        for i, poses in log:
+            if poses is None or len(poses) != len(stream.parts):
+                continue
+            Op = poses[p.parent] if p.parent < len(poses) else None
+            Tp = reader.get_gt_pose(i, par)
+            if Op is None or Tp is None or not np.all(np.isfinite(Tp)):
+                continue
+            a = Op[:3, :3] @ p.joint.axis
+            b = Tp[:3, :3] @ ref.axis
+            angs.append(float(np.degrees(np.arccos(np.clip(
+                abs(float(a @ b)) / max(np.linalg.norm(a) * np.linalg.norm(b),
+                                        1e-9), -1, 1)))))
+            if p.joint.kind == "revolute" and ref.kind == "revolute" \
+                    and p.joint.point is not None and ref.point is not None:
+                pa = Op[:3, :3] @ p.joint.point + Op[:3, 3]
+                pb = Tp[:3, :3] @ ref.point + Tp[:3, 3]
+                w = np.cross(a, b)
+                nw = np.linalg.norm(w)
+                dv = pb - pa
+                dists.append(float(abs(np.dot(dv, w / nw))) if nw > 1e-6 else
+                             float(np.linalg.norm(dv - np.dot(dv, b) * b
+                                                  / max(b @ b, 1e-9))))
+        if not angs:
+            continue
+        ang = float(np.median(angs))
+        d = float(np.median(dists)) if dists else None
         out.append({"gt": chi, "kind": p.joint.kind, "ref_kind": ref.kind,
                     "spec_kind": gt_type.get(chi), "ang": ang, "dist": d})
     return out

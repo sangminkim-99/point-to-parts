@@ -32,7 +32,7 @@ def _naive_tail(s, cfg, args, r, a, gt):
                      min_group=cfg.min_part_pts)
     try:
         res["joints"] = _ev.joint_metrics(r, gt["parts"], s, res["rows"],
-                                          [f for f, _ in gt["log"]])
+                                          gt["log"])
     except Exception as exc:
         print(f"[eval] joint metrics unavailable ({exc})")
     print("[eval] " + _ev.fmt(_P(args.seq_dir).name, res, len(s.parts)))
@@ -519,7 +519,7 @@ def main():
                                     else cfg.min_group))
         try:
             res["joints"] = _ev.joint_metrics(r, gt["parts"], s, res["rows"],
-                                              [f for f, _ in gt["log"]])
+                                              gt["log"])
         except Exception as exc:
             print(f"[eval] joint metrics unavailable ({exc})")
         print("[eval] " + _ev.fmt(Path(args.seq_dir).name, res, len(s.parts)))

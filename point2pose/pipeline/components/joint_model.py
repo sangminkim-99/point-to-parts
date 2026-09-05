@@ -48,6 +48,14 @@ class JointModel:
         self.kind = None          # "revolute" | "prismatic"
         self.axis = None          # unit direction, parent frame
         self.point = None         # a point on the axis (revolute only)
+        # The fit works on the offset-free history A0^-1 A(t), so the axis it
+        # produces lives in the REST frame, not the parent's. Two drawers of
+        # one cabinet came out 51 deg apart as fitted and 0.9 deg apart once
+        # carried through A0. The public axis/point are therefore stored in
+        # the parent frame and these keep the fit's own frame for the
+        # kinematics, which are all expressed against A0 anyway.
+        self._axis0 = None
+        self._point0 = None
         self.A0 = None            # the relative transform at value 0
         self.conf = None          # dict from confidence(); None until fitted
         self.sigma = 0.003        # metres of observation noise, for the BIC
@@ -128,10 +136,13 @@ class JointModel:
     def _score(self, model, A):
         """Mean squared residual of a candidate over the offset-free history."""
         kind, axis, point = model
-        keep = (self.kind, self.axis, self.point, self.A0)
+        keep = (self.kind, self.axis, self.point, self.A0,
+                self._axis0, self._point0)
         self.kind, self.axis, self.point, self.A0 = kind, axis, point, None
+        self._axis0, self._point0 = axis, point
         r = float(np.mean([self.residual(a) ** 2 for a in A]))
-        self.kind, self.axis, self.point, self.A0 = keep
+        (self.kind, self.axis, self.point, self.A0,
+         self._axis0, self._point0) = keep
         return r
 
     @staticmethod
@@ -181,8 +192,10 @@ class JointModel:
         """
         if kind != "revolute" or self.geom is None or point is None:
             return 0.0
-        g = self.geom - np.asarray(point, dtype=np.float64)
-        a = np.asarray(axis, dtype=np.float64)
+        Rz = self.A0[:3, :3] if self.A0 is not None else np.eye(3)
+        tz = self.A0[:3, 3] if self.A0 is not None else np.zeros(3)
+        g = self.geom - (Rz @ np.asarray(point, dtype=np.float64) + tz)
+        a = Rz @ np.asarray(axis, dtype=np.float64)
         perp = g - np.outer(g @ a, a)
         return float(np.min(np.linalg.norm(perp, axis=1)))
 
@@ -272,7 +285,10 @@ class JointModel:
                          ("disconnected", np.array([0., 0., 1.]), np.zeros(3))))
         rows.sort(key=lambda x: x[0])
         self.bic = {m[0]: b for b, _, m in rows}
-        self.kind, self.axis, self.point = rows[0][2]
+        self.kind, self._axis0, self._point0 = rows[0][2]
+        Rz, tz = self.A0[:3, :3], self.A0[:3, 3]
+        self.axis = Rz @ self._axis0
+        self.point = (Rz @ self._point0 + tz) if self._point0 is not None else None
         self.axis_far = far_of.get(self.kind, 0.0)
         self._confidence(A, ang, t, rows)
         return True
@@ -294,7 +310,7 @@ class JointModel:
         type_p = float(w[0] / w.sum()) if w.size > 1 else 1.0
 
         # axis: the spread of the axis over bootstrap resamples of the history
-        keep = (self.kind, self.axis, self.point)
+        keep = (self.kind, self._axis0, self._point0)
         axes = []
         n = len(A)
         for _ in range(boots if n >= 6 else 0):
@@ -303,7 +319,7 @@ class JointModel:
                  else self._fit_prismatic(A[i], ang[i], t[i]))
             if m is not None:
                 axes.append(m[1] * np.sign(np.dot(m[1], keep[1]) or 1.0))
-        self.kind, self.axis, self.point = keep
+        self.kind, self._axis0, self._point0 = keep
         if len(axes) >= 4:
             V = np.stack(axes)
             mean = V.mean(0)
@@ -386,11 +402,14 @@ class JointModel:
         if self.kind in ("rigid", "disconnected"):
             return A
         if self.kind == "revolute":
-            Rm = R.from_rotvec(self.axis * value).as_matrix()
+            ax = self._axis0 if self._axis0 is not None else self.axis
+            pt = self._point0 if self._point0 is not None else self.point
+            Rm = R.from_rotvec(ax * value).as_matrix()
             A[:3, :3] = Rm
-            A[:3, 3] = self.point - Rm @ self.point
+            A[:3, 3] = pt - Rm @ pt
         elif self.kind == "prismatic":
-            A[:3, 3] = self.axis * value
+            A[:3, 3] = (self._axis0 if self._axis0 is not None
+                        else self.axis) * value
         return A
 
     def value_of(self, A):
@@ -398,11 +417,12 @@ class JointModel:
         A = np.asarray(A, dtype=np.float64)
         if self.A0 is not None:
             A = np.linalg.inv(self.A0) @ A
+        ax = self._axis0 if self._axis0 is not None else self.axis
         if self.kind == "revolute":
             rv = R.from_matrix(A[:3, :3]).as_rotvec()
-            return float(rv @ self.axis)
+            return float(rv @ ax)
         if self.kind == "prismatic":
-            return float(A[:3, 3] @ self.axis)
+            return float(A[:3, 3] @ ax)
         return 0.0        # rigid and unfitted both have no configuration
 
     def residual(self, A):
