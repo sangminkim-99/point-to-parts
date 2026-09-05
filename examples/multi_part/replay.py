@@ -117,6 +117,10 @@ def main():
     ap.add_argument("--occlude", default=None,
                     help="START:END:FRAC -- hide FRAC of the object's bounding "
                          "box (depth and mask) between those frames")
+    ap.add_argument("--no-eval", action="store_true",
+                    help="skip the ground-truth scoring; the frame rate is "
+                         "only honest without it, since labelling renders a "
+                         "GT part-index map on the frames that add tracks")
     ap.add_argument("--dump-joint", default=None,
                     help="npz of every joint's relative-pose stack, for analysis")
     ap.add_argument("--urdf", default=None,
@@ -318,7 +322,8 @@ def main():
 
     # ground truth, when the reader has it
     gt = None
-    if not rec_mode and hasattr(r, "render_part_index_map"):
+    if not rec_mode and not args.no_eval \
+            and hasattr(r, "render_part_index_map"):
         try:
             from examples.multi_part import evaluate as _ev
             lab = (_ev.gt_labels_at(r, a, s.pts0) if args.method == "naive"
