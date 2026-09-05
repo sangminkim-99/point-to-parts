@@ -30,6 +30,11 @@ key_view: true
 key_angle_deg: 15.0
 min_live: 24
 reseed_min_region: 200
+hist_max: 600
+root_min_obs: 20
+root_window: 90
+root_margin: 0.6
+reroot: false
 mask_jump: 0.15
 mask_slope_deg: 85.0
 reseed_points: 24

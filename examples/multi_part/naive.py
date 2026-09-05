@@ -181,6 +181,11 @@ class NaiveConfig:
     top_up: bool = True
     min_live: int = 24                  # per part, before new points are sought
     reseed_min_region: int = 200   # px of its own before a part may re-seed
+    hist_max: int = 600            # poses kept per part, for re-rooting
+    root_min_obs: int = 20         # shared frames before the base is judged
+    root_window: int = 90          # shared frames the spread is read over
+    root_margin: float = 0.6       # a new base must be this much stiller
+    reroot: bool = False           # pick the base from the poses, not index 0
     mask_jump: float = 0.15        # metres behind the local surface; 0 = slope rule
     mask_slope_deg: float = 85.0   # steepest surface kept, when mask_jump is 0
     reseed_points: int = 24             # how many to add each time
@@ -280,6 +285,8 @@ class NaivePart:
     _last_seen: object = None           # last measured positions, for the gate
     _last_sel: object = None
     _last_pose: object = None           # for the rotation the band allows for
+    hist: object = None                 # [(frame, pose, resid)], its own path
+    joint_upto: int = -1                # last frame already in the joint
     t_lo: object = None                 # corner of the box this part's origin
     t_hi: object = None                 # has visited, in the camera
     #   The base of an articulated object is the part everything else moves
@@ -408,6 +415,8 @@ class NaivePartTracker:
                     self.last_split = i
                     break
 
+        if cfg.reroot and len(self.parts) > 1:
+            self._reparent()
         for j, p in enumerate(self.parts):
             if p.joint is None or j == p.parent or p.parent >= len(self.parts):
                 continue
@@ -423,8 +432,10 @@ class NaivePartTracker:
                 # rotation is only as well determined as the lever arm allows
                 p.joint.sigma_r_floor = max(
                     self._rot_floor(p), self._rot_floor(self.parts[p.parent]))
-                A = np.linalg.inv(self.parts[p.parent].pose) @ p.pose
-                p.joint.add(A)
+                if i > p.joint_upto:        # the rebuild may already hold it
+                    p.joint.add(np.linalg.inv(self.parts[p.parent].pose)
+                                @ p.pose)
+                    p.joint_upto = i
                 if p.joint.kind is None or len(p.joint.A) % 4 == 0:
                     if p.joint.fit():
                         self._note_controllable(j, p, i)
@@ -705,6 +716,11 @@ class NaivePartTracker:
         t = T_free[:3, 3]
         part.t_lo = t.copy() if part.t_lo is None else np.minimum(part.t_lo, t)
         part.t_hi = t.copy() if part.t_hi is None else np.maximum(part.t_hi, t)
+        if part.hist is None:
+            part.hist = []
+        part.hist.append((self.n - 1, T_free.copy(), None))
+        if len(part.hist) > self.cfg.hist_max:
+            del part.hist[:len(part.hist) - self.cfg.hist_max]
         part.pose = T_free
         jf = self._fit_joint(part, sel, cur)
         if jf is not None and jf[1] <= max(float(np.median(d)), 1e-4) * cfg.joint_tol:
@@ -717,6 +733,9 @@ class NaivePartTracker:
         else:
             part.on_joint = False
         part.resid = float(np.median(d))
+        if part.hist:                   # stamp the frame we just appended
+            n_, T_, _ = part.hist[-1]
+            part.hist[-1] = (n_, T_, part.resid)
         # the inlier half of the residuals IS the sensor noise on this surface
         inl = d[d <= max(np.median(d), 1e-4) * 2.0]
         sig = 1.4826 * float(np.median(np.abs(inl - np.median(inl)))) if inl.size \
@@ -1028,26 +1047,100 @@ class NaivePartTracker:
         self.merged_total = getattr(self, "merged_total", 0) + len(gone)
         return len(gone)
 
-    def _reparent(self):
-        """Part 0 is the root; every other part hangs off it.
+    def _new_joint(self):
+        jm = JointModel()
+        jm.allow_free = self.cfg.allow_free
+        jm.axis_prior = self.cfg.axis_prior
+        jm.axis_max = self.cfg.axis_max
+        jm.min_angle = np.radians(self.cfg.revolute_min_deg)
+        return jm
 
-        Part 0 used to take part 1 as ITS parent so that a two-part object
-        gave both sides a joint, but that makes the pair a two-cycle: the same
-        relative motion is fitted twice, in opposite directions, with
-        different rest offsets and different geometry, and the two fits
-        disagree -- on lift01 the same pair came out revolute one way (axis 33
-        cm off the object) and prismatic the other. One relation, one joint.
+    def _spread(self, p):
+        """Size of the box this part's origin has visited, in the camera."""
+        if p.t_lo is None or p.t_hi is None:
+            return float("inf")
+        return float(np.linalg.norm(p.t_hi - p.t_lo))
+
+    def _pick_root(self):
+        """The base is the part that went nowhere, and we have every pose.
+
+        Part 0 used to be the root because it existed first, which on a
+        cabinet is often a drawer. Everything else was then measured against a
+        part that was itself moving, so one drawer's motion was written into
+        the other's joint. Since each part carries its own pose on every frame
+        there is nothing to guess: the base is the part whose origin visited
+        the smallest box. It has to be the box and not the path length --
+        summing |dt| integrates the tracking noise, and measured on
+        ikeasmall02 that ranked the static body above a barely-opened drawer,
+        while the box separates them at 4, 12 and 113 mm.
         """
+        cfg = self.cfg
+        cur = getattr(self, "root", 0)
+        if len(self.parts) < 2 or not cfg.reroot:
+            return 0
+        # Over the window every part shares, never over each part's own life.
+        # A part that has just been split off has barely moved because it has
+        # barely existed, so on its own history it looks like the most static
+        # thing in the scene and takes the root away from a joint with 83
+        # observations behind it -- measured on ikeasmall02, where the root
+        # flipped at the second split and flipped back eight frames later,
+        # destroying that joint and leaving one fitted to eight frames.
+        common = None
+        for p in self.parts:
+            if not p.hist:
+                return cur
+            f = {n for n, _, _ in p.hist}
+            common = f if common is None else (common & f)
+        if common is None or len(common) < cfg.root_min_obs:
+            return cur
+        win = set(sorted(common)[-cfg.root_window:])
+        sp = []
+        for p in self.parts:
+            t = np.array([T[:3, 3] for n, T, _ in p.hist if n in win])
+            sp.append(float(np.linalg.norm(t.max(0) - t.min(0))) if len(t)
+                      else float("inf"))
+        best = int(np.argmin(sp))
+        if best == cur:
+            return cur
+        # and only when it is clearly better, so the root cannot oscillate
+        return best if sp[best] < cfg.root_margin * sp[cur] else cur
+
+    def _reparent(self):
+        """One relation, one joint, all of them against the measured base.
+
+        A joint is nothing but inv(T_parent) @ T_child over time, and both
+        poses are already stored, so the joint for ANY pair can be built on
+        demand. That removes the star topology's cost: nothing has to be
+        inverted, chained through a third part, or re-fitted in the export,
+        and no part's motion leaks into another part's joint.
+        """
+        r = self._pick_root()
+        self.root = r
         for k, p in enumerate(self.parts):
-            p.parent = 0
-            if k == 0:
-                p.joint = None          # the root has nothing to hinge on
-            elif p.joint is None:
-                p.joint = JointModel()
-                p.joint.allow_free = self.cfg.allow_free
-                p.joint.axis_prior = self.cfg.axis_prior
-                p.joint.axis_max = self.cfg.axis_max
-                p.joint.min_angle = np.radians(self.cfg.revolute_min_deg)
+            was, p.parent = getattr(p, "parent", 0), r
+            if k == r:
+                p.joint = None          # the base has nothing to hinge on
+            elif p.joint is None or was != r:
+                p.joint = self._new_joint()
+                self._rebuild_joint(k)
+
+    def _rebuild_joint(self, k):
+        """Fill a joint from the two parts' own histories, on shared frames."""
+        p, par = self.parts[k], self.parts[self.root]
+        if not p.hist or not par.hist:
+            return
+        # the same gate the incremental path uses: a frame whose pose the part
+        # did not trust never entered the joint, and must not enter it now
+        g = self.cfg.joint_gate
+        pp = {n: T for n, T, r in par.hist if r is None or r < g}
+        p.joint_upto = -1
+        for n, T, r in p.hist:
+            if r is not None and r >= g:
+                continue
+            Tp = pp.get(n)
+            if Tp is not None:
+                p.joint.add(np.linalg.inv(Tp) @ T)
+                p.joint_upto = n
 
     def _cohort_split(self, groups):
         """True when the two groups are just two different seeding batches."""
