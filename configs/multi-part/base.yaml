@@ -4,7 +4,7 @@
 # `extends: base.yaml` and override only what they change.
 
 # ---- frontend ----
-n_points: 100
+n_points: 200
 sampler: 'super_point_balanced'
 sampler_cell: -1
 sampler_nms: 0.0

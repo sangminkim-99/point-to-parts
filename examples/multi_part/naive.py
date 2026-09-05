@@ -28,7 +28,14 @@ def lift(pts2d, depth, K):
 
 @dataclass
 class NaiveConfig:
-    n_points: int = 100
+    n_points: int = 200
+    #   Measured over all 81 RBO sequences, 100 against 200: the axis error
+    #   halves (26.9 -> 11.5 deg median, 42 -> 58% inside 15 deg) and nine
+    #   more joints become scorable at all, while part count, coverage,
+    #   purity, pose and time-to-controllable all improve and the cost is 3%
+    #   of the frame rate. A textureless moving part is the reason -- a
+    #   laptop lid is half the object's area and takes 19% of 100 points but
+    #   34% of 200, and a part with no points on it cannot be found.
     # pipeline_test2.yaml's svd_residual_outlier values. They were being
     # injected from the dense Config at construction while this file declared
     # something else, so every measurement ran on 0.01 and 50 -- and the first
