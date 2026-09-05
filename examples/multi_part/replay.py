@@ -359,6 +359,36 @@ def main():
         if gt is not None and s.parts:
             gt["log"].append((int(i), [None if p.pose is None else p.pose.copy()
                                        for p in s.parts]))
+            # Label every track, not only the ones sampled at the anchor. A
+            # sequence whose first frame is too dark or too small to yield
+            # keypoints starts with a handful of points and recovers by
+            # re-seeding -- cabinet04 begins with 6 and ends with 246 across
+            # three parts -- and scoring it on the initial six reported 0%
+            # purity for a run that had in fact found the parts.
+            #
+            # A track cannot be labelled in the step that creates it: the
+            # re-seed happens after cur_tracks_2d is set, so the new entries
+            # are not in it yet. Each frame therefore labels whatever is
+            # still unlabelled and now has a position, for a few frames after
+            # birth -- long enough to survive one occluded frame, short
+            # enough that the label still describes where the track started.
+            if args.method == "naive":
+                try:
+                    born = np.asarray(s.track_born)
+                    if len(born) > len(gt["lab"]):
+                        gt["lab"] = np.concatenate(
+                            [gt["lab"], np.full(len(born) - len(gt["lab"]),
+                                                -1, np.int32)])
+                    t2 = s.cur_tracks_2d
+                    if t2 is not None:
+                        t2 = np.asarray(t2)
+                        k = np.where((gt["lab"][:len(t2)] < 0)
+                                     & (born[:len(t2)] > 0)
+                                     & (s.n - born[:len(t2)] <= 3))[0]
+                        if k.size:
+                            gt["lab"][k] = _ev.gt_labels_at(r, int(i), t2[k])
+                except Exception as exc:
+                    print(f"[replay] track labelling failed ({exc})")
 
         vis = s.render(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy(),
                        style=(args.vis if args.method == 'naive' else 'clean'))

@@ -89,6 +89,7 @@ joint_grid: 61
 joint_conf: 0.6
 joint_exc: 0.5
 axis_prior: 0.2
+axis_max: 0.0
 allow_free: false
 merge_rigid: true
 merge_every: 10

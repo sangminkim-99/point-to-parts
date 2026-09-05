@@ -70,6 +70,17 @@ class JointModel:
         self.sigma_r_floor = 0.0
         self.geom = None          # parent+child points in the parent frame
         self.axis_prior = 0.5     # x the object radius; 0 disables
+        # A hard veto on top of that soft prior. Measured over RBO: of 45
+        # scored joints, the 36 typed correctly have a median axis error of
+        # 9.3 deg and the 9 mistyped have 80.6 deg -- and 8 of those 9 are
+        # the same mistake, a slide called a hinge. That hinge is always a
+        # revolute of enormous radius, whose axis sits half a metre off the
+        # object (47.8 cm on cabinet12), and a quadratic penalty does not
+        # stop it because enough observations outvote any fixed prior. An
+        # axis farther from the object than this multiple of the object's own
+        # radius is not a hinge, so the candidate is dropped and prismatic
+        # wins on its own merits. 0 disables.
+        self.axis_max = 0.0
         # Free 6-DoF as a candidate. Measured: it never won on RBO when the
         # residual was in metres, and once the residual was put in units of
         # noise it started beating REAL joints at two degrees of pose jitter,
@@ -272,9 +283,14 @@ class JointModel:
         scale = (float(np.percentile(
             np.linalg.norm(self.geom - self.geom.mean(0), axis=1), 90))
             if self.geom is not None and len(self.geom) else 0.0)
-        rows, far_of = [], {}
+        rows, far_of, vetoed = [], {}, []
         for m in cands:
             far = self._axis_distance(m[0], m[1], m[2])
+            if (self.axis_max > 0 and scale > 0 and m[0] == "revolute"
+                    and far > self.axis_max * scale
+                    and any(c[0] != "revolute" for c in cands)):
+                vetoed.append(m[0])     # a hinge that far away is not a hinge
+                continue
             pen = (far / max(self.axis_prior * max(scale, 1e-3), 1e-6)) ** 2 \
                 if (self.axis_prior > 0 and scale > 0) else 0.0
             rows.append((self._bic(m[0], mses[m[0]], n, self.sigma_eff) + pen,

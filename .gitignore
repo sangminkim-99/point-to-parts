@@ -221,3 +221,4 @@ __marimo__/
 .ini
 # large experiment outputs (videos, figures, reports)
 debug/
+results/
