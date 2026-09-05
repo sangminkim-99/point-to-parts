@@ -9,8 +9,18 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
-def part_mesh(points, colors=None, depth=8, trim=0.02, voxel=0.004):
-    """Poisson surface from a part's Gaussian centres, low-density faces cut."""
+def part_mesh(points, colors=None, depth=8, trim=0.20, voxel=0.004,
+              margin=0.01):
+    """Poisson surface from a part's Gaussian centres, low-density faces cut.
+
+    Poisson closes an open cloud by inventing surface where it has no evidence,
+    and the invention is outward. Measured on ikeasmall02, trimming only the
+    bottom 2% of density left meshes up to 1.85x the true extent of their own
+    points -- a drawer whose collision mesh was larger than the cabinet it
+    slides in. Trimming the bottom 20% and then cropping to the points' own
+    bounds brings every part to within 10% of its true size and still keeps
+    three quarters of the triangles.
+    """
     import open3d as o3d
     pc = o3d.geometry.PointCloud()
     pc.points = o3d.utility.Vector3dVector(np.asarray(points, np.float64))
@@ -27,6 +37,12 @@ def part_mesh(points, colors=None, depth=8, trim=0.02, voxel=0.004):
     d = np.asarray(dens)
     if d.size:
         mesh.remove_vertices_by_mask(d < np.quantile(d, trim))
+    # Poisson may still bulge past the evidence; the points bound the part.
+    if margin >= 0:
+        q = np.asarray(pc.points)
+        box = o3d.geometry.AxisAlignedBoundingBox(q.min(0) - margin,
+                                                  q.max(0) + margin)
+        mesh = mesh.crop(box)
     mesh.compute_vertex_normals()
     return mesh if len(mesh.triangles) else None
 

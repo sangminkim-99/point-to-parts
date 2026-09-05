@@ -142,23 +142,46 @@ def sample_superpoint(sampler, rgb, depth, mask, K, n, min_px=20000,
     return pts
 
 
-def clean_mask(mask, depth, jump=0.15, win=7, min_frac=0.02):
+def clean_mask(mask, depth, K=None, slope_deg=85.0, noise=0.005,
+               jump=0.0, win=7, min_frac=0.02):
     """Drop mask pixels that sit well BEHIND the object's local surface.
 
     A propagated mask leaks background at the silhouette, and the leak is always
     behind. A symmetric depth-span test also deletes the object's own edge,
     which on a live sensor eats enough of the mask that the poses stop updating
     and the model is drawn at its old place over a moving image.
+
+    The tolerance is local, not a fixed number of metres. What may legitimately
+    change across the window is set by the window's own footprint at that depth
+    times the steepest surface slope worth keeping, plus the sensor's noise --
+    all of which the camera tells us. The 0.15 m constant this replaces was one
+    to two orders of magnitude larger than the leak it was meant to catch:
+    measured at the silhouette on RBO, the background sits a median of 2 to 6
+    MILLIMETRES behind the object, because these objects stand against a wall
+    or on a table.
+
+    Which is the honest limit of this filter. Most silhouette leak is not
+    depth-separable at all, and only the part that falls on genuinely distant
+    background can go -- 23% of it on cabinet01, 0% on pliers01. What removes
+    the rest is downstream: a point left on the static table does not move with
+    the object and fails the rigid fit. So this stays conservative, keeping 97
+    to 100% of the true mask on every RBO class, and is not asked to do more.
     """
     import cv2
     m = (mask > 0) & (depth > 0)
-    if jump <= 0 or not m.any():
+    if not m.any() or (jump <= 0 and K is None):
         return m.astype(np.uint8) * 255
     # nearest masked surface within `win`: erosion of depth is a min filter, and
     # unmasked pixels are pushed to +inf so they cannot win it
     big = np.where(m, depth, np.float32(1e3)).astype(np.float32)
     near = cv2.erode(big, np.ones((win, win), np.uint8))
-    out = m & (depth <= near + jump)
+    if jump > 0:
+        tol = jump                      # caller pinned an absolute tolerance
+    else:
+        # the window's radius in metres at the depth it is looking at
+        rad = (win // 2) * near / float(np.asarray(K)[0, 0])
+        tol = rad * np.tan(np.radians(slope_deg)) + noise
+    out = m & (depth <= near + tol)
     if out.sum() < 0.5 * m.sum():       # the object really is that deep
         return m.astype(np.uint8) * 255
     # Keep every component that is a real share of the object, not just the
@@ -364,7 +387,8 @@ class StreamingPartDiscovery:
         cfg = self.cfg
         H, W = depth.shape
         self.H, self.W = H, W
-        mask = clean_mask(mask, depth, cfg.mask_depth_jump, cfg.mask_win)
+        mask = clean_mask(mask, depth, K=self.K, jump=cfg.mask_depth_jump,
+                          win=cfg.mask_win)
 
         # a thin object at a fixed stride yields a few hundred gaussians, and
         # then nothing is ever decisively assigned
@@ -407,7 +431,8 @@ class StreamingPartDiscovery:
         i = self.n
         self.n += 1
         cfg = self.cfg
-        mask = clean_mask(mask, depth, cfg.mask_depth_jump, cfg.mask_win)
+        mask = clean_mask(mask, depth, K=self.K, jump=cfg.mask_depth_jump,
+                          win=cfg.mask_win)
 
         tracks, _, vis = self.tracker.track_once(
             Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K))

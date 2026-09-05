@@ -270,7 +270,7 @@ class LiveAcquire:
                         ov[self.preview_mask > 0] = (60, 200, 60)
                         disp = cv2.addWeighted(disp, 1.0, ov, 0.4, 0)
                         # what the tracker will actually use, after depth cleaning
-                        cm = clean_mask(self.preview_mask, depth) > 0
+                        cm = clean_mask(self.preview_mask, depth, K=self.K) > 0
                         e = cv2.morphologyEx(cm.astype(np.uint8),
                                              cv2.MORPH_GRADIENT,
                                              np.ones((3, 3), np.uint8))
@@ -312,7 +312,7 @@ class LiveAcquire:
                     shown = (getattr(self.stream, "mask", None)
                              if self.started else
                              (None if self.preview_mask is None else
-                              clean_mask(self.preview_mask, depth)))
+                              clean_mask(self.preview_mask, depth, K=self.K)))
                     cv2.imshow("depth", self._depth_view(depth, shown))
                 elif self._depth_open:
                     cv2.destroyWindow("depth")

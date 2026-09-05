@@ -306,7 +306,7 @@ class NaivePartTracker:
         from point2pose.data_types.frame import Frame
         from examples.multi_part.streaming import (build_sampler,
                                                    sample_superpoint, clean_mask)
-        mask = clean_mask(mask, depth)
+        mask = clean_mask(mask, depth, K=self.K)
         self.mask = mask
         self.sampler = build_sampler(self.cfg)
         pts0 = sample_superpoint(self.sampler, rgb, depth, mask, self.K,
@@ -349,7 +349,7 @@ class NaivePartTracker:
         # one mask for the whole frame: the gate, the re-seeding and the viewer
         # were each using a different one, so a track could be judged on-object
         # against pixels the sampler had already discarded
-        mask = clean_mask(mask, depth)
+        mask = clean_mask(mask, depth, K=self.K)
         self.mask = mask
 
         tracks, unc, vis = self.tracker.track_once(

@@ -3,4 +3,8 @@
 extends: base.yaml
 
 n_points: 200
-sampler: uniform_fps
+# uniform_fps was measured against super_point_balanced over the never-splitting
+# RBO sequences: it appears to fix four of seventeen by part count, but the GT
+# parts actually covered stay at 17 of 34 and purity falls 76 -> 65%. Two real
+# wins out of seventeen, so the base sampler stands.
+sampler: super_point_balanced

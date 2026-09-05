@@ -199,7 +199,7 @@ class RealSenseMultiPart:
                         # the depth-cleaned one, so show that outline too
                         try:
                             from examples.multi_part.streaming import clean_mask
-                            cm = clean_mask(self.preview_mask, depth) > 0
+                            cm = clean_mask(self.preview_mask, depth, K=self.K) > 0
                             e = cv2.morphologyEx(cm.astype(np.uint8),
                                                  cv2.MORPH_GRADIENT,
                                                  np.ones((3, 3), np.uint8))
