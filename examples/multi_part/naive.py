@@ -124,6 +124,7 @@ class NaiveConfig:
     # it does not. Real hinges sit 0-4 cm from the surface and pay nothing.
     axis_prior: float = 0.2             # x the object radius; 0 disables
     axis_max: float = 0.0               # hard veto: no hinge this far off
+    revolute_min_deg: float = 1.5       # arc a revolute must show to be offered
     allow_free: bool = False            # admit a 6-DoF "disconnected" model
     #   A part that is lifted OFF its parent -- a ring taken off its post, a
     #   lid carried away -- has no joint at all, and with only rigid,
@@ -402,6 +403,7 @@ class NaivePartTracker:
                 p.joint.sigma = max(p.sigma, self.parts[p.parent].sigma)
                 p.joint.axis_prior = cfg.axis_prior
                 p.joint.axis_max = cfg.axis_max
+                p.joint.min_angle = np.radians(cfg.revolute_min_deg)
                 p.joint.allow_free = cfg.allow_free
                 p.joint.geom = self._joint_geom(j, p)
                 # rotation is only as well determined as the lever arm allows
@@ -1028,6 +1030,7 @@ class NaivePartTracker:
                 p.joint.allow_free = self.cfg.allow_free
                 p.joint.axis_prior = self.cfg.axis_prior
                 p.joint.axis_max = self.cfg.axis_max
+                p.joint.min_angle = np.radians(self.cfg.revolute_min_deg)
 
     def _cohort_split(self, groups):
         """True when the two groups are just two different seeding batches."""

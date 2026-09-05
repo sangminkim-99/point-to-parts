@@ -252,6 +252,13 @@ class JointModel:
         # handful of points fits no 1-DoF manifold, so rigid wins on BIC even
         # though the parts appear to move.
         cands = [("rigid", np.array([0., 0., 1.]), np.zeros(3))]
+        # A revolute needs an ARC, not a wobble. Sturm's degeneracy runs both
+        # ways: a straight line is a huge revolute arc, and a dozen degrees of
+        # apparent rotation on a noisy pose is a line. Every mistyped joint
+        # measured on RBO -- a slide called a hinge, 8 of 9 errors -- was
+        # fitted to 6 to 16 degrees, while the drawers typed correctly were
+        # watched over 225 mm. Below this the revolute is not offered at all
+        # and prismatic has to win on its own.
         if ang.max() >= self.min_angle:
             m = self._fit_revolute(A, ang, t)
             if m is not None:
