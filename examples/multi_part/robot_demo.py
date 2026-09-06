@@ -102,6 +102,103 @@ def solve_path(robot, targets, link_index, smooth=2.0, rest_w=0.01):
 
 
 
+def _link_clouds(urdf, stride=3):
+    """Vertices per geometry node, in that node's own frame."""
+    out = []
+    for node in urdf.scene.graph.nodes_geometry:
+        name = urdf.scene.graph[node][1]
+        m = urdf.scene.geometry.get(name)
+        if m is None or not hasattr(m, "vertices"):
+            continue
+        out.append((node, np.asarray(m.vertices, np.float64)[::stride]))
+    return out
+
+
+def render_sweep(args, robot, urdf, base, cfgs, qs, k, joints, root,
+                 geoms, rest, centre, radius, grip, ee_i, err=None):
+    """The sweep as a video: the object articulating and the arm following.
+
+    Drawn by projecting and splatting, the same way urdf_view does, because a
+    headless GL context on this machine returns a frame that is not what the
+    viewer shows.
+    """
+    import cv2
+    W, H = args.size
+    clouds = _link_clouds(urdf)
+    # a viewpoint that frames the arm and the object together
+    tgt = np.array([-0.35, 0.0, 0.0])
+    eye = tgt + np.array([0.75, -0.95, -1.45])
+    fwd = tgt - eye; fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, [0, -1, 0]); right /= np.linalg.norm(right)
+    Rc = np.stack([right, np.cross(right, fwd), fwd])
+    f = 1.25 * max(W, H)
+
+    def project(v):
+        c = Rc @ (v - eye).T
+        z = c[2]
+        ok = z > 1e-3
+        return (np.stack([f * c[0][ok] / z[ok] + W / 2,
+                          f * c[1][ok] / z[ok] + H / 2], 1), z[ok])
+
+    def splat(img, P, D, colour):
+        keep = (P[:, 0] > -10) & (P[:, 0] < W + 10) & \
+               (P[:, 1] > -10) & (P[:, 1] < H + 10)
+        return P[keep], D[keep], np.full(int(keep.sum()), colour)
+
+    writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"),
+                             args.fps, (W, H))
+    order = list(range(len(qs))) + list(range(len(qs) - 1, -1, -1))
+    for step, i in enumerate(order):
+        img = np.full((H, W, 3), (24, 27, 31), np.uint8)
+        P, D, C = [], [], []
+        # the object, at this joint value
+        full = np.zeros(len(joints)); full[k] = qs[i]
+        pose = link_poses(joints, root, full)
+        for li, n in enumerate(geoms):
+            T = pose.get(n, np.eye(4))
+            v = (rest[n] - centre) @ T[:3, :3].T + T[:3, 3]
+            p, d = project(v)
+            a, b, c = splat(img, p, d, li)
+            P.append(a); D.append(b); C.append(c)
+        # the arm, at the configuration solved for it
+        urdf.update_cfg(np.asarray(cfgs[i]))
+        for node, verts in clouds:
+            T = urdf.scene.graph[node][0]
+            v = verts @ np.asarray(T)[:3, :3].T + np.asarray(T)[:3, 3] + base
+            p, d = project(v)
+            a, b, c = splat(img, p, d, 99)
+            P.append(a); D.append(b); C.append(c)
+        P = np.concatenate(P); D = np.concatenate(D); C = np.concatenate(C)
+        o = np.argsort(-D)
+        P, D, C = P[o], D[o], C[o]
+        lo, hi = D.min(), D.max()
+        sh = 1.15 - 0.5 * (D - lo) / max(hi - lo, 1e-6)
+        for (x, y), s_, ci in zip(P.astype(int), sh, C):
+            col = (0.72, 0.74, 0.78) if ci == 99 else PAL[int(ci) % len(PAL)]
+            b_, g_, r_ = col[::-1]
+            cv2.circle(img, (x, y), 2, (int(255 * min(b_ * s_, 1)),
+                                        int(255 * min(g_ * s_, 1)),
+                                        int(255 * min(r_ * s_, 1))), -1)
+        # the point the robot is holding
+        p, d = project(grip[i][None])
+        if len(p):
+            cv2.circle(img, tuple(p[0].astype(int)), 6, (20, 20, 20), -1, cv2.LINE_AA)
+            cv2.circle(img, tuple(p[0].astype(int)), 4, (120, 240, 250), -1, cv2.LINE_AA)
+        j = joints[k]
+        unit = ("deg", np.degrees(qs[i])) if j["type"] == "revolute" \
+            else ("mm", qs[i] * 1000)
+        cv2.rectangle(img, (0, H - 34), (W, H), (16, 18, 21), -1)
+        cap = (f"{j['name']}  {j['type']}   q = {unit[1]:+.1f} {unit[0]}"
+               f"   |  root {root} held fixed"
+               + (f"   |  reach error {1000 * err[i]:.1f} mm"
+                  if err is not None else ""))
+        cv2.putText(img, cap, (12, H - 11), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (228, 228, 228), 1, cv2.LINE_AA)
+        writer.write(img)
+    writer.release()
+    print(f"[robot] wrote {args.out} ({len(order)} frames)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("urdf", help="the object URDF written by --urdf")
@@ -112,6 +209,10 @@ def main():
     ap.add_argument("--no-serve", action="store_true",
                     help="solve and report, without starting the viewer")
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--out", default=None,
+                    help="write the sweep as an mp4 instead of serving it")
+    ap.add_argument("--size", type=int, nargs=2, default=[960, 720])
+    ap.add_argument("--fps", type=int, default=20)
     args = ap.parse_args()
 
     import open3d as o3d
@@ -185,6 +286,11 @@ def main():
     step = np.abs(np.diff(cfgs, axis=0)).max(axis=1)
     print(f"[robot] largest joint step between waypoints: "
           f"{np.degrees(step.max()):.1f} deg")
+    if args.out:
+        render_sweep(args, robot, robot_urdf, base, cfgs, qs, k,
+                     joints, root, geoms, rest, centre, radius, grip, ee_i,
+                     err)
+        return
     if args.no_serve:
         return
 
