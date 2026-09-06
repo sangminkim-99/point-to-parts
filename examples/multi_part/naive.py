@@ -181,7 +181,8 @@ class NaiveConfig:
     top_up: bool = True
     min_live: int = 24                  # per part, before new points are sought
     reseed_min_region: int = 200   # px of its own before a part may re-seed
-    hist_max: int = 600            # poses kept per part, for re-rooting
+    hist_max: int = 600            # poses and frames kept, for re-rooting
+    retro: bool = True             # give a new part its own past at birth
     root_min_obs: int = 20         # shared frames before the base is judged
     root_window: int = 90          # shared frames the spread is read over
     root_margin: float = 0.6       # a new base must be this much stiller
@@ -390,6 +391,19 @@ class NaivePartTracker:
             cur_ok = cur_ok & self._on_object(tracks, mask)
         self.cur = (cur, cur_ok, vis)
         self.cur_tracks_2d = tracks
+        if cfg.retro:
+            # The split fires BECAUSE of motion, so by the time it fires the
+            # motion is over: on ikeasmall02 the drawer travelled 113 mm before
+            # frame 105 and 12 mm after it, and the joint born at the split saw
+            # only the 12. Keeping the lifted tracks lets a new part recompute
+            # its OWN past pose from its OWN points, which is causal -- it uses
+            # nothing but frames already seen -- and gives the joint the motion
+            # that created it. 200 points over 600 frames is about 3 MB.
+            self.frames = getattr(self, "frames", [])
+            self.frames.append((i, cur.astype(np.float32),
+                                cur_ok.copy(), vis.copy()))
+            if len(self.frames) > cfg.hist_max:
+                del self.frames[:len(self.frames) - cfg.hist_max]
         t_track = time.perf_counter()
 
         for p in self.parts:
@@ -1040,12 +1054,50 @@ class NaivePartTracker:
         if not gone:
             return 0
         for j in sorted(gone, reverse=True):
+            # The gaussians carry a part index, and a merge renumbers the
+            # parts. Splits already hand the labels over; merges did not, so a
+            # gaussian kept pointing at a part that no longer existed and the
+            # label refiner indexed past the end of its own array.
+            if self.model is not None:
+                lb = self.model.labels
+                par = self.parts[j].parent
+                lb[lb == j] = par if par < j else max(par - 1, 0)
+                lb[lb > j] -= 1
             self.parts.pop(j)
         self._reparent()
         if len(self.parts) < 2:
             self.state = self.RIGID
         self.merged_total = getattr(self, "merged_total", 0) + len(gone)
         return len(gone)
+
+    def _retro_hist(self, part):
+        """A part's pose on every past frame, from its own points.
+
+        One RANSAC per stored frame, done once when the part is born. The
+        points were tracked from the beginning; only the grouping is new.
+        """
+        cfg = self.cfg
+        out = []
+        idx0 = part.idx[part.idx < len(self.anchor_ok)]
+        idx0 = idx0[self.anchor_ok[idx0]]
+        if idx0.size < cfg.min_inliers or self.reg is None:
+            return None
+        P0 = self.anchor_xyz[idx0]
+        for n, cur, ok, vis in getattr(self, "frames", []):
+            sel = idx0[(idx0 < len(ok)) & (idx0 < len(vis))]
+            m = ok[sel] & vis[sel]
+            if m.sum() < cfg.min_inliers:
+                continue
+            g = sel[m]
+            c = self.reg._RANSAC(p0=self.anchor_xyz[g], tgt_pcd=cur[g], w=None,
+                                 remaining=np.ones(g.size, bool), init_pose=None)
+            if c is None:
+                continue
+            T = np.asarray(c["T"])
+            d = np.linalg.norm(self.anchor_xyz[g] @ T[:3, :3].T + T[:3, 3]
+                               - cur[g], axis=1)
+            out.append((n, T, float(np.median(d))))
+        return out or None
 
     def _new_joint(self):
         jm = JointModel()
@@ -1387,6 +1439,13 @@ class NaivePartTracker:
         all_idx = np.concatenate([np.asarray(g) for g in groups])
         self.co_same[np.ix_(all_idx, all_idx)] = 0.0
         self.co_seen[np.ix_(all_idx, all_idx)] = 0.0
+        if self.cfg.retro:
+            for p in new:
+                h = self._retro_hist(p)
+                if h:
+                    p.hist = h
+                    p.t_lo = np.min([T[:3, 3] for _, T, _ in h], axis=0)
+                    p.t_hi = np.max([T[:3, 3] for _, T, _ in h], axis=0)
         self.parts[j:j + 1] = new
         self._reparent()
         if self.model is not None:

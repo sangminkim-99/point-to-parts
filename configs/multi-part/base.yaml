@@ -31,6 +31,7 @@ key_angle_deg: 15.0
 min_live: 24
 reseed_min_region: 200
 hist_max: 600
+retro: true
 root_min_obs: 20
 root_window: 90
 root_margin: 0.6

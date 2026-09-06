@@ -117,6 +117,10 @@ def main():
     ap.add_argument("--occlude", default=None,
                     help="START:END:FRAC -- hide FRAC of the object's bounding "
                          "box (depth and mask) between those frames")
+    ap.add_argument("--occlude-eval", action="store_true",
+                    help="score only the frames inside the --occlude window, "
+                         "which is where a constraint meant to survive "
+                         "occlusion has to show its value")
     ap.add_argument("--no-eval", action="store_true",
                     help="skip the ground-truth scoring; the frame rate is "
                          "only honest without it, since labelling renders a "
@@ -560,12 +564,15 @@ def main():
         print(f"[replay] pruned {s.pruned_total} gaussians no part explained")
     if gt is not None and s.parts:
         from examples.multi_part import evaluate as _ev
-        res = _ev.report(r, a, gt["parts"], gt["lab"], s, gt["log"],
+        log = gt["log"]
+        if args.occlude_eval and occ is not None:
+            log = [(i, T) for i, T in log if occ[0] <= i < occ[1]]
+            print(f"[replay] scoring only the {len(log)} occluded frames")
+        res = _ev.report(r, a, gt["parts"], gt["lab"], s, log,
                          min_group=(cfg.min_part_pts if args.method == "naive"
                                     else cfg.min_group))
         try:
-            res["joints"] = _ev.joint_metrics(r, gt["parts"], s, res["rows"],
-                                              gt["log"])
+            res["joints"] = _ev.joint_metrics(r, gt["parts"], s, res["rows"], log)
         except Exception as exc:
             print(f"[eval] joint metrics unavailable ({exc})")
         print("[eval] " + _ev.fmt(Path(args.seq_dir).name, res, len(s.parts)))

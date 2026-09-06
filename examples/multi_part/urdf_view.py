@@ -18,6 +18,11 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
+def cv2_bgr(rgb):
+    import cv2
+    return cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
+
+
 PAL = [(0.90, 0.42, 0.24), (0.24, 0.52, 0.85), (0.36, 0.70, 0.42),
        (0.85, 0.72, 0.25), (0.66, 0.40, 0.78), (0.30, 0.72, 0.72)]
 
@@ -97,6 +102,14 @@ def main():
     ap.add_argument("--frames", type=int, default=48,
                     help="frames per joint sweep")
     ap.add_argument("--size", type=int, nargs=2, default=[900, 700])
+    ap.add_argument("--seq-dir", default=None,
+                    help="the sequence this URDF came from. The exported "
+                         "geometry is already in camera coordinates, so with "
+                         "the sequence's own intrinsics the animation is drawn "
+                         "from the viewpoint that recorded it, over the frame "
+                         "it was recorded in -- which is the only view in "
+                         "which it can be compared with the demo.")
+    ap.add_argument("--bg-frame", type=int, default=0)
     ap.add_argument("--fps", type=int, default=20)
     args = ap.parse_args()
 
@@ -160,37 +173,61 @@ def main():
             m.compute_vertex_normals()
 
     W, H = args.size
+    K, bg = None, None
+    if args.seq_dir:
+        try:
+            from point2pose.io.sources.dataset.rbo_view import _noop  # noqa
+        except Exception:
+            pass
+        try:
+            from point2pose.io.sources.dataset.rbo_reader import RBOReader
+            rr = RBOReader(args.seq_dir)
+            K = np.asarray(rr.K, float)
+            bg = cv2_bgr(rr.get_color(min(args.bg_frame, len(rr) - 1)))
+        except Exception:
+            from examples.multi_part.recording import Recording
+            rr = Recording(args.seq_dir)
+            K = np.asarray(rr.K, float)
+            bg = cv2_bgr(rr.get_color(min(args.bg_frame, len(rr) - 1)))
+        H, W = bg.shape[:2]
+
     if args.out:
-        # Drawn here rather than through OpenGL. A headless GL context on this
+        # Drawn here rather than through OpenGL: a headless GL context on this
         # machine returns a frame that is not what the viewer shows, and a
-        # URDF check is worthless if you cannot trust the picture. Vertices
-        # are projected and splatted back to front, which is enough to see
-        # whether a drawer slides along its own body and where the axis runs.
+        # URDF check is worthless if you cannot trust the picture. Vertices are
+        # projected and splatted back to front, which is enough to see whether
+        # a drawer slides along its own body and where the axis runs.
         import cv2
-        f = 1.6 * max(W, H)
-        eye = np.array([0.9, -0.6, -1.9]) * radius * 2.2
-        fwd = -eye / np.linalg.norm(eye)
-        right = np.cross(fwd, [0, -1, 0]); right /= np.linalg.norm(right)
-        up = np.cross(right, fwd)
-        Rc = np.stack([right, up, fwd])          # world -> camera
+        if K is not None:
+            f, cx, cy = K[0, 0], K[0, 2], K[1, 2]
+            eye = np.zeros(3)
+            Rc = np.eye(3)               # the geometry is already in camera
+            off = np.zeros(3)
+        else:
+            f, cx, cy = 1.6 * max(W, H), W / 2, H / 2
+            eye = np.array([0.9, -0.6, -1.9]) * radius * 2.2
+            fwd = -eye / np.linalg.norm(eye)
+            right = np.cross(fwd, [0, -1, 0]); right /= np.linalg.norm(right)
+            Rc = np.stack([right, np.cross(right, fwd), fwd])
+            off = centre
 
         def draw(q, label):
-            img = np.full((H, W, 3), (26, 30, 34), np.uint8)
+            img = (bg.copy() * 0.35).astype(np.uint8) if bg is not None \
+                else np.full((H, W, 3), (26, 30, 34), np.uint8)
             pose = link_poses(joints, root, q)
             pts, col, dep = [], [], []
             for i, (n, m) in enumerate(geoms.items()):
                 T = pose.get(n, np.eye(4))
-                v = rest[n] @ T[:3, :3].T + T[:3, 3] - centre
+                v = rest[n] @ T[:3, :3].T + T[:3, 3] - off
                 c = Rc @ (v - eye).T
                 z = c[2]
                 ok = z > 1e-3
-                u = f * c[0][ok] / z[ok] + W / 2
-                w = f * c[1][ok] / z[ok] + H / 2
-                pts.append(np.stack([u, w], 1)); dep.append(z[ok])
-                col.append(np.full(int(ok.sum()), i))
+                pts.append(np.stack([f * c[0][ok] / z[ok] + cx,
+                                     f * c[1][ok] / z[ok] + cy], 1))
+                dep.append(z[ok]); col.append(np.full(int(ok.sum()), i))
             P = np.concatenate(pts); D = np.concatenate(dep)
             C = np.concatenate(col).astype(int)
-            o = np.argsort(-D)                    # far first
+            o = np.argsort(-D)
             P, D, C = P[o], D[o], C[o]
             keep = (P[:, 0] > -20) & (P[:, 0] < W + 20) & \
                    (P[:, 1] > -20) & (P[:, 1] < H + 20)
@@ -201,40 +238,33 @@ def main():
                 for (x, y), s_, ci in zip(P.astype(int), shade, C):
                     b, g, r = PAL[ci % len(PAL)][::-1]
                     cv2.circle(img, (x, y), 2,
-                               (int(255 * min(b * s_, 1)), int(255 * min(g * s_, 1)),
+                               (int(255 * min(b * s_, 1)),
+                                int(255 * min(g * s_, 1)),
                                 int(255 * min(r * s_, 1))), -1)
-            # the joint axes, in the same frame, so a hinge in mid-air shows
             for k, j in enumerate(joints):
                 Tp = pose.get(j["parent"], np.eye(4))
                 a = Tp[:3, :3] @ (j["axis"] / np.linalg.norm(j["axis"]))
                 if j["type"] == "revolute":
-                    b0 = Tp[:3, :3] @ j["origin"] + Tp[:3, 3] - centre
+                    b0 = Tp[:3, :3] @ j["origin"] + Tp[:3, 3] - off
                 else:
-                    # A prismatic joint has a direction and no position, so the
-                    # URDF origin is arbitrary and drawing the line through it
-                    # puts the axis somewhere off the object. Through the part
-                    # it moves, the line says what it means.
                     ch = geoms.get(j["child"])
                     b0 = (np.asarray(ch.vertices).mean(0) if ch is not None
-                          else Tp[:3, 3] - centre)
+                          else Tp[:3, 3] - off)
                 seg = np.stack([b0 - a * radius * 0.7, b0 + a * radius * 0.7])
                 cc = Rc @ (seg - eye).T
                 if (cc[2] <= 1e-3).any():
                     continue
-                uv = np.stack([f * cc[0] / cc[2] + W / 2,
-                               f * cc[1] / cc[2] + H / 2], 1).astype(int)
+                uv = np.stack([f * cc[0] / cc[2] + cx,
+                               f * cc[1] / cc[2] + cy], 1).astype(int)
                 cv2.line(img, tuple(uv[0]), tuple(uv[1]), (20, 20, 20), 5,
                          cv2.LINE_AA)
                 cv2.line(img, tuple(uv[0]), tuple(uv[1]), (240, 240, 240), 2,
                          cv2.LINE_AA)
-                cv2.putText(img, f"{j['name']} {j['type']}  q={q[k]:+.3f}",
-                            (tuple(uv[1])[0] + 8, tuple(uv[1])[1]),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (20, 20, 20), 3,
-                            cv2.LINE_AA)
-                cv2.putText(img, f"{j['name']} {j['type']}  q={q[k]:+.3f}",
-                            (tuple(uv[1])[0] + 8, tuple(uv[1])[1]),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (235, 235, 235), 1,
-                            cv2.LINE_AA)
+                t = f"{j['name']} {j['type']}  q={q[k]:+.3f}"
+                for c_, w_ in (((20, 20, 20), 3), ((235, 235, 235), 1)):
+                    cv2.putText(img, t, (uv[1][0] + 8, uv[1][1]),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, c_, w_,
+                                cv2.LINE_AA)
             cv2.rectangle(img, (0, H - 30), (W, H), (18, 20, 23), -1)
             cv2.putText(img, label, (12, H - 10), cv2.FONT_HERSHEY_SIMPLEX,
                         0.52, (225, 225, 225), 1, cv2.LINE_AA)
@@ -248,8 +278,9 @@ def main():
                 writer.write(draw(q_at(fr / args.frames, only), label))
                 wrote += 1
         writer.release()
-        print(f"[urdf-view] wrote {args.out} ({wrote} frames, "
-              f"{len(plans)} sweeps, object radius {radius * 100:.0f} cm)")
+        print(f"[urdf-view] wrote {args.out} ({wrote} frames, {len(plans)} "
+              f"sweeps, object radius {radius * 100:.0f} cm"
+              f"{', from the recording camera' if K is not None else ''})")
         return
 
     # interactive: space steps through the sweeps, the joints animate on a timer

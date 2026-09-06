@@ -58,7 +58,8 @@ class RenderRefiner:
         A = np.where(good, self._acc, np.inf)
         best = A.argmin(axis=0)
         bv = A.min(axis=0)
-        cur = self.m.labels[:n]
+        # defensive: a stale label must never index past the parts
+        cur = np.clip(self.m.labels[:n], -1, A.shape[0] - 1)
         here = np.where(cur >= 0, A[np.clip(cur, 0, None), np.arange(n)], np.inf)
         want = (cur >= 0) & (best != cur) & np.isfinite(bv) \
             & (here > bv * self.margin)
