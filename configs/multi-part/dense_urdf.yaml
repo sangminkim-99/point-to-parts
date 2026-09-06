@@ -3,3 +3,16 @@
 extends: dense_refine.yaml
 
 max_points: 600
+
+# The exported model needs a part's whole past. A split fires because of
+# motion, so the joint born at it sees only what is left over -- on
+# ikeasmall02, 12 mm of a 113 mm drawer -- and the URDF then claims a range
+# and a topology that the animation shows to be wrong. With the past
+# recomputed the ranges come out at 74 and 112 mm along axes that point the
+# way the drawers open, and the tree is a star from the base.
+#
+# It is off in base.yaml because on the benchmark it is a trade: coverage 159
+# -> 165 of 200, purity 85.3 -> 87.4%, controllable 5.6 -> 4.3 s, type
+# accuracy 75 -> 79%, but part count exact 42 -> 38 of 81 and axis error 17.8
+# -> 27.5 degrees median, worse on 35 of the 61 joints scored both ways.
+retro: true

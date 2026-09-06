@@ -182,7 +182,9 @@ class NaiveConfig:
     min_live: int = 24                  # per part, before new points are sought
     reseed_min_region: int = 200   # px of its own before a part may re-seed
     hist_max: int = 600            # poses and frames kept, for re-rooting
-    retro: bool = True             # give a new part its own past at birth
+    retro: bool = False            # give a new part its own past at birth
+    retro_min_frac: float = 0.6    # of the part's points must be live
+    retro_max_resid: float = 0.008 # m; a looser fit is not evidence
     root_min_obs: int = 20         # shared frames before the base is judged
     root_window: int = 90          # shared frames the spread is read over
     root_margin: float = 0.6       # a new base must be this much stiller
@@ -1086,7 +1088,13 @@ class NaivePartTracker:
         for n, cur, ok, vis in getattr(self, "frames", []):
             sel = idx0[(idx0 < len(ok)) & (idx0 < len(vis))]
             m = ok[sel] & vis[sel]
-            if m.sum() < cfg.min_inliers:
+            # A past frame in which this part was mostly hidden gives a pose
+            # fitted to a handful of points, and that noise goes straight into
+            # the joint the part is about to be given. The live path is
+            # protected by the residual gate; the retro path needs its own,
+            # and support is what it lacks.
+            if m.sum() < cfg.min_inliers or \
+                    m.sum() < cfg.retro_min_frac * sel.size:
                 continue
             g = sel[m]
             c = self.reg._RANSAC(p0=self.anchor_xyz[g], tgt_pcd=cur[g], w=None,
@@ -1096,7 +1104,10 @@ class NaivePartTracker:
             T = np.asarray(c["T"])
             d = np.linalg.norm(self.anchor_xyz[g] @ T[:3, :3].T + T[:3, 3]
                                - cur[g], axis=1)
-            out.append((n, T, float(np.median(d))))
+            r = float(np.median(d))
+            if r > cfg.retro_max_resid:
+                continue
+            out.append((n, T, r))
         return out or None
 
     def _new_joint(self):
