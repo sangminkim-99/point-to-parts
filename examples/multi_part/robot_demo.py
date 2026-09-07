@@ -116,6 +116,64 @@ def object_spheres(geoms, rest, centre, joints, root, q, k, n_pts, radius,
         jnp.asarray(Q), jnp.full(len(Q), radius))
 
 
+def grasp_candidates(geoms, child, joints, n=60):
+    """Places on the moving part the robot could plausibly hold."""
+    import open3d as o3d
+    m = geoms.get(child)
+    if m is None:
+        return np.zeros((0, 3)), np.zeros(0)
+    v = np.asarray(m.vertices)
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(v))
+    C = np.asarray((pcd.farthest_point_down_sample(n) if len(v) > n
+                    else pcd).points)
+    j = next((j for j in joints if j["child"] == child), None)
+    if j is None or j["type"] != "revolute":
+        return C, np.ones(len(C))
+    a = np.asarray(j["axis"], float); a /= max(np.linalg.norm(a), 1e-9)
+    r = C - np.asarray(j["origin"], float)
+    lever = np.linalg.norm(r - np.outer(r @ a, a), axis=1)
+    return C, lever / max(lever.max(), 1e-9)
+
+
+def plan_grasps(C, prefer, joints, root, k, qs, clouds, base, reach,
+                clear, min_run):
+    """Which point to hold at each joint value, and when to let go.
+
+    A grasp is feasible where the gripper has room -- the obstacles are every
+    part except the one being held, re-posed at that joint value -- and where
+    the arm can reach. Both change with q, which is what makes a door
+    graspable by its edge only once it is open. The plan is then the fewest
+    holds that cover the range, each kept as long as it stays feasible.
+    """
+    from scipy.spatial import cKDTree
+    lo, hi = reach
+    ok = np.zeros((len(C), len(qs)), bool)
+    for t, q in enumerate(qs):
+        full = np.zeros(len(joints)); full[k] = q
+        pose = link_poses(joints, root, full)
+        T = pose.get(joints[k]["child"], np.eye(4))
+        P = C @ T[:3, :3].T + T[:3, 3]
+        d = cKDTree(clouds[t]).query(P)[0] if len(clouds[t]) else np.full(len(P), 9.)
+        r = np.linalg.norm(P - base, axis=1)
+        ok[:, t] = (d > clear) & (r > lo) & (r < hi)
+    plan, t = [], 0
+    while t < len(qs):
+        run = np.zeros(len(C), int)
+        for i in range(len(C)):
+            u = t
+            while u < len(qs) and ok[i, u]:
+                u += 1
+            run[i] = u - t
+        if run.max() < 1:
+            plan.append((None, t, t + 1)); t += 1; continue
+        best = int(np.argmax(run + 1000 * prefer * (run >= min(min_run, run.max()))))
+        if run[best] < 1:
+            best = int(np.argmax(run))
+        plan.append((best, t, t + int(run[best])))
+        t += int(run[best])
+    return plan, ok
+
+
 def solve_path(robot, targets, link_index, smooth=2.0, rest_w=0.01,
                worlds=None, robot_coll=None, margin=0.004, coll_w=8.0):
     """One configuration per target, smooth along the way.
@@ -287,6 +345,14 @@ def main():
                          "it sits on, and a generous berth simply forbids the "
                          "contact the demo exists to show. The term is here to "
                          "stop the arm passing THROUGH what we measured.")
+    ap.add_argument("--candidates", type=int, default=60,
+                    help="places on the moving part the robot might hold")
+    ap.add_argument("--grip-clear", type=float, default=0.03,
+                    help="room a hold needs from the REST of the object, so a "
+                         "lid edge resting on its body is not offered")
+    ap.add_argument("--min-run", type=int, default=4,
+                    help="waypoints a hold should survive before it is worth "
+                         "preferring on lever arm alone")
     ap.add_argument("--no-collision", action="store_true")
     args = ap.parse_args()
 
@@ -321,16 +387,11 @@ def main():
     radius = float(np.linalg.norm(allv - centre, axis=1).max())
 
     qs = np.linspace(j["lower"], j["upper"], args.steps)
-    grip = []
-    for q in qs:
+
+    def part_point(p, q):
         full = np.zeros(len(joints)); full[k] = q
-        pose = link_poses(joints, root, full)
-        T = pose.get(j["child"], np.eye(4))
-        g = grasp_point(geoms, joints, j["child"])
-        grip.append(T[:3, :3] @ g + T[:3, 3] - centre)
-    grip = np.asarray(grip)
-    travel = float(np.linalg.norm(grip[-1] - grip[0]))
-    print(f"[robot] the grasp point travels {travel * 1000:.0f} mm over that range")
+        T = link_poses(joints, root, full).get(j["child"], np.eye(4))
+        return T[:3, :3] @ p + T[:3, 3] - centre
 
     robot, robot_urdf = load_robot(args.robot)
     names = list(robot.links.names)
@@ -351,6 +412,10 @@ def main():
     # whole sweep inside the arm's comfortable annulus rather than by trying
     # trajectories, which would be a solve per candidate.
     lo, hi = args.reach
+    # the part's own centre over the sweep: what the base has to cover,
+    # independent of which point ends up being held
+    grip = np.array([part_point(np.asarray(
+        geoms[j["child"]].vertices).mean(0), q) for q in qs])
     cands = []
     for d in np.arange(0.30, 0.95, 0.05):
         for lat in (-0.25, -0.12, 0.0, 0.12, 0.25):
@@ -377,22 +442,41 @@ def main():
           f"{1000 * args.coll_radius:.0f} mm, re-posed at every waypoint "
           f"(the held part {j['child']} is excluded)")
 
-    best = None
-    for _, b in cands[:args.try_bases]:
-        worlds = None if coll is None else [
-            pc.Sphere.from_center_and_radius(
-                jnp.asarray(Q - b), jnp.full(len(Q), args.coll_radius))
-            for Q in clouds]
-        c = solve_path(robot, grip - b, ee_i, worlds=worlds,
-                       robot_coll=coll, margin=args.coll_margin)
-        f = np.asarray(robot.forward_kinematics(c))[:, ee_i, 4:7] + b
-        e = float(np.linalg.norm(f - grip, axis=1).max())
-        if best is None or e < best[0]:
-            best = (e, b, c)
-    _, base, cfgs = best
+    C, prefer = grasp_candidates(geoms, j["child"], joints, args.candidates)
+    C = C - centre
+    print(f"[robot] {len(C)} candidate holds on {j['child']}")
+
+    base = cands[0][1]
     print(f"[robot] stood the base at {np.round(base, 2)} m "
           f"(reach {np.linalg.norm(grip - base, axis=1).min():.2f}"
           f"-{np.linalg.norm(grip - base, axis=1).max():.2f} m)")
+
+    plan, feas = plan_grasps(C, prefer, joints, root, k, qs, clouds, base,
+                             args.reach, args.grip_clear, args.min_run)
+    cov = feas.any(axis=0)
+    print(f"[robot] a hold exists at {int(cov.sum())} of {len(qs)} joint "
+          f"values; the plan uses {sum(1 for h, _, _ in plan if h is not None)} "
+          f"hold(s)" + ("" if cov.all() else
+                        f", and {int((~cov).sum())} have none at all"))
+    for h, a_, b_ in plan:
+        u = ("deg", np.degrees(qs[a_]), np.degrees(qs[min(b_, len(qs)) - 1])) \
+            if j["type"] == "revolute" else \
+            ("mm", qs[a_] * 1000, qs[min(b_, len(qs)) - 1] * 1000)
+        print(f"[robot]   q {u[1]:+7.1f} .. {u[2]:+7.1f} {u[0]}: "
+              + (f"hold candidate {h}" if h is not None
+                 else "NO feasible hold"))
+
+    # the target the arm actually follows: the held point, which changes
+    grip = np.array([part_point(C[h] if h is not None else
+                                np.asarray(geoms[j["child"]].vertices).mean(0)
+                                - centre, qs[t])
+                     for h, a_, b_ in plan for t in range(a_, b_)])
+    worlds = None if coll is None else [
+        pc.Sphere.from_center_and_radius(
+            jnp.asarray(Q - base), jnp.full(len(Q), args.coll_radius))
+        for Q in clouds]
+    cfgs = solve_path(robot, grip - base, ee_i, worlds=worlds,
+                      robot_coll=coll, margin=args.coll_margin)
     fk = np.asarray(robot.forward_kinematics(cfgs))[:, ee_i, 4:7] + base
     err = np.linalg.norm(fk - grip, axis=1)
     print(f"[robot] IK over {args.steps} waypoints: reach error median "
