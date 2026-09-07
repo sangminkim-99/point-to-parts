@@ -44,32 +44,86 @@ def load_robot(name):
     return pyroki.Robot.from_urdf(urdf), urdf
 
 
-def grasp_point(geoms, joints, child, axis_frac=0.35):
-    """Where the robot is holding: on the moving part, out along its axis.
+def grasp_point(geoms, joints, child, frac=0.7):
+    """Where the robot holds: on the moving part, where the lever is longest.
 
-    The centroid of a single-view shell sits behind the surface we actually
-    saw, so the point is pushed out along the joint's own direction. It is a
-    stand-in for the interaction point proper -- a handle, a lid edge -- which
-    is step 6 and not yet recovered.
+    For a revolute joint that means AWAY from the hinge -- you open a door by
+    its far edge, not by pushing along the hinge line. The first version
+    pushed along the joint axis for both types, which for a revolute runs
+    along the hinge and put the point inside the body the lid closes onto:
+    cardboardbox01 came out with 23 mm of reach error because the arm was
+    aiming into the box. For a prismatic joint the axis IS the direction the
+    part comes out, so there the push along it is right.
+
+    Still a stand-in for the interaction point proper -- a handle, a lid edge
+    -- which is step 6 and not yet recovered.
     """
     m = geoms.get(child)
     if m is None:
         return None
     v = np.asarray(m.vertices)
-    c = v.mean(0)
     j = next((j for j in joints if j["child"] == child), None)
     if j is None:
-        return c
+        return v.mean(0)
     a = np.asarray(j["axis"], float)
     a = a / max(np.linalg.norm(a), 1e-9)
-    return c + a * axis_frac * float(np.linalg.norm(v.max(0) - v.min(0)))
+    if j["type"] == "revolute":
+        p0 = np.asarray(j["origin"], float)
+        r = v - p0
+        lever = np.linalg.norm(r - np.outer(r @ a, a), axis=1)
+        pick = np.argsort(-lever)[:max(20, len(v) // 50)]
+        return v[pick].mean(0)
+    c = v.mean(0)
+    return c + a * frac * 0.5 * float(np.linalg.norm(v.max(0) - v.min(0)))
 
 
-def solve_path(robot, targets, link_index, smooth=2.0, rest_w=0.01):
+def object_spheres(geoms, rest, centre, joints, root, q, k, n_pts, radius,
+                   skip=None):
+    """The object at this joint value, as spheres, for collision.
+
+    A point cloud rather than the meshes. The meshes are Poisson shells fitted
+    to one viewpoint -- they are not watertight and they invent surface -- so
+    a mesh collider would be asserting geometry we never measured. The points
+    ARE the measurement, farthest-point sampled so that a few hundred of them
+    still cover the object, and a sphere of half the spacing closes the gaps.
+    """
+    import jax.numpy as jnp
+    import open3d as o3d
+    import pyroki.collision as pc
+    full = np.zeros(len(joints)); full[k] = q
+    pose = link_poses(joints, root, full)
+    out = []
+    for n, v in rest.items():
+        if n == skip:
+            # The part being held is not an obstacle. A gripper closes AROUND
+            # what it grasps, so keeping the whole object in the collision set
+            # forbids the very contact the demo is about: on cardboardbox01
+            # that showed up as 21.7 mm of reach error, the arm held off the
+            # surface it was supposed to be holding. The rest of the object --
+            # the frame the door swings in -- stays an obstacle, which is what
+            # makes re-grasping a real question.
+            continue
+        T = pose.get(n, np.eye(4))
+        out.append((v - centre) @ T[:3, :3].T + T[:3, 3])
+    if not out:
+        return np.zeros((0, 3)), None
+    P = np.concatenate(out)
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
+    if len(P) > n_pts:
+        pcd = pcd.farthest_point_down_sample(n_pts)
+    Q = np.asarray(pcd.points)
+    return Q, pc.Sphere.from_center_and_radius(
+        jnp.asarray(Q), jnp.full(len(Q), radius))
+
+
+def solve_path(robot, targets, link_index, smooth=2.0, rest_w=0.01,
+               worlds=None, robot_coll=None, margin=0.004, coll_w=8.0):
     """One configuration per target, smooth along the way.
 
     Each waypoint is an IK problem; the smoothness term between neighbours is
-    what makes it a trajectory rather than a sequence of unrelated poses.
+    what makes it a trajectory rather than a sequence of unrelated poses. The
+    object is a different obstacle at every waypoint, because it is the thing
+    that moves, so each waypoint carries its own collision term.
     """
     import jax.numpy as jnp
     import jaxls
@@ -94,6 +148,9 @@ def solve_path(robot, targets, link_index, smooth=2.0, rest_w=0.01):
             jnp.asarray(link_index), 5.0, 0.0))
         costs.append(pkc.limit_cost(robot, v, 100.0))
         costs.append(pkc.rest_cost(v, rest, rest_w))
+        if worlds is not None and robot_coll is not None:
+            costs.append(pkc.world_collision_cost(
+                robot, robot_coll, v, worlds[i], margin, coll_w))
         if i:
             costs.append(pkc.smoothness_cost(v, vars_[i - 1], smooth))
     sol = (jaxls.LeastSquaresProblem(costs, vars_).analyze()
@@ -125,9 +182,14 @@ def render_sweep(args, robot, urdf, base, cfgs, qs, k, joints, root,
     import cv2
     W, H = args.size
     clouds = _link_clouds(urdf)
-    # a viewpoint that frames the arm and the object together
-    tgt = np.array([-0.35, 0.0, 0.0])
-    eye = tgt + np.array([0.75, -0.95, -1.45])
+    # A viewpoint across the approach, not along it. The base now stands on
+    # the side the camera saw, so the recording camera's own direction has the
+    # arm directly in front of the object.
+    tgt = 0.5 * base
+    v = base / max(np.linalg.norm(base), 1e-6)
+    side = np.cross(v, [0, 1, 0])
+    side = side / max(np.linalg.norm(side), 1e-6)
+    eye = tgt + side * 1.35 + np.array([0.0, -0.75, 0.0]) - v * 0.35
     fwd = tgt - eye; fwd /= np.linalg.norm(fwd)
     right = np.cross(fwd, [0, -1, 0]); right /= np.linalg.norm(right)
     Rc = np.stack([right, np.cross(right, fwd), fwd])
@@ -213,6 +275,19 @@ def main():
                     help="write the sweep as an mp4 instead of serving it")
     ap.add_argument("--size", type=int, nargs=2, default=[960, 720])
     ap.add_argument("--fps", type=int, default=20)
+    ap.add_argument("--coll-points", type=int, default=400,
+                    help="farthest-point samples of the object, per waypoint")
+    ap.add_argument("--coll-radius", type=float, default=0.012)
+    ap.add_argument("--reach", type=float, nargs=2, default=[0.32, 0.72],
+                    help="the arm's comfortable annulus, metres from its base")
+    ap.add_argument("--try-bases", type=int, default=4)
+    ap.add_argument("--coll-margin", type=float, default=0.004,
+                    help="clearance demanded of the obstacles. Small on "
+                         "purpose: grasping an edge IS approaching the body "
+                         "it sits on, and a generous berth simply forbids the "
+                         "contact the demo exists to show. The term is here to "
+                         "stop the arm passing THROUGH what we measured.")
+    ap.add_argument("--no-collision", action="store_true")
     args = ap.parse_args()
 
     import open3d as o3d
@@ -269,16 +344,55 @@ def main():
     # Stand the robot where the whole sweep is inside its envelope. Too far
     # and the arm is at full stretch, which shows up as tens of millimetres of
     # reach error that say nothing about the kinematics we recovered.
+    # Where to stand. The geometry is in camera coordinates, so the side we
+    # have any surface for -- and the side the parts open toward -- is the
+    # camera's side, which is -z. That fixes the direction; what is left is
+    # how far back and how far across, and those are chosen by keeping the
+    # whole sweep inside the arm's comfortable annulus rather than by trying
+    # trajectories, which would be a solve per candidate.
+    lo, hi = args.reach
+    cands = []
+    for d in np.arange(0.30, 0.95, 0.05):
+        for lat in (-0.25, -0.12, 0.0, 0.12, 0.25):
+            for dz in (-0.30, -0.15, 0.0):
+                b = np.array([lat, dz, -d])
+                r = np.linalg.norm(grip - b, axis=1)
+                if r.min() < lo or r.max() > hi:
+                    continue
+                # the middle of the annulus, not merely inside it: a base
+                # that only just satisfies the bound puts the arm at a stretch
+                # for half the sweep
+                cands.append((-abs(r.mean() - 0.5 * (lo + hi)), b))
+    if not cands:
+        cands = [(0.0, np.array([0.0, -0.15, -0.6]))]
+    cands.sort(key=lambda x: -x[0])
+    # the object as points, once per waypoint, in the world frame
+    import jax.numpy as jnp
+    import pyroki.collision as pc
+    coll = None if args.no_collision else pc.RobotCollision.from_urdf(robot_urdf)
+    clouds = [object_spheres(geoms, rest, centre, joints, root, q, k,
+                             args.coll_points, args.coll_radius,
+                             skip=j["child"])[0] for q in qs]
+    print(f"[robot] obstacles: {len(clouds[0])} spheres of "
+          f"{1000 * args.coll_radius:.0f} mm, re-posed at every waypoint "
+          f"(the held part {j['child']} is excluded)")
+
     best = None
-    for d in np.arange(0.30, 0.85, 0.05):
-        b = np.array([-d, 0.0, -0.15])
-        c = solve_path(robot, grip - b, ee_i)
+    for _, b in cands[:args.try_bases]:
+        worlds = None if coll is None else [
+            pc.Sphere.from_center_and_radius(
+                jnp.asarray(Q - b), jnp.full(len(Q), args.coll_radius))
+            for Q in clouds]
+        c = solve_path(robot, grip - b, ee_i, worlds=worlds,
+                       robot_coll=coll, margin=args.coll_margin)
         f = np.asarray(robot.forward_kinematics(c))[:, ee_i, 4:7] + b
         e = float(np.linalg.norm(f - grip, axis=1).max())
         if best is None or e < best[0]:
             best = (e, b, c)
     _, base, cfgs = best
-    print(f"[robot] stood the base at {np.round(base, 2)} m")
+    print(f"[robot] stood the base at {np.round(base, 2)} m "
+          f"(reach {np.linalg.norm(grip - base, axis=1).min():.2f}"
+          f"-{np.linalg.norm(grip - base, axis=1).max():.2f} m)")
     fk = np.asarray(robot.forward_kinematics(cfgs))[:, ee_i, 4:7] + base
     err = np.linalg.norm(fk - grip, axis=1)
     print(f"[robot] IK over {args.steps} waypoints: reach error median "
@@ -286,6 +400,25 @@ def main():
     step = np.abs(np.diff(cfgs, axis=0)).max(axis=1)
     print(f"[robot] largest joint step between waypoints: "
           f"{np.degrees(step.max()):.1f} deg")
+    if coll is not None:
+        d = [float(np.asarray(coll.compute_world_collision_distance(
+                robot, jnp.asarray(cfgs[i]),
+                pc.Sphere.from_center_and_radius(
+                    jnp.asarray(clouds[i] - base),
+                    jnp.full(len(clouds[i]), args.coll_radius)))).min())
+             for i in range(len(cfgs))]
+        d = np.asarray(d)
+        print(f"[robot] closest approach to the object: {1000 * d.min():+.0f} mm "
+              f"(negative = through it), "
+              f"{int((d < 0).sum())} of {len(d)} waypoints in contact")
+        if err.max() > 0.01 or (d < 0).any():
+            print("[robot] NOT feasible as posed. The arm cannot hold that "
+                  "point over that range without going through the rest of "
+                  "the object -- which is a real answer, not a solver "
+                  "failure: a lid opened 18 degrees has its far edge resting "
+                  "on the body it closes onto, and no gripper reaches there "
+                  "either. It needs a grasp chosen for clearance, or the "
+                  "object opened further before the robot takes over.")
     if args.out:
         render_sweep(args, robot, robot_urdf, base, cfgs, qs, k,
                      joints, root, geoms, rest, centre, radius, grip, ee_i,
