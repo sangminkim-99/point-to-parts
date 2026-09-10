@@ -1719,17 +1719,32 @@ class NaivePartTracker:
         gain = max(a['contradiction'] - b['contradiction'] for a, b in rows)
         supported = all(b['support'] >= cfg.split_reprojection_support for _, b in rows)
         baseline_accept = supported and gain >= cfg.split_reprojection_gain
+        detail = ""
+        residual_accept = False
         if cfg.split_reprojection_mode == "residual_veto":
-            # UNION, not replacement: keep the contradiction path (catches a
-            # revolute hinge) and ADD the fit-improvement + persistence path
-            # (catches a prismatic slide). The rigid control is rejected by both.
             rv_cond = self._accept_residual_veto(child_rows)
-            accept = baseline_accept or self._reproj_persist(
-                part.part_id, rv_cond, groups, motions)
-        else:
-            accept = baseline_accept
+            residual_accept = self._reproj_persist(part.part_id, rv_cond, groups, motions)
+            streak = getattr(self, "_reproj_streak", {}).get(part.part_id, {}).get(
+                "streak", int(rv_cond))
+            paired_mm = [round(1000 * (c["paired_com"] - c["paired_sep"]), 2)
+                         if c["paired_com"] is not None and c["paired_sep"] is not None
+                         else None for c in child_rows]
+            detail = (f" residual_ok={rv_cond} streak={streak}/{cfg.split_reprojection_persist}"
+                      f" paired_gain_mm={paired_mm}"
+                      f" paired_n={[c['n_paired'] for c in child_rows]}"
+                      f" support_gain={[round(b['support']-a['support'], 3) for a,b in rows]}"
+                      f" freespace_increase={[round(b.get('contradiction_freespace', 0)-a.get('contradiction_freespace', 0), 3) for a,b in rows]}")
+        accept = baseline_accept or residual_accept
+        reason = ("contradiction_gain" if baseline_accept else
+                  "persistent_fit_improvement" if residual_accept else
+                  "low_support" if not supported else
+                  "gain_below_threshold" if cfg.split_reprojection_mode != "residual_veto" else
+                  "fit_or_persistence_pending")
         print(f"[reprojection] f{self.n} split gain={gain:.3f} "
-              f"support={[round(b['support'], 3) for _, b in rows]} accept={accept}")
+              f"support={[round(b['support'], 3) for _, b in rows]} accept={accept} "
+              f"mode={cfg.split_reprojection_mode} reason={reason} "
+              f"gain_min={cfg.split_reprojection_gain:.3f} "
+              f"support_min={cfg.split_reprojection_support:.3f}{detail}")
         return accept
 
     def _paired_resid(self, pts, com_pose, sep_pose):
