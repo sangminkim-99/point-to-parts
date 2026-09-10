@@ -723,9 +723,16 @@ class NaivePartTracker:
         return added
 
     def _note_controllable(self, j, part, i):
-        """First moment a joint is pinned down well enough to command."""
+        """First diagnostic readiness event, not verified robot controllability.
+
+        Keep the historical attribute name for existing consumers. This event
+        can become stale if tracking later drifts and must not authorize motion.
+        """
         c = part.joint.confidence()
-        if c["conf"] < self.cfg.joint_conf or hasattr(self, "controllable"):
+        if (part.joint.kind not in ("revolute", "prismatic")
+                or not c.get("valid", False) or c.get("excitation", 0) < 1.0
+                or not np.isfinite(c["conf"]) or c["conf"] < self.cfg.joint_conf
+                or hasattr(self, "controllable")):
             return
         self.controllable = {
             "frame": int(i), "part": int(j), "kind": part.joint.kind,
@@ -735,8 +742,8 @@ class NaivePartTracker:
         span = (np.degrees(c["span"]) if part.joint.kind == "revolute"
                 else c["span"] * 1000)
         unit = "deg" if part.joint.kind == "revolute" else "mm"
-        print(f"[naive] CONTROLLABLE at frame {i}: part {j} {part.joint.kind}, "
-              f"conf {c['conf']:.2f}, axis +-{c['axis_std_deg']:.1f} deg, "
+        print(f"[naive] JOINT ESTIMATE READY at frame {i}: part {j} {part.joint.kind}, "
+              f"conf {c['conf']:.2f}, axis RMS {c['axis_std_deg']:.1f} deg, "
               f"observed {span:.1f} {unit}")
 
     def _fit_joint(self, part, sel, cur):

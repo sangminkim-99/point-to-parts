@@ -491,19 +491,19 @@ def main():
         c = getattr(s, "controllable", None)
         fps_med = 1000.0 / max(np.median(times), 1e-6)
         if c:
-            print(f"[replay] time to controllable: frame {c['frame']} "
+            print(f"[replay] first joint-estimate readiness: frame {c['frame']} "
                   f"({c['frame'] / max(fps_med, 1e-6):.1f} s at {fps_med:.0f} fps"
                   + (f", split at {c['split_frame']}" if c['split_frame'] else "")
                   + f") -- {c['kind']}, conf {c['conf']:.2f}, "
-                  f"axis +-{c['axis_std_deg']:.1f} deg")
+                  f"axis RMS {c['axis_std_deg']:.1f} deg (diagnostic, not verified control)")
         else:
-            print("[replay] never became controllable")
+            print("[replay] joint-estimate readiness criteria not reached")
         for j, p in enumerate(s.parts):
             if p.joint is not None and p.joint.kind:
                 cc = p.joint.confidence()
                 print(f"[replay]   part {j} joint {p.joint.kind}: "
                       f"conf {cc['conf']:.2f} (type {cc['type_p']:.2f}, "
-                      f"axis +-{cc['axis_std_deg']:.1f} deg, "
+                      f"axis RMS {cc['axis_std_deg']:.1f} deg, "
                       f"watched {(np.degrees(cc['span']) if p.joint.kind == 'revolute' else 1000 * cc['span']):.0f}"
                       f"{' deg' if p.joint.kind == 'revolute' else ' mm'}"
                       f"{'' if cc['excitation'] >= 1.0 else ' (short)'}, "

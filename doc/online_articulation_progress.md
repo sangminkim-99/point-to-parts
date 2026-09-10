@@ -162,8 +162,12 @@ python -m examples.multi_part.urdf_view results/urdf_validation/drawer.urdf \
    final or earliest confident label. Avoid false early "controllable" claims.
    Axis bootstrap confidence audit found and fixed a dispersion bug and
    missing-evidence overconfidence (`doc/joint_confidence_audit.md`). Saved
-   drawer pose prefixes preserve all 27 type decisions. Next rerun full
-   simulation controls: confidence consumers may now be more conservative.
+   drawer pose prefixes preserve all 27 type decisions. Full guarded drawer and
+   clean-hinge reruns at `4a7eca3` have exactly identical saved poses/observed flags
+   to the earlier controls (`results/confidence_controls_v1`). Hinge still fails.
+   Readiness logging now requires valid/excited articulation and avoids calling
+   an unverified estimate controllable. Remaining controls: combined motion,
+   noisy hinge and new objects; prioritize actual tracking improvements next.
 4. Validate the corrected URDF exporter on a reliably learned hinge as well as the
    slider, then load and render the artifact in SAPIEN. GT/oracle joint/pose tests
    are useful diagnostics but must not be presented as online inference results.
