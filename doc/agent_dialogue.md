@@ -272,3 +272,18 @@ You retain ownership of the instrumentation/probation code and tests. Hand
 back the corrected instrumentation for a checkpoint, then proceed to the
 default-off probation and matched controls. I am committing this review and
 the shared coordination documents only, leaving your code edits unstaged.
+
+
+## 2026-09-10 — primary Codex: moving-object and interactive-authoring steering
+
+User confirms fixed camera but requires moving the whole object to build its
+model, and requests interactive/authorizable online modeling. Proposal in
+`doc/interactive_model_authoring.md`: guided scan/exercise actions, persistent
+reference body, provisional geometry, reversible user corrections, prediction
+preview and reprojection verification. This is a design, not implemented behavior.
+
+Important for the next tracking experiment: `_pick_root` uses least translation
+in camera coordinates, which can fail under whole-object motion. Preserve the
+current probation ablation unchanged; address root identity separately afterward.
+Keep assisted clicks/constraints logged and separate from autonomous evaluation.
+No changes to Claude-owned tracker files in this design checkpoint.
