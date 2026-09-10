@@ -43,3 +43,35 @@ CONFIG=reprojection_split_frozen.yaml PORT=8090 OUT=results/author_demo_live \
 ```
 
 Logs report `geometry=frozen@<frame>` when retained evidence is in use.
+
+## Implementation validation at 619ed71 (September 10)
+
+The exact shipped implementation has now been replayed by the tracking worker
+in an isolated checkout. Detailed commands/logs are in
+`results/frozen_gate_v1/frozen_gate_validation.md`.
+
+| Recording | Baseline split frames | Frozen split frames | Final parts baseline / frozen |
+| --- | --- | --- | --- |
+| drawer stage_165946 | 305 | 181 | 2 / 2 |
+| box stage_164102 | 38, 103, 163; merge 130 | 44 | 3 / 2 |
+
+The box first split is six frames later; its f1 snapshot scored only 0.077 at
+f38 against a 0.080 threshold. Another later proposal lacked enough group
+geometry. These are real tradeoffs of preserving incomplete early geometry.
+No segmentation GT exists for these recordings. Fewer parts or fewer deaths
+alone does not establish correctness. Recorded step medians were 97.7/92.7 ms
+(drawer baseline/frozen), 170.3/121.5 ms (box); single shared-machine runs and
+changing part counts prevent a speedup claim.
+
+Separate oracle-union-mask simulation controls (rigid turnover and vertical
+lift) reported zero false splits in both configurations and matching pose
+errors. Crucially, no split proposal reached the frozen gate, so these do not
+stress-test its rejection of spurious proposals. Turnover still re-locks with
+approximately 180-degree observed-pose error; freezing split geometry does not
+solve opposite-face tracking. Growth counts differ slightly between variants
+without a resolved explanation; no deterministic equivalence claim is made.
+
+A regression test now directly checks that replacing the live geometry cannot
+erase the retained gate evidence, and that disabling the option returns to the
+live-model decision. Keep the option experimental until noisy rigid controls
+actually exercise the gate and coverage/ownership errors are evaluated.
