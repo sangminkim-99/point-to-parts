@@ -16,7 +16,8 @@ from scipy.spatial.transform import Rotation
 from examples.multi_part.naive import NaivePartTracker, NaiveConfig
 from examples.multi_part.acquire import apply_config, apply_overrides
 from examples.multi_part.author_state import (snapshot, displayed_poses, save_snapshot,
-                                               cloud_center_radius, frame_view)
+                                               cloud_center_radius, frame_view,
+                                               PALETTE, geometry_counts, legend_markdown)
 
 
 class ReferenceTracker(NaivePartTracker):
@@ -63,6 +64,7 @@ class AuthorView:
         self.center = None            # display-frame cloud centroid, for framing
         self.radius = 0.
         self.framed = False           # have we auto-framed once data arrived?
+        self.counts = None            # assigned/unassigned geometry counts
         self.server = viser.ViserServer(host='127.0.0.1', port=args.port,
                                         label='Teach an articulated object')
         self.server.scene.set_up_direction('-y')
@@ -83,6 +85,7 @@ class AuthorView:
         save = self.server.gui.add_button('Save model version')
         reset = self.server.gui.add_button('Reset preview & annotations')
         self.saved = self.server.gui.add_markdown('Cloud + kinematic URDF when fitted. Observed surfaces only.')
+        self.legend = self.server.gui.add_markdown('Legend appears once geometry is tracked.')
         self.server.gui.add_markdown('Select the physical body after parts separate. Reference pose is tracked, not fixed. Preview does not move the real object.')
         choose.on_click(lambda _: self.commands.append(('reference', int(self.root.value))))
         save.on_click(lambda _: self.save())
@@ -163,8 +166,10 @@ class AuthorView:
             if tuple(self.root.options) != tuple(options):
                 self.root.options = options
             root = self.state.parts[self.state.root]
+            counts = geometry_counts(self.state.labels, len(self.state.parts))
             self.info.content = (f'Frame **{self.state.frame}** · **{len(options)} parts** · '
-                                 f'**{len(self.state.points):,} points**\n\n'
+                                 f'**{counts["assigned"]:,} assigned** / '
+                                 f'{counts["unassigned"]:,} unassigned (hidden) pts\n\n'
                                  f'Reference **{root.part_id}**: '
                                  f'{"tracked" if root.observed else "LOST — held pose"} · '
                                  f'tracker step {step_ms:.0f} ms')
@@ -185,12 +190,11 @@ class AuthorView:
             for node in self.nodes:
                 node.remove()
             self.nodes = []
-            palette = np.array([[239,155,56],[65,193,163],[155,115,232],[72,163,230]])
             shown, root_pts = [], None
             for j,p in enumerate(s.parts):
                 ids = np.flatnonzero(s.labels == j)[::max(1, int(np.sum(s.labels == j) / 12000))]
                 pts = s.points[ids] @ poses[j][:3,:3].T + poses[j][:3,3]
-                colors = (np.tile(palette[p.part_id % len(palette)], (len(ids),1)) if self.color.value
+                colors = (np.tile(PALETTE[p.part_id % len(PALETTE)], (len(ids),1)) if self.color.value
                           else np.clip(s.colors[ids] * 255,0,255)).astype(np.uint8)
                 self.nodes.append(self.server.scene.add_point_cloud(f'/parts/{p.part_id}',
                     points=pts.astype(np.float32), colors=colors, point_size=.003))
@@ -198,6 +202,13 @@ class AuthorView:
                     shown.append(pts)
                     if j == s.root:
                         root_pts = pts
+            # Assigned-vs-unassigned counts + legend. Unassigned geometry
+            # (label -1) is intentionally NOT drawn -- it has no part pose and the
+            # viewer never invents one -- but its count is surfaced so the user
+            # knows it exists. See doc: the viewer hides labels=-1.
+            counts = geometry_counts(s.labels, len(s.parts))
+            self.counts = counts
+            self.legend.content = legend_markdown([p.part_id for p in s.parts], counts)
             # Framing/gizmo: centre on the geometry, not the distant anchor origin.
             if shown:
                 self.center, self.radius = cloud_center_radius(np.concatenate(shown))

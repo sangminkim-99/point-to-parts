@@ -49,6 +49,36 @@ def cloud_center_radius(points, pct=95):
 # scene's -y up. A pure viewing choice; it never touches model coordinates.
 VIEW_DIR = np.array([0., -0.28, -0.96])
 
+# Single source of truth for the per-part display palette (RGB 0-255) and names,
+# shared by the 3D cloud and the legend so a swatch and its label always agree.
+PALETTE = np.array([[239, 155, 56], [65, 193, 163], [155, 115, 232], [72, 163, 230]])
+PALETTE_NAMES = ['orange', 'teal', 'purple', 'blue']
+
+
+def geometry_counts(labels, n_parts):
+    """Points assigned to each part vs unassigned (label not in [0, n_parts)).
+
+    Unassigned geometry (dense label -1, or any label outside the current parts)
+    has no part pose; the viewer never gives it a fabricated one, so counting it
+    is how the user sees it exists at all.
+    """
+    labels = np.asarray(labels)
+    per_part = [int((labels == j).sum()) for j in range(n_parts)]
+    assigned = int(sum(per_part))
+    return dict(per_part=per_part, assigned=assigned,
+                unassigned=int(labels.size - assigned))
+
+
+def legend_markdown(part_ids, counts):
+    """A legend that names each part's colour and its point count, and states
+    the unassigned (hidden, un-posed) count explicitly."""
+    lines = ['**Legend** — part colors when Color by part is enabled:', '']
+    for k, pid in enumerate(part_ids):
+        name = PALETTE_NAMES[pid % len(PALETTE_NAMES)]
+        lines.append(f'- {name} — part {pid}: {counts["per_part"][k]:,} pts')
+    lines.append(f'- unassigned (hidden, no part pose): {counts["unassigned"]:,} pts')
+    return '\n'.join(lines)
+
 
 def frame_view(center, radius, factor=3.2, min_dist=0.3, max_dist=1.1,
                direction=VIEW_DIR, up=(0., -1., 0.)):

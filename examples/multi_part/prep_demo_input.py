@@ -32,7 +32,19 @@ def prepare(render_dir, out_dir):
         seg = cv2.imread(str(render_dir / 'seg' / name), cv2.IMREAD_GRAYSCALE)
         if not cv2.imwrite(str(out_dir / 'masks' / name), union_mask(seg)):
             raise IOError(f'could not write mask {name}')
-    print(f'[prep] {len(names)} frames -> {out_dir} (rgb/depth/masks/cam_K.txt)')
+    # Record that these masks are an ORACLE, so no downstream reader mistakes
+    # this for a live-segmentation (SAM2) control.
+    provenance = dict(
+        mask_source='oracle_sim_seg_union',
+        rule='seg != 255 (renderer part index; 255 = background)',
+        render_dir=str(render_dir),
+        holds_out=['per_part_labels', 'gt_poses'],
+        note='Perfect object mask, cleaner than a live SAM2 mask; isolates '
+             'tracking from segmentation error and does NOT evaluate SAM2 quality.',
+        frames=len(names))
+    (out_dir / 'mask_provenance.json').write_text(json.dumps(provenance, indent=2))
+    print(f'[prep] {len(names)} frames -> {out_dir} '
+          f'(rgb/depth/masks/cam_K.txt + mask_provenance.json; oracle union mask)')
     return len(names)
 
 

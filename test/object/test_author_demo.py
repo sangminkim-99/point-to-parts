@@ -7,7 +7,9 @@ import pytest
 from scipy.spatial.transform import Rotation
 from examples.multi_part.author_demo import ReferenceTracker
 from examples.multi_part.author_state import (displayed_poses, save_snapshot, snapshot,
-                                              union_mask, cloud_center_radius, frame_view)
+                                              union_mask, cloud_center_radius, frame_view,
+                                              geometry_counts, legend_markdown, PALETTE,
+                                              PALETTE_NAMES)
 from examples.multi_part.recording import Recording
 from test.object.test_urdf_export import model, fk
 
@@ -129,6 +131,24 @@ def test_npz_masks_take_precedence_over_png(tmp_path):
 
 # ---- union mask / framing helpers --------------------------------------------
 
+def test_prep_writes_oracle_mask_provenance(tmp_path):
+    from examples.multi_part.prep_demo_input import prepare
+    render, out = tmp_path / 'render', tmp_path / 'track'
+    for sub in ('rgb', 'depth', 'seg'):
+        (render / sub).mkdir(parents=True)
+    (render / 'meta.json').write_text(json.dumps({'intrinsics': np.eye(3).tolist()}))
+    cv2.imwrite(str(render / 'rgb' / '000000.png'), np.zeros((6, 6, 3), np.uint8))
+    cv2.imwrite(str(render / 'depth' / '000000.png'), np.full((6, 6), 700, np.uint16))
+    seg = np.full((6, 6), 255, np.uint8); seg[1:4, 1:4] = 0        # object = seg != 255
+    cv2.imwrite(str(render / 'seg' / '000000.png'), seg)
+    prepare(render, out)
+    prov = json.loads((out / 'mask_provenance.json').read_text())
+    assert prov['mask_source'] == 'oracle_sim_seg_union'
+    assert 'gt_poses' in prov['holds_out'] and 'per_part_labels' in prov['holds_out']
+    m = cv2.imread(str(out / 'masks' / '000000.png'), cv2.IMREAD_GRAYSCALE)
+    assert int((m > 0).sum()) == 9                                  # the 3x3 object block
+
+
 def test_union_mask_matches_renderer_background_convention():
     seg = np.array([[255, 0], [1, 255]], np.uint8)          # 255 = background
     np.testing.assert_array_equal(union_mask(seg), [[0, 1], [1, 0]])
@@ -156,6 +176,31 @@ def test_select_reference_rejects_a_vanished_identity():
     t.reference_id = 9
     with pytest.raises(RuntimeError):
         t._pick_root()                                        # gone -> explicit, no silent promote
+
+
+# ---- assigned vs unassigned geometry counts / legend ------------------------
+
+def test_geometry_counts_separate_unassigned_from_parts():
+    labels = np.array([0, 0, 1, -1, -1, -1, 1])       # 2 in part0, 2 in part1, 3 unassigned
+    c = geometry_counts(labels, n_parts=2)
+    assert c['per_part'] == [2, 2]
+    assert c['assigned'] == 4
+    assert c['unassigned'] == 3                        # the -1s, not dropped silently
+    # A label >= n_parts is also unassigned, never miscounted into a part.
+    assert geometry_counts(np.array([0, 5]), 2)['unassigned'] == 1
+
+
+def test_legend_names_each_part_and_states_unassigned():
+    c = geometry_counts(np.array([0, 0, 1, -1]), 2)
+    md = legend_markdown([0, 2], c)                    # part_ids 0 and 2
+    assert PALETTE_NAMES[0] in md and 'part 0' in md
+    assert PALETTE_NAMES[2 % len(PALETTE_NAMES)] in md and 'part 2' in md
+    assert 'unassigned' in md and 'no part pose' in md
+    assert '\n\n- ' in md                              # Markdown list separation
+
+
+def test_palette_and_names_are_aligned():
+    assert len(PALETTE) == len(PALETTE_NAMES)           # swatch and label always agree
 
 
 def test_lost_root_is_saved_as_unobserved_not_tracked(tmp_path):
