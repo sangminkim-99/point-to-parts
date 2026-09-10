@@ -183,5 +183,13 @@ python -m examples.multi_part.urdf_view results/urdf_validation/drawer.urdf \
    traces contain separate `recovered` flags; diagnostic branch counters explain
    skipped searches. Next inspect other-part surface confusion / canonical model
    bias before relaxing gates. Clean hinge remains unchanged.
+   Offline candidate audit confirms wrong-part matching: all 166 supported
+   points at frame 110 are base, not lid (`doc/recovery_surface_ownership.md`).
+   Optional `recovery_exclude_owned` projects other observed estimated parts
+   and excludes depth-agreeing pixels, rejecting all four wrong recoveries.
+   Lid remains lost/held; no correct recovery gained. Drawer unchanged but never
+   searches, so next build a positive recovery control before promoting this
+   gate. Snapshot option `recovery_debug_dir` contains no GT; offline oracle
+   diagnostic is `scripts/sim/diagnose_recovery.py`.
 5. Keep matched ablations and negative results. Commit/push tested checkpoints,
    leave larger data local, and report meaningful progress in Korean.

@@ -21,6 +21,24 @@ def uncovered_surface(mask, depth, tracks, radius=14, min_region=400):
     return keep[labels].astype(np.uint8)
 
 
+def unowned_depth_mask(mask, depth, K, surfaces, tolerance=.012):
+    """Remove pixels supported by other currently observed estimated parts."""
+    owned = np.zeros(mask.shape, np.uint8)
+    h, w = mask.shape
+    for points, pose in surfaces:
+        q = np.asarray(points) @ pose[:3, :3].T + pose[:3, 3]
+        q = q[np.isfinite(q).all(1) & (q[:, 2] > .05)]
+        uv = q @ K.T
+        xy = np.rint(uv[:, :2] / q[:, 2:3]).astype(int)
+        valid = (xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h)
+        xy, q = xy[valid], q[valid]
+        u, v = xy[:, 0], xy[:, 1]
+        supported = (depth[v, u] > .05) & (np.abs(q[:, 2] - depth[v, u]) <= tolerance)
+        owned[v[supported], u[supported]] = 1
+    owned = cv2.dilate(owned, np.ones((5, 5), np.uint8))
+    return ((mask > 0) & (owned == 0)).astype(np.uint8)
+
+
 def match_joint_surface(points, poses, depth, mask, K, tolerance=0.012,
                         min_support=20, min_fraction=0.3, margin=0.05):
     """Find a distinguishable joint pose from depth, with no feature matches.

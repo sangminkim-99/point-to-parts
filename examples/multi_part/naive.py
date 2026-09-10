@@ -293,6 +293,8 @@ class NaiveConfig:
     surface_min_region: int = 400
     surface_recovery: bool = False     # recover a known joint without old point tracks
     recovery_contradicted_pose: bool = False  # also test geometrically contradicted sparse fits
+    recovery_debug_dir: str = ""       # optional GT-free candidate snapshots
+    recovery_exclude_owned: bool = False  # exclude depth supported by other tracked parts
     recovery_grid: int = 121
     recovery_tol: float = 0.012
     recovery_fraction: float = 0.3
@@ -934,7 +936,27 @@ class NaivePartTracker:
             extra = np.pi / 2 if jm.kind == "revolute" else .1
             grid = np.linspace(min(values) - extra, max(values) + extra, cfg.recovery_grid)
             poses = [parent.pose @ jm.at(float(v)) for v in grid]
-            result = match_joint_surface(points, poses, depth, mask, self.K,
+            recovery_mask = mask
+            if cfg.recovery_exclude_owned and self.model is not None:
+                from examples.multi_part.surface_memory import unowned_depth_mask
+                surfaces = []
+                for other_j, other in enumerate(self.parts):
+                    if other_j == j or not other.observed:
+                        continue
+                    ids = np.flatnonzero(self.model.labels == other_j)
+                    xyz = self.model.cloud.means[ids].detach().cpu().numpy()
+                    surfaces.append((xyz, other.pose))
+                recovery_mask = unowned_depth_mask(mask, depth, self.K, surfaces)
+            if cfg.recovery_debug_dir:
+                from pathlib import Path
+                target = Path(cfg.recovery_debug_dir)
+                target.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(target / f"frame{i:05d}_part{p.part_id}.npz",
+                    frame=i, part_id=p.part_id, points=points, poses=poses,
+                    values=grid, depth=depth, mask=recovery_mask, K=self.K,
+                    current_pose=p.pose, tolerance=cfg.recovery_tol,
+                    min_fraction=cfg.recovery_fraction, margin=cfg.recovery_margin)
+            result = match_joint_surface(points, poses, depth, recovery_mask, self.K,
                                          tolerance=cfg.recovery_tol,
                                          min_fraction=cfg.recovery_fraction,
                                          margin=cfg.recovery_margin)
