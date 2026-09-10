@@ -206,3 +206,32 @@ def fmt(name, res, n_parts):
         L.append(f"    joint {j['gt']:6s} {j['kind']:9s} (spec {j['spec_kind']}, "
                  f"mocap {j['ref_kind']})  axis {j['ang']:5.1f} deg  dist {dd}")
     return "\n".join(L)
+
+
+def save_pose_trace(reader, gt, filename):
+    """Archive all IDs, including deleted ones, without pickle or tracker feedback."""
+    from pathlib import Path
+    ids = sorted({p for row in gt['id_log'] for p in row})
+    frames = np.array([f for f, _ in gt['log']], dtype=int)
+    poses = np.full((len(frames), len(ids), 4, 4), np.nan)
+    votes = np.zeros((len(frames), len(ids), len(gt['parts'])), dtype=int)
+    observed = np.zeros((len(frames), len(ids)), dtype=bool)
+    present = np.zeros_like(observed)
+    for t, ((_, Ts), row) in enumerate(zip(gt['log'], gt['id_log'])):
+        for j, identity in enumerate(row):
+            k = ids.index(identity)
+            present[t, k] = True
+            if Ts[j] is not None:
+                poses[t, k] = Ts[j]
+            votes[t, k] = gt['votes'][t][j]
+            observed[t, k] = gt['observed'][t][j]
+    truth = np.full((len(frames), len(gt['parts']), 4, 4), np.nan)
+    for t, f in enumerate(frames):
+        for k, part in enumerate(gt['parts']):
+            T = reader.get_gt_pose(int(f), part)
+            if T is not None:
+                truth[t, k] = T
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(filename, frames=frames, part_ids=ids, poses=poses,
+                        present=present, observed=observed, votes=votes,
+                        gt_names=gt['parts'], gt_poses=truth)

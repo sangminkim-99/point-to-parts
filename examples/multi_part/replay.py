@@ -149,11 +149,15 @@ def main():
     ap.add_argument("--shorter-side", type=int, default=None)
     ap.add_argument("--min-frames", type=int, default=None)
     ap.add_argument("--regroup-every", type=int, default=None)
+    ap.add_argument("--trace-out", help="save per-frame estimated IDs/poses and evaluation-only GT")
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
     args = ap.parse_args()
     if args.save_model and args.method != "naive":
         ap.error("--save-model currently requires --method naive with dense enabled")
+
+    if args.trace_out and (args.method != "naive" or args.no_eval):
+        ap.error("trace-out requires naive with dataset evaluation")
 
     # a RealSense recording (rgb/, depth/, cam_K.txt), an RBO sequence
     # (camera_rgb/, tf.csv) or a rendered SAPIEN sequence
@@ -411,6 +415,14 @@ def main():
                 except Exception as exc:
                     print(f"[replay] track labelling failed ({exc})")
 
+        if args.trace_out and gt is not None:
+            votes = []
+            for p in s.parts:
+                ix = p.idx[p.idx < len(gt['lab'])]
+                lab = gt['lab'][ix]
+                votes.append(np.bincount(lab[lab >= 0], minlength=len(gt['parts'])))
+            gt.setdefault('votes', []).append(votes)
+            gt.setdefault('observed', []).append([p.observed for p in s.parts])
         vis = s.render(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy(),
                        style=(args.vis if args.method == 'naive' else 'clean'))
         if args.hyp_panel and hasattr(s, "hypothesis_panel"):
@@ -448,6 +460,11 @@ def main():
             if k == ord(" "):                       # pause until space again
                 while (cv2.waitKey(50) & 0xFF) != ord(" "):
                     pass
+    if args.trace_out:
+        if gt is None:
+            raise RuntimeError("trace-out requires dataset ground truth")
+        from examples.multi_part.evaluate import save_pose_trace
+        save_pose_trace(r, gt, args.trace_out)
     if writer:
         writer.release()
     if args.view:
