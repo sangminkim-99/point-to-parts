@@ -61,6 +61,10 @@ class LiveAcquire:
         self.dscale = pr.get_device().first_depth_sensor().get_depth_scale()
         print(f"camera {it.width}x{it.height} fx={it.fx:.1f}")
 
+    def _make_stream(self, cfg, tracker, reg):
+        from examples.multi_part.naive import NaivePartTracker
+        return NaivePartTracker(self.K, cfg, tracker, reg)
+
     def _frames(self):
         f = self.align.process(self.pipe.wait_for_frames())
         c, d = f.get_color_frame(), f.get_depth_frame()
@@ -356,7 +360,7 @@ class LiveAcquire:
                             "inlier_thres": cfg.inlier_thres,
                             "min_inliers": cfg.min_inliers,
                             "max_clusters": 4, "use_uncertainty": False})
-                    self.stream = NaivePartTracker(self.K, cfg, tracker, reg)
+                    self.stream = self._make_stream(cfg, tracker, reg)
                     self.stream.start(rgb, depth, mask)
                     self.started = True
                     print(f"started with {len(self.stream.anchor_xyz)} points "
@@ -370,7 +374,7 @@ class LiveAcquire:
             self.acq.report(fps, fps)
 
 
-def main():
+def main(app_class=LiveAcquire, configure_parser=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--serial", default=None)
     ap.add_argument("--vis", choices=["clean", "debug"], default="clean",
@@ -404,7 +408,9 @@ def main():
     ap.add_argument("--sam-checkpoint",
                     default="checkpoints/sam2.1/sam2.1_hiera_large.pt")
     ap.add_argument("--sam-config", default="configs/sam2.1/sam2.1_hiera_l.yaml")
-    LiveAcquire(ap.parse_args()).run()
+    if configure_parser is not None:
+        configure_parser(ap)
+    app_class(ap.parse_args()).run()
 
 
 if __name__ == "__main__":

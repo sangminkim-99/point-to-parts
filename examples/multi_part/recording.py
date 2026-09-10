@@ -47,5 +47,8 @@ class Recording:
 
     def get_mask(self, i):
         if self._masks is None or i not in self._mi:
-            return None
+            # Online authoring writes one mask per processed frame so capture
+            # remains replayable even if the process exits unexpectedly.
+            path = self.root / 'masks' / self.rgb_files[i].name if 0 <= i < len(self.rgb_files) else None
+            return cv2.imread(str(path), cv2.IMREAD_GRAYSCALE) if path is not None and path.exists() else None
         return np.asarray(self._masks[self._mi[i]])
