@@ -30,3 +30,28 @@ def test_duplicate_ids_rejected():
     p = PartCloud(0, torch.zeros((1, 3)), torch.eye(4))
     with pytest.raises(ValueError, match='unique'):
         point_sphere_clearance(torch.ones((1, 4)), [p, p])
+
+
+def test_sweep_catches_thin_surface_missed_by_endpoints():
+    from examples.manipulation.point_sphere import swept_point_sphere_clearance
+    part = PartCloud(0, torch.zeros((1, 3)), torch.eye(4), 0.)
+    spheres = torch.tensor([[[[-1., 0, 0, .1]], [[1., 0, 0, .1]]]])
+    assert (point_sphere_clearance(spheres, [part]) > 0).all()
+    assert swept_point_sphere_clearance(spheres, [part]).item() == pytest.approx(-.1)
+
+
+def test_stationary_sweep_and_varying_radius_are_conservative():
+    from examples.manipulation.point_sphere import swept_point_sphere_clearance
+    part = PartCloud(0, torch.zeros((1, 3)), torch.eye(4), .02)
+    spheres = torch.tensor([[[[0., 0, 1., .1]], [[0., 0, 1., .2]]]], requires_grad=True)
+    gap = swept_point_sphere_clearance(spheres, [part])
+    assert gap.item() == pytest.approx(.78)
+    gap.sum().backward()
+    assert torch.isfinite(spheres.grad).all()
+
+
+def test_sweep_rejects_changing_sphere_activation():
+    from examples.manipulation.point_sphere import swept_point_sphere_clearance
+    spheres = torch.tensor([[[0., 0, 0, .1]], [[0., 0, 0, -1.]]])
+    with pytest.raises(ValueError, match='activation'):
+        swept_point_sphere_clearance(spheres, [])

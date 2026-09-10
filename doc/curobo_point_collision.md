@@ -65,7 +65,7 @@ Warp-based collision/ESDF paths have not been validated; do not assume them usab
 - Use the user's actual robot configuration and camera-to-robot calibration.
   Franka is currently only a test fixture; the actual robot is pending user input.
 - Connect the cloud cost to a trajectory objective / validate candidate plans;
-  current samples do not include swept collision, robot self-collision, joint
+  current queries include linear sphere sweeps (see below), but not robot self-collision, joint
   limits, dynamics, gripper contact exceptions or object motion along a trajectory.
 - Keep missing surfaces and stale part poses explicit. Empty clouds return inf
   meaning no evidence, not certified free space. Interior occupancy is unknown;
@@ -74,3 +74,30 @@ Warp-based collision/ESDF paths have not been validated; do not assume them usab
   interpolation or swept queries to avoid tunneling through thin surfaces.
 - A 5 mm default padding is a configurable initial allowance, not a measured
   uncertainty bound. Avoid changing object geometry to hide tracking errors.
+
+## Swept sampled-trajectory queries
+
+`point_sphere.py` now provides `swept_point_sphere_clearance` for
+`[..., T, S, 4]` sphere trajectories and `curobo_trajectory_clearance` for
+`[B,T,D]` joint trajectories. It computes closest points on each straight
+sphere-center segment to every sampled object point, in the part's rigid local
+frame. Fixed-radius linear sphere motion is handled exactly against these points;
+varying radius uses the larger endpoint radius conservatively. Activation changes
+are rejected. Static segments, empty clouds, disabled spheres and gradients are
+handled. The first endpoint query reuses validation; spatial indexing remains a
+future optimization.
+
+A regression test detects a sphere crossing a thin sampled surface even though
+both endpoint clearances are positive. Further tests cover stationary centers,
+varying radii and activation changes. GPU smoke uses actual Franka FK at five
+joint samples, 65 spheres and 15,667 drawer points; output shape is [1,4,65,1].
+Finite nonzero trajectory gradient norm is 0.2776. Output is
+`results/curobo_swept_v1/smoke.json`; placement remains synthetic.
+
+This is exact only for the **linear center segments**. It is not continuous
+collision certification for nonlinear joint-space interpolation: curved FK paths
+may leave those segments. The object poses are fixed during the query. Dense
+joint sampling or conservative curvature bounds, time-varying articulation,
+self-collision and MotionGen integration remain outstanding. It also does not
+establish occupied interiors or treat unobserved surfaces as free space.
+The relevant test suite now has 70 passing tests.

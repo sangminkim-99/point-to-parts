@@ -7,7 +7,7 @@ import time
 import numpy as np
 import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from examples.manipulation.point_sphere import PartCloud, curobo_clearance
+from examples.manipulation.point_sphere import PartCloud, curobo_clearance, curobo_trajectory_clearance
 
 
 def main():
@@ -35,6 +35,12 @@ def main():
     assert q.grad.norm().item() > 1e-6
     far = T.clone(); far[0, 3] += 10.
     assert curobo_clearance(model, q.detach(), [PartCloud(0, points, far)]).min().item() > 0
+    trajectory = q.detach()[:, None, :].repeat(1, 5, 1)
+    trajectory[0, :, 0] += torch.linspace(0, .1, 5, device=q.device)
+    trajectory.requires_grad_(True)
+    swept = curobo_trajectory_clearance(model, trajectory, [part])
+    swept.min().backward()
+    assert torch.isfinite(trajectory.grad).all() and trajectory.grad.norm().item() > 0
     times = []
     with torch.no_grad():
         for _ in range(12):
@@ -45,6 +51,8 @@ def main():
         robot='franka.yml', spheres=int(spheres.shape[1]), points=len(points),
         colliding_clearance_m=float(minimum.detach()), finite_joint_gradient=True,
         joint_gradient_norm=float(q.grad.norm()),
+        swept_shape=list(swept.shape), swept_min_clearance_m=float(swept.min().detach()),
+        trajectory_gradient_norm=float(trajectory.grad.norm()),
         median_query_ms=float(np.median(times[2:])), source_cloud=str(args.cloud))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2)+'\n'); print(json.dumps(result, indent=2))

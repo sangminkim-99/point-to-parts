@@ -149,6 +149,11 @@ on saved drawer points. See `doc/curobo_point_collision.md` for source/runtime,
 Warp limitation, and next planner integration steps. Actual robot model pending
 user answer; do not interpret synthetic object placement as calibration. Prioritize
 this mesh-free manipulation path alongside texture/no-texture tracking controls.
+Linear sphere sweep queries now catch between-sample point collisions and run
+through real Franka FK/trajectory gradients (`results/curobo_swept_v1`). They do
+not bound curved FK motion or moving object articulation. Next connect costs to
+a candidate trajectory validator/optimizer with self-collision and joint limits;
+do not call this MotionGen integration or continuous joint-space certification.
 
 1. The first RGB-D keyframe control is complete (`doc/keyframe_baseline.md`).
    LightGlue previous-only / best-keyframe / pooled-keyframe median errors are

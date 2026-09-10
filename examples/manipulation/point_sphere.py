@@ -62,3 +62,58 @@ def curobo_clearance(robot_model, q, parts, chunk_size=2048):
     if spheres is None:
         raise ValueError('cuRobo robot configuration must include collision spheres')
     return point_sphere_clearance(spheres, parts, chunk_size)
+
+
+def swept_point_sphere_clearance(spheres, parts, chunk_size=2048):
+    """Clearance [...,T-1,S,P] for straight sphere-center segments.
+
+    Input is [...,T,S,4]. Exact for fixed-radius linear sphere motion against
+    sampled points; uses the larger endpoint radius if radius varies. Objects
+    are static during each query. Curved FK motion between samples is NOT bounded.
+    Sphere activation must remain constant over the trajectory.
+    """
+    if spheres.ndim < 3 or spheres.shape[-3] < 2 or spheres.shape[-1] != 4:
+        raise ValueError('expected [...,T,S,4] with T >= 2')
+    if not torch.isfinite(spheres).all():
+        raise ValueError('sphere coordinates must be finite')
+    active = spheres[..., 3] > 0
+    if not torch.equal(active[..., 1:, :], active[..., :-1, :]):
+        raise ValueError('sphere activation must be constant along trajectory')
+    # Reuse the validated static query at the first endpoint. This small query
+    # also validates empty part lists, rigid transforms and point geometry.
+    point_sphere_clearance(spheres[..., 0, :, :], parts, chunk_size)
+    radii = torch.maximum(spheres[..., :-1, :, 3], spheres[..., 1:, :, 3])
+    output = []
+    for part in parts:
+        T = part.pose
+        a = (spheres[..., :-1, :, :3] - T[:3, 3]) @ T[:3, :3]
+        b = (spheres[..., 1:, :, :3] - T[:3, 3]) @ T[:3, :3]
+        direction = (b - a).unsqueeze(-2)
+        length2 = direction.square().sum(-1).clamp_min(torch.finfo(spheres.dtype).tiny)
+        distance = torch.full_like(radii, float('inf'))
+        for chunk in part.points.split(chunk_size):
+            if not len(chunk):
+                continue
+            delta = chunk - a.unsqueeze(-2)
+            fraction = ((delta * direction).sum(-1) / length2).clamp(0, 1)
+            nearest = a.unsqueeze(-2) + fraction.unsqueeze(-1) * direction
+            d = torch.linalg.vector_norm(nearest - chunk, dim=-1).amin(-1)
+            distance = torch.minimum(distance, d)
+        gap = distance - radii - part.padding
+        output.append(torch.where(radii > 0, gap, torch.full_like(gap, float('inf'))))
+    return torch.stack(output, -1) if output else spheres.new_empty((*radii.shape, 0))
+
+
+def curobo_trajectory_clearance(robot_model, q, parts, chunk_size=2048):
+    """Sample cuRobo FK for [B,T,D] joints, then sweep centers between samples.
+
+    Callers must choose adequate joint sampling for curved link motion. This
+    does not invoke MotionGen or certify continuous joint-space collision freedom.
+    """
+    if q.ndim != 3 or q.shape[1] < 2:
+        raise ValueError('expected joint trajectory [B,T,D], T >= 2')
+    spheres = robot_model.get_state(q.reshape(-1, q.shape[-1])).link_spheres_tensor
+    if spheres is None:
+        raise ValueError('cuRobo robot configuration must include collision spheres')
+    spheres = spheres.reshape(q.shape[0], q.shape[1], -1, 4)
+    return swept_point_sphere_clearance(spheres, parts, chunk_size)
