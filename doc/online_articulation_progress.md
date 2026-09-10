@@ -177,5 +177,11 @@ python -m examples.multi_part.urdf_view results/urdf_validation/drawer.urdf \
    `joint_reprojection_gate` reproduces no-joint hinge and mostly retains drawer
    overrides, with no evidence to promote it. Defaults unchanged. Missing-surface
    pose initialization/identity remains the next substantial tracking target.
+   Recovery eligibility ablation now recorded (`doc/surface_recovery_retry.md`):
+   retrying a depth-contradicted observed pose adds one FALSE recovery in combined
+   motion (frame 110, 75 -> 445 mm). Keep `recovery_contradicted_pose` off. Fresh
+   traces contain separate `recovered` flags; diagnostic branch counters explain
+   skipped searches. Next inspect other-part surface confusion / canonical model
+   bias before relaxing gates. Clean hinge remains unchanged.
 5. Keep matched ablations and negative results. Commit/push tested checkpoints,
    leave larger data local, and report meaningful progress in Korean.

@@ -256,3 +256,37 @@ def test_split_gate_requires_observable_contradiction_reduction():
 def test_split_gate_does_not_use_hidden_geometry_as_articulation_evidence():
     tracker, part, groups, motions = _split_gate_scene(1.2)
     assert not tracker._validate_split_reprojection(0, part, groups, motions)
+
+
+def test_contradicted_observed_pose_can_recover_without_training_joint(monkeypatch):
+    import examples.multi_part.surface_memory as memory
+    s = recovery_tracker()
+    s.cfg.recovery_contradicted_pose = True
+    child = s.parts[1]
+    child.observed = True
+    original = np.stack(child.joint.A).copy()
+    monkeypatch.setattr(memory, 'reprojection_evidence', lambda *args: {
+        'support': 0., 'contradiction': .8, 'visible': .8})
+    depth, mask = panel_depth(pose(140), thickness=.003)
+    s._recover_surfaces(depth, mask, 10)
+    assert child.observed and not child.surface_recovered
+    s._recover_surfaces(depth, mask, 11)
+    assert child.surface_recovered and not child.observed
+    assert child.part_id == 7
+    np.testing.assert_array_equal(np.stack(child.joint.A), original)
+    assert s.recovery_diagnostics['accepted'] == 1
+
+
+def test_supported_observed_pose_is_not_replaced_by_recovery(monkeypatch):
+    import examples.multi_part.surface_memory as memory
+    s = recovery_tracker()
+    s.cfg.recovery_contradicted_pose = True
+    child = s.parts[1]
+    child.observed = True
+    monkeypatch.setattr(memory, 'reprojection_evidence', lambda *args: {
+        'support': .8, 'contradiction': .1, 'visible': .9})
+    depth, mask = panel_depth(pose(140))
+    s._recover_surfaces(depth, mask, 10)
+    assert child.observed and not child.surface_recovered
+    assert s.recovery_diagnostics['not_contradicted'] == 1
+    assert s.recovery_diagnostics['search'] == 0

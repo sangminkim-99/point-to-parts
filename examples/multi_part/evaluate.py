@@ -217,6 +217,7 @@ def save_pose_trace(reader, gt, filename):
     votes = np.zeros((len(frames), len(ids), len(gt['parts'])), dtype=int)
     observed = np.zeros((len(frames), len(ids)), dtype=bool)
     present = np.zeros_like(observed)
+    recovered = np.zeros_like(observed)
     for t, ((_, Ts), row) in enumerate(zip(gt['log'], gt['id_log'])):
         for j, identity in enumerate(row):
             k = ids.index(identity)
@@ -225,6 +226,8 @@ def save_pose_trace(reader, gt, filename):
                 poses[t, k] = Ts[j]
             votes[t, k] = gt['votes'][t][j]
             observed[t, k] = gt['observed'][t][j]
+            if 'recovered' in gt:
+                recovered[t, k] = gt['recovered'][t][j]
     truth = np.full((len(frames), len(gt['parts']), 4, 4), np.nan)
     for t, f in enumerate(frames):
         for k, part in enumerate(gt['parts']):
@@ -233,5 +236,5 @@ def save_pose_trace(reader, gt, filename):
                 truth[t, k] = T
     Path(filename).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(filename, frames=frames, part_ids=ids, poses=poses,
-                        present=present, observed=observed, votes=votes,
+                        present=present, observed=observed, recovered=recovered, votes=votes,
                         gt_names=gt['parts'], gt_poses=truth)

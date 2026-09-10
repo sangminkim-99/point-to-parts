@@ -292,6 +292,7 @@ class NaiveConfig:
     surface_radius: int = 14
     surface_min_region: int = 400
     surface_recovery: bool = False     # recover a known joint without old point tracks
+    recovery_contradicted_pose: bool = False  # also test geometrically contradicted sparse fits
     recovery_grid: int = 121
     recovery_tol: float = 0.012
     recovery_fraction: float = 0.3
@@ -894,20 +895,26 @@ class NaivePartTracker:
         Recovery is an observation of joint STATE, not independent evidence of
         joint type/axis: it never feeds its own predictions back to joint.fit.
         """
-        from examples.multi_part.surface_memory import match_joint_surface
+        from examples.multi_part.surface_memory import match_joint_surface, reprojection_evidence
         cfg = self.cfg
+        from collections import Counter
+        if not hasattr(self, 'recovery_diagnostics'):
+            self.recovery_diagnostics = Counter()
         for j, p in enumerate(self.parts):
-            if p.observed:
+            if p.observed and not cfg.recovery_contradicted_pose:
+                self.recovery_diagnostics['observed_skip'] += 1
                 p.recovery_pending = None
                 continue
             jm = p.joint
             if jm is None or jm.kind not in ("revolute", "prismatic") \
                     or p.parent == j or not 0 <= p.parent < len(self.parts):
+                self.recovery_diagnostics['no_joint'] += 1
                 continue
             parent = self.parts[p.parent]
             conf = jm.confidence()
             if not parent.observed or not conf.get("valid", False) \
                     or conf.get("conf", 0) < cfg.joint_conf or not jm.A:
+                self.recovery_diagnostics['untrusted_joint_or_parent'] += 1
                 continue
             if self.model is not None:
                 lb = self.model.labels
@@ -916,6 +923,13 @@ class NaivePartTracker:
                 points = self.model.cloud.means[selected].detach().cpu().numpy()
             else:
                 points = self.anchor_xyz[p.idx[self.anchor_ok[p.idx]]]
+            if p.observed:
+                evidence = reprojection_evidence(points, p.pose, depth, mask, self.K)
+                if evidence['contradiction'] < .25 or evidence['support'] >= .25:
+                    self.recovery_diagnostics['not_contradicted'] += 1
+                    p.recovery_pending = None
+                    continue
+            self.recovery_diagnostics['search'] += 1
             values = [jm.value_of(A) for A in jm.A]
             extra = np.pi / 2 if jm.kind == "revolute" else .1
             grid = np.linspace(min(values) - extra, max(values) + extra, cfg.recovery_grid)
@@ -925,6 +939,7 @@ class NaivePartTracker:
                                          min_fraction=cfg.recovery_fraction,
                                          margin=cfg.recovery_margin)
             if result is None:
+                self.recovery_diagnostics['no_distinct_surface_match'] += 1
                 p.recovery_pending = None
                 continue
             value = float(grid[result["index"]])
@@ -934,13 +949,16 @@ class NaivePartTracker:
                 and abs(value - pending[1]) < step else 1
             p.recovery_pending = (i, value, count)
             if count < cfg.recovery_confirm:
+                self.recovery_diagnostics['await_confirmation'] += 1
                 continue
             p.pose = result["pose"]
+            p.observed = False  # recovered joint state is not independent joint-fit evidence
             p.surface_recovered = True
             p.recovery_region = result["region"]
             p.resid = cfg.recovery_tol
             p.on_joint = True
             self.surface_recoveries = getattr(self, "surface_recoveries", 0) + 1
+            self.recovery_diagnostics['accepted'] += 1
 
     def _grow_co(self, n):
         """Keep the co-association matrices as wide as the track set."""

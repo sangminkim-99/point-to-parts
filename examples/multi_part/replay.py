@@ -423,6 +423,7 @@ def main():
                 votes.append(np.bincount(lab[lab >= 0], minlength=len(gt['parts'])))
             gt.setdefault('votes', []).append(votes)
             gt.setdefault('observed', []).append([p.observed for p in s.parts])
+            gt.setdefault('recovered', []).append([getattr(p, 'surface_recovered', False) for p in s.parts])
         vis = s.render(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy(),
                        style=(args.vis if args.method == 'naive' else 'clean'))
         if args.hyp_panel and hasattr(s, "hypothesis_panel"):
@@ -544,6 +545,8 @@ def main():
         if getattr(s, "bic_blocked", 0):
             print(f"[replay] {s.bic_blocked} splits refused: not worth six more "
                   f"parameters")
+        if getattr(s, 'recovery_diagnostics', None):
+            print(f"[replay] surface recovery gates: {dict(s.recovery_diagnostics)}")
         if args.dump_joint:
             d = {}
             for j, p in enumerate(s.parts):

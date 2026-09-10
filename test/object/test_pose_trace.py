@@ -9,7 +9,7 @@ def test_trace_keeps_deleted_ids_and_missing_truth_without_pickle(tmp_path):
     T = np.eye(4)
     gt = dict(parts=['body'], log=[(1, [T, T]), (2, [T])],
               id_log=[[0, 2], [0]], votes=[[[10], [6]], [[12]]],
-              observed=[[True, False], [True]])
+              observed=[[True, False], [True]], recovered=[[False, True], [False]])
     path = tmp_path / 'trace.npz'
     save_pose_trace(Reader(), gt, path)
     d = np.load(path, allow_pickle=False)
@@ -19,3 +19,4 @@ def test_trace_keeps_deleted_ids_and_missing_truth_without_pickle(tmp_path):
     assert np.isnan(d['gt_poses'][1, 0]).all()
     assert d['votes'][0, 1, 0] == 6
     assert not d['observed'][0, 1]
+    assert d['recovered'].tolist() == [[False, True], [False, False]]
