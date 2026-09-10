@@ -1,0 +1,9 @@
+# Opt-in alternative split gate (default remains "contradiction"). Extends the
+# reprojection_split config and turns on the residual_veto union gate with
+# temporal persistence (3 strictly-consecutive same-partition frames). This
+# recovers real prismatic slides the contradiction gate misses; it can leave an
+# extra weak part on some captures (see doc/drawer_split_validation.md). Not a
+# default; select explicitly with --config reprojection_split_residual_veto.yaml.
+extends: reprojection_split.yaml
+split_reprojection_mode: residual_veto
+split_reprojection_persist: 3

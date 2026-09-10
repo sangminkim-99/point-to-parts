@@ -112,9 +112,21 @@ def reprojection_evidence(points, pose, depth, mask, K, tolerance=.012,
     valid &= np.isfinite(d) & (d > .05)
     obj = mask[v, u] > 0
     support = valid & obj & (np.abs(z - d) <= tolerance)
-    contradiction = valid & ((z < d - tolerance) | (~obj & (z <= d + tolerance)))
+    # Two kinds of contradiction, kept separate so a gate can veto the genuine
+    # one (free-space, in front of a confirmed surface) without penalising the
+    # benign one (off-silhouette: a slide's moved surface spilling past the mask
+    # edge). They OVERLAP and do not sum to `contradiction`.
+    freespace = valid & (z < d - tolerance)
+    offsil = valid & ~obj & (z <= d + tolerance)
+    contradiction = freespace | offsil
     if not occlusion_aware:
         contradiction |= valid & (z > d + tolerance)
+    # continuous on-object depth residual (None when nothing lands on-object)
+    on_obj = valid & obj & (np.abs(z - d) <= 0.1)
+    resid = float(np.mean(np.abs((z - d)[on_obj]))) if on_obj.any() else None
     return {"support": float(support.mean()),
             "contradiction": float(contradiction.mean()),
+            "contradiction_freespace": float(freespace.mean()),
+            "contradiction_offsilhouette": float(offsil.mean()),
+            "resid": resid,
             "visible": float((support | contradiction).mean())}

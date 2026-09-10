@@ -196,7 +196,9 @@ def test_reprojection_occlusion_is_not_motion_evidence():
     assert reprojection_evidence(pts, T, depth, mask, K)['support'] == 1
     T[2, 3] = .1
     hidden = reprojection_evidence(pts, T, depth, mask, K)
-    assert hidden == {'support': 0., 'contradiction': 0., 'visible': 0.}
+    assert hidden == {'support': 0., 'contradiction': 0., 'visible': 0.,
+                      'contradiction_freespace': 0., 'contradiction_offsilhouette': 0.,
+                      'resid': None}
     T[2, 3] = -.1
     assert reprojection_evidence(pts, T, depth, mask, K)['contradiction'] == 1
 
@@ -208,7 +210,8 @@ def test_reprojection_invalid_depth_and_offscreen_are_neutral():
     mask = np.ones((40, 40), np.uint8)
     pts = np.array([[0., 0., 1.], [10, 10, 1.]])
     assert reprojection_evidence(pts, np.eye(4), depth, mask, K) == {
-        'support': 0., 'contradiction': 0., 'visible': 0.}
+        'support': 0., 'contradiction': 0., 'visible': 0.,
+        'contradiction_freespace': 0., 'contradiction_offsilhouette': 0., 'resid': None}
 
 
 def test_reprojection_silhouette_contradiction():

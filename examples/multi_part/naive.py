@@ -288,6 +288,17 @@ class NaiveConfig:
     split_reprojection_gain: float = .08
     split_reprojection_support: float = .25
     split_reprojection_tol: float = .012
+    # Alternative split gate (default OFF; opt-in). residual_veto keeps the
+    # contradiction path and ADDS a fit-improvement + persistence path so a
+    # prismatic slide (whose moved surface leaves the silhouette) is not
+    # rejected for failing to reduce free-space contradiction.
+    split_reprojection_mode: str = "contradiction"   # or "residual_veto"
+    split_reprojection_resid_gain: float = .004      # m; paired residual must fall this much
+    split_reprojection_support_gain: float = .05     # or support must rise this much
+    split_reprojection_veto: float = .08             # max NEW free-space contradiction allowed
+    split_reprojection_persist: int = 1              # consecutive same-partition frames; 1 = per-frame
+    split_reprojection_persist_gap: int = 1          # frames; 1 = strictly consecutive
+    split_reprojection_persist_overlap: float = .5   # min swap-invariant Jaccard of the partition
     surface_reseed: bool = False       # seed new surface even if the base tracks well
     surface_radius: int = 14
     surface_min_region: int = 400
@@ -1671,6 +1682,7 @@ class NaivePartTracker:
         distances = np.stack([cKDTree(self.anchor_xyz[g]).query(points)[0] for g in groups])
         labels = distances.argmin(axis=0)
         rows = []
+        child_rows = []    # richer per-child evidence for the residual_veto gate
         for k, motion in enumerate(motions):
             pts = points[labels == k]
             if len(pts) < cfg.split_reprojection_min_points:
@@ -1681,13 +1693,158 @@ class NaivePartTracker:
             separate = reprojection_evidence(pts, motion, self.current_depth, self.mask,
                                              self.K, cfg.split_reprojection_tol, cfg.split_reprojection_occlusion)
             rows.append((common, separate))
+            if cfg.split_reprojection_mode == "residual_veto":
+                # PAIRED residual over samples on-object under BOTH poses, so a
+                # candidate cannot lower its residual by dropping the hard points.
+                pc, ps, npaired = self._paired_resid(pts, part.pose, motion)
+                child_rows.append({"common": common, "separate": separate,
+                                   "paired_com": pc, "paired_sep": ps, "n_paired": npaired})
         # A hidden old face cannot justify articulation just by finding new RGB tracks.
         gain = max(a['contradiction'] - b['contradiction'] for a, b in rows)
         supported = all(b['support'] >= cfg.split_reprojection_support for _, b in rows)
-        accept = supported and gain >= cfg.split_reprojection_gain
+        baseline_accept = supported and gain >= cfg.split_reprojection_gain
+        if cfg.split_reprojection_mode == "residual_veto":
+            # UNION, not replacement: keep the contradiction path (catches a
+            # revolute hinge) and ADD the fit-improvement + persistence path
+            # (catches a prismatic slide). The rigid control is rejected by both.
+            rv_cond = self._accept_residual_veto(child_rows)
+            accept = baseline_accept or self._reproj_persist(
+                part.part_id, rv_cond, groups, motions)
+        else:
+            accept = baseline_accept
         print(f"[reprojection] f{self.n} split gain={gain:.3f} "
               f"support={[round(b['support'], 3) for _, b in rows]} accept={accept}")
         return accept
+
+    def _paired_resid(self, pts, com_pose, sep_pose):
+        """On-object depth residual under BOTH poses over the SAME samples.
+
+        The per-hypothesis residual (mean over each pose's own on-object subset)
+        is gameable: a candidate can look better just by dropping the hard points
+        out of its subset. Comparing over the intersection -- points on-object at
+        a plausible depth under BOTH poses -- removes that: a dropped point leaves
+        both residuals. Returns (com_resid, sep_resid, n_paired). n_paired is the
+        explicit denominator; a caller must require it be large enough to trust
+        the comparison.
+        """
+        K, depth, mask = np.asarray(self.K), self.current_depth, self.mask
+        h, w = depth.shape
+
+        def proj(pose):
+            q = np.asarray(pts) @ pose[:3, :3].T + pose[:3, 3]
+            z = q[:, 2]
+            uv = q @ K.T
+            xy = np.rint(uv[:, :2] / np.maximum(z[:, None], 1e-6)).astype(int)
+            valid = np.isfinite(q).all(axis=1) & (z > .05) & \
+                (xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h)
+            u, v = np.clip(xy[:, 0], 0, w - 1), np.clip(xy[:, 1], 0, h - 1)
+            d = depth[v, u]
+            valid &= np.isfinite(d) & (d > .05)
+            on = valid & (mask[v, u] > 0) & (np.abs(z - d) <= 0.1)
+            return on, np.abs(z - d)
+
+        on_c, dz_c = proj(com_pose)
+        on_s, dz_s = proj(sep_pose)
+        paired = on_c & on_s
+        n = int(paired.sum())
+        if n == 0:
+            return None, None, 0
+        return float(dz_c[paired].mean()), float(dz_s[paired].mean()), n
+
+    @staticmethod
+    def _partition_overlap(a, b):
+        """Swap-invariant membership overlap between two 2-group partitions
+        (lists of frozensets of point indices). Mean Jaccard under the better of
+        the two child pairings, so which group is called 0 or 1 does not matter."""
+        def jac(x, y):
+            u = len(x | y)
+            return len(x & y) / u if u else 0.0
+        if len(a) != 2 or len(b) != 2:
+            return 0.0
+        straight = 0.5 * (jac(a[0], b[0]) + jac(a[1], b[1]))
+        swapped = 0.5 * (jac(a[0], b[1]) + jac(a[1], b[0]))
+        return max(straight, swapped)
+
+    def _reproj_persist(self, part_id, cond, groups, motions):
+        """Require the accept condition to recur for the SAME partition on
+        `persist` strictly-consecutive split-proposal frames.
+
+        Tracking part_id alone (an earlier version) is not persistence of a
+        motion: alternating partitions or repeated same-frame calls would count.
+        This keys on the child seed membership (swap-invariant Jaccard >=
+        `split_reprojection_persist_overlap`) and advances only on a strictly
+        later frame within `split_reprojection_persist_gap` (default 1 = strictly
+        consecutive). A duplicate same-frame call returns the current status
+        without advancing; a gap or a changed partition resets the streak to 1.
+        A single-frame rigid spike never reaches the count; a real slide, whose
+        partition and fit-improvement recur frame after frame, does.
+        """
+        cfg = self.cfg
+        if cfg.split_reprojection_persist <= 1:
+            return cond
+        st = getattr(self, "_reproj_streak", None)
+        if st is None:
+            st = self._reproj_streak = {}
+        frame = int(self.n - 1)
+        sig = [frozenset(int(i) for i in g) for g in groups]
+        prev = st.get(part_id)
+        if not cond:
+            st[part_id] = {"frame": frame, "groups": sig, "streak": 0}
+            return False
+        if prev is None:
+            st[part_id] = {"frame": frame, "groups": sig, "streak": 1}
+            return 1 >= cfg.split_reprojection_persist
+        if frame <= prev["frame"]:                 # duplicate same-frame call
+            return prev["streak"] >= cfg.split_reprojection_persist
+        same = (frame - prev["frame"] <= cfg.split_reprojection_persist_gap
+                and self._partition_overlap(sig, prev["groups"])
+                >= cfg.split_reprojection_persist_overlap)
+        streak = prev["streak"] + 1 if same else 1
+        st[part_id] = {"frame": frame, "groups": sig, "streak": streak}
+        return streak >= cfg.split_reprojection_persist
+
+    def _accept_residual_veto(self, child_rows):
+        """Alternative split gate: accept on fit improvement, veto real free space.
+
+        Each entry has `common` (evidence under the parent pose), `separate`
+        (under the child's candidate motion), and the PAIRED residual
+        (`paired_com`, `paired_sep`, `n_paired`) over samples on-object under both.
+        Accept when
+          * every child is supported (separate.support >= split_reprojection_support),
+          * at least one child fits materially better under its own motion -- the
+            paired residual drops by `split_reprojection_resid_gain` (only when
+            enough paired points exist), or support rises by
+            `split_reprojection_support_gain`,
+          * and NO child's motion raises `contradiction_freespace` over common by
+            more than `split_reprojection_veto`.
+        HYPOTHESIS, not a proven law: this treats off-silhouette spill under the
+        CURRENT mask as benign for a slide. That spill can also be a mask error or
+        wrong dense ownership, so the free-space veto is the guard and this gate
+        is opt-in, to be judged against geometry, not asserted universally.
+        Note contradiction_freespace and contradiction_offsilhouette OVERLAP
+        (a background sample in front of the surface is in both); they are not
+        additive and only the free-space part is vetoed.
+        """
+        cfg = self.cfg
+        if not all(c["separate"]["support"] >= cfg.split_reprojection_support
+                   for c in child_rows):
+            return False
+        for c in child_rows:
+            if (c["separate"].get("contradiction_freespace", 0.0)
+                    - c["common"].get("contradiction_freespace", 0.0)) \
+                    > cfg.split_reprojection_veto:
+                return False
+        best = False
+        for c in child_rows:
+            support_gain = c["separate"]["support"] - c["common"]["support"]
+            resid_gain = None
+            if c["n_paired"] >= cfg.split_reprojection_min_points \
+                    and c["paired_com"] is not None:
+                resid_gain = c["paired_com"] - c["paired_sep"]
+            if (resid_gain is not None and resid_gain >= cfg.split_reprojection_resid_gain) \
+                    or support_gain >= cfg.split_reprojection_support_gain:
+                best = True
+        return best
 
     def _accept(self, j, part, groups, motions, cur, cur_ok, via, gap, keep,
                 sep_sigma=float("nan"), dbic=float("nan")):
