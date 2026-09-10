@@ -110,6 +110,7 @@ class AuthorView:
             'tracking overlay if the raw frame is unavailable._')
         self._obs_is_overlay = False
         self.diag_panel.on_update(lambda _: self._show_diag())
+        self.diag.on_update(lambda _: self.commands.append(('diagnostics', None)))
         self.server.gui.add_markdown('Select the physical body after parts separate. Reference pose is tracked, not fixed. Preview does not move the real object.')
         choose.on_click(lambda _: self.commands.append(('reference', int(self.root.value))))
         save.on_click(lambda _: self.save())
@@ -168,6 +169,12 @@ class AuthorView:
     def process_commands(self, stream):
         while self.commands:
             kind, pid = self.commands.popleft()
+            if kind == 'diagnostics':
+                self.last_diag_t = 0.
+                self.last_update = 0.
+                if not self.diag.value:
+                    self.diag_status.content = 'Diagnostics paused. Enable Render diagnostics (low-rate) to render.'
+                continue
             try:
                 stream.select_reference(pid)
                 self.events.append(dict(frame=stream.n - 1, action=kind, part_id=pid,
@@ -185,6 +192,8 @@ class AuthorView:
         self.last_update = time.monotonic()
         # Actual Gaussian render happens HERE, in the tracking thread (GPU-safe),
         # default-off and rate-limited -- never inside a GUI callback.
+        if not self.diag.value:
+            self.diag_status.content = 'Enable Render diagnostics (low-rate) to render.'
         if self.diag.value and time.monotonic() - self.last_diag_t > 1.5:
             self._render_diag(stream, depth, raw_rgb, rgb)
             self.last_diag_t = time.monotonic()
@@ -417,16 +426,16 @@ def replay():
         trace.append(dict(frame=i, part_id=root.part_id, observed=bool(root.observed),
                           pose=root.pose.tolist(), parts=len(stream.parts)))
     view.last_update = 0
-    view.publish(stream,rgb)
+    view.publish(stream,rgb, depth=depth, raw_rgb=rgb)
     view.save()
     Path(args.output).mkdir(parents=True, exist_ok=True)
     (Path(args.output) / 'reference_trace.json').write_text(json.dumps(trace,allow_nan=False))
     print('[author] replay complete; browser remains interactive',flush=True)
     if not args.exit_after_replay:
         while True:
-            if view.commands:
+            if view.commands or (view.diag.value and time.monotonic() - view.last_diag_t > 1.5):
                 view.last_update = 0
-                view.publish(stream, rgb)
+                view.publish(stream, rgb, depth=depth, raw_rgb=rgb)
             time.sleep(.1)
     view.server.stop()
 
