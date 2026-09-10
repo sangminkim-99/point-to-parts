@@ -1799,15 +1799,15 @@ class NaivePartTracker:
     @staticmethod
     def _partition_overlap(a, b):
         """Swap-invariant membership overlap between two 2-group partitions
-        (lists of frozensets of point indices). Mean Jaccard under the better of
-        the two child pairings, so which group is called 0 or 1 does not matter."""
+        (lists of frozensets of point indices). Minimum child Jaccard under the
+        better pairing: BOTH children must persist, even if one is much larger."""
         def jac(x, y):
             u = len(x | y)
             return len(x & y) / u if u else 0.0
         if len(a) != 2 or len(b) != 2:
             return 0.0
-        straight = 0.5 * (jac(a[0], b[0]) + jac(a[1], b[1]))
-        swapped = 0.5 * (jac(a[0], b[1]) + jac(a[1], b[0]))
+        straight = min(jac(a[0], b[0]), jac(a[1], b[1]))
+        swapped = min(jac(a[0], b[1]), jac(a[1], b[0]))
         return max(straight, swapped)
 
     def _reproj_persist(self, part_id, cond, groups, motions):

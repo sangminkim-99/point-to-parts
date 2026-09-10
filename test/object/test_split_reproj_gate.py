@@ -165,3 +165,21 @@ def test_persist_one_is_the_per_frame_gate():
     s.n = 10
     assert s._reproj_persist(0, True, groups(range(5), range(5, 10)), None) is True
     assert s._reproj_persist(0, False, groups(range(5), range(5, 10)), None) is False
+
+
+def test_persistence_requires_both_children_not_only_stable_body():
+    s = gate({"split_reprojection_persist": 3})
+    for frame, lid in enumerate((range(100,110), range(110,120), range(120,130)), 50):
+        s.n = frame + 1
+        # The unchanged body used to produce mean Jaccard .5 even when
+        # every moving-child track was replaced, passing the .5 threshold.
+        assert not s._reproj_persist(0, True, groups(range(100), lid), None)
+        assert s._reproj_streak[0]['streak'] == 1
+
+
+def test_persistence_allows_partial_overlap_in_both_children():
+    s = gate({"split_reprojection_persist": 2})
+    s.n = 51
+    assert not s._reproj_persist(0, True, groups(range(10), range(20,30)), None)
+    s.n = 52
+    assert s._reproj_persist(0, True, groups(range(22,32), range(2,12)), None)
