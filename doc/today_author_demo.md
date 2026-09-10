@@ -65,3 +65,26 @@ Artifacts: results/viser_diagnostics_smoke/{render.png,observed.png,metrics.json
 The same-frame initialized smoke verifies plumbing, not reconstruction accuracy
 or live throughput. Live input RGB/depth handoff was connected; physical camera
 interaction was not exercised by this smoke. User CUDA cache was not modified.
+
+## Separate Gaussian panel
+
+Use the **Open Gaussian render panel** link in Viser to open an independent
+browser panel next to the main scene. It listens on localhost at Viser port+1
+(or a free port if occupied; the link/terminal prints the actual URL). Enable
+Render diagnostics in the main Viser UI. Overall, observed RGB, depth residual
+and each assigned persistent part get separate image cards. Part images retain
+the common camera framing and are approximate Gaussian contributions; they are
+not independently centered object views. Cards reflect the last render frame;
+paused/error states are shown. This is a separate web panel, not native Viser
+drag-and-drop docking. No tracker settings are changed by opening it.
+
+To opt into the experimental drawer split gate:
+
+```sh
+CONFIG=reprojection_split_residual_veto.yaml PORT=8090 OUT=results/author_demo_live \
+  examples/multi_part/run_author_demo.sh live --depth 1
+```
+
+The gate was checked through recorded author_demo replay and can detect a
+prismatic part earlier, but may produce an extra late part. It is not the
+default and does not guarantee correct decomposition of a new recording.

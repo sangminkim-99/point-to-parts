@@ -98,6 +98,10 @@ class AuthorView:
         self.saved = self.server.gui.add_markdown('Cloud + kinematic URDF when fitted. Observed surfaces only.')
         self.legend = self.server.gui.add_markdown('Legend appears once geometry is tracked.')
         self.uncertainty = self.server.gui.add_markdown('Tracking confidence appears with parts.')
+        from examples.multi_part.render_dock import RenderDock
+        self.render_dock = RenderDock(args.port + 1)
+        self.server.gui.add_markdown(f'[Open Gaussian render panel]({self.render_dock.url}) — separate window/panel')
+        print(f'[Gaussian panel] {self.render_dock.url}', flush=True)
         self.diag = self.server.gui.add_checkbox('Render diagnostics (low-rate)', initial_value=False)
         self.diag_panel = self.server.gui.add_dropdown('Diagnostic panel',
             ['Rendered RGB (approx)', 'Depth residual', 'Observed RGB'])
@@ -174,6 +178,7 @@ class AuthorView:
                 self.last_update = 0.
                 if not self.diag.value:
                     self.diag_status.content = 'Diagnostics paused. Enable Render diagnostics (low-rate) to render.'
+                    self.render_dock.status('Diagnostics paused — previous images are stale.')
                 continue
             try:
                 stream.select_reference(pid)
@@ -258,6 +263,7 @@ class AuthorView:
             rgb_acc = np.zeros((H, W, 3), np.float32)
             z_acc = np.full((H, W), np.inf, np.float32)
             cover = np.zeros((H, W), bool)
+            part_images = []
             with torch.no_grad():
                 for j, p in enumerate(stream.parts):
                     sub = np.where(labels == j)[0]
@@ -268,6 +274,8 @@ class AuthorView:
                     rgb = rgb_t.detach().cpu().numpy(); dep = dep_t.detach().cpu().numpy()
                     al = al_t.detach().cpu().numpy()
                     good = (al > 0.3) & np.isfinite(dep) & (dep > 0)   # valid finite positive depth
+                    part_rgb = cv2.resize(np.clip(rgb * 255, 0, 255).astype(np.uint8), (320, 240))
+                    part_images.append((f'Part {p.part_id} — {"observed" if p.observed else "held pose"}', part_rgb))
                     win = good & (dep < z_acc)
                     rgb_acc[win] = rgb[win]; z_acc[win] = dep[win]; cover |= win
             self.diag_rgb = cv2.resize(np.clip(rgb_acc * 255, 0, 255).astype(np.uint8), (320, 240))
@@ -300,9 +308,13 @@ class AuthorView:
             self.last_render_ms = 1000 * (time.perf_counter() - t0)
             self.last_render_frame = int(stream.n - 1)
             self.render_error = None
+            if hasattr(self, 'render_dock'):
+                self.render_dock.publish(self.last_render_frame, [('Overall (approx)', self.diag_rgb), ('Observed RGB', self.diag_obs), ('Depth residual', self.diag_resid)] + part_images, f'{self.last_render_ms:.0f} ms; updates at most every 1.5 s')
         except Exception as exc:            # never fake a render; surface in UI + log
             self.render_error = f'{type(exc).__name__}: {exc}'
             print(f'[author] render diagnostic failed: {exc}', flush=True)
+            if hasattr(self, 'render_dock'):
+                self.render_dock.status(f'Render error: {exc}; previous images are stale.')
 
     def draw(self):
         with self.lock:
@@ -437,6 +449,7 @@ def replay():
                 view.last_update = 0
                 view.publish(stream, rgb, depth=depth, raw_rgb=rgb)
             time.sleep(.1)
+    view.render_dock.close()
     view.server.stop()
 
 
@@ -485,6 +498,7 @@ def live():
                 super().run()
             finally:
                 self.author.save()
+                self.author.render_dock.close()
                 self.author.server.stop()
     main(LiveAuthor,add_args)
 
