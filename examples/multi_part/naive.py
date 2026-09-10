@@ -271,6 +271,10 @@ class NaiveConfig:
     refine: bool = False                # step 5: rendering-based refinement
     refine_every: int = 3
     carve_every: int = 3
+    split_reprojection: bool = False   # require independent RGB-D evidence for a split
+    split_reprojection_gain: float = .08
+    split_reprojection_support: float = .25
+    split_reprojection_tol: float = .012
     surface_reseed: bool = False       # seed new surface even if the base tracks well
     surface_radius: int = 14
     surface_min_region: int = 400
@@ -390,6 +394,7 @@ class NaivePartTracker:
         mask = clean_mask(mask, depth, K=self.K, jump=cfg.mask_jump,
                           slope_deg=cfg.mask_slope_deg)
         self.mask = mask
+        self.current_depth = depth
 
         tracks, unc, vis = self.tracker.track_once(
             Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K))
@@ -1530,9 +1535,45 @@ class NaivePartTracker:
         return self._accept(j, part, groups, motions, cur, cur_ok, "frame",
                             float("nan"), keep, ss, dbic)
 
+    def _validate_split_reprojection(self, j, part, groups, motions):
+        """Test sparse-motion proposals against stored geometry and current RGB-D."""
+        from scipy.spatial import cKDTree
+        from examples.multi_part.surface_memory import reprojection_evidence
+        cfg = self.cfg
+        if self.model is None:
+            points = self.anchor_xyz[np.concatenate(groups)]
+        else:
+            selected = np.flatnonzero(self.model.labels == j)
+            selected = selected[::max(1, int(np.ceil(len(selected) / 1536)))]
+            points = self.model.cloud.means[selected].detach().cpu().numpy()
+        if len(points) < 40:
+            return False
+        distances = np.stack([cKDTree(self.anchor_xyz[g]).query(points)[0] for g in groups])
+        labels = distances.argmin(axis=0)
+        rows = []
+        for k, motion in enumerate(motions):
+            pts = points[labels == k]
+            if len(pts) < 20:
+                return False
+            common = reprojection_evidence(pts, part.pose, self.current_depth, self.mask,
+                                           self.K, cfg.split_reprojection_tol)
+            separate = reprojection_evidence(pts, motion, self.current_depth, self.mask,
+                                             self.K, cfg.split_reprojection_tol)
+            rows.append((common, separate))
+        # A hidden old face cannot justify articulation just by finding new RGB tracks.
+        gain = max(a['contradiction'] - b['contradiction'] for a, b in rows)
+        supported = all(b['support'] >= cfg.split_reprojection_support for _, b in rows)
+        accept = supported and gain >= cfg.split_reprojection_gain
+        print(f"[reprojection] f{self.n} split gain={gain:.3f} "
+              f"support={[round(b['support'], 3) for _, b in rows]} accept={accept}")
+        return accept
+
     def _accept(self, j, part, groups, motions, cur, cur_ok, via, gap, keep,
                 sep_sigma=float("nan"), dbic=float("nan")):
         """Install the two groups as parts and hand the gaussian labels over."""
+        if self.cfg.split_reprojection and not self._validate_split_reprojection(j, part, groups, motions):
+            self.reprojection_blocked = getattr(self, "reprojection_blocked", 0) + 1
+            return False
         order = np.argsort([-len(g) for g in groups])
         new = [NaivePart(idx=np.asarray(groups[k]), pose=motions[k],
                          born=self.n, view_dirs=[np.array([0., 0., 1.])])

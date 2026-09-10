@@ -68,3 +68,32 @@ def match_joint_surface(points, poses, depth, mask, K, tolerance=0.012,
     return {"index": best, "pose": poses[best].copy(),
             "score": float(scores[best]), "support": int(counts[best]),
             "region": region}
+
+
+def reprojection_evidence(points, pose, depth, mask, K, tolerance=.012):
+    """Depth support and free-space contradiction for a fixed canonical sample.
+
+    Behind-surface geometry is unobserved, not evidence of a second motion.
+    Invalid depth and out-of-frame samples are neutral. Valid background pixels
+    contradict the predicted object silhouette. Fractions use the SAME sample
+    denominator across competing pose hypotheses.
+    """
+    points = np.asarray(points)
+    if not len(points):
+        return {"support": 0., "contradiction": 0., "visible": 0.}
+    q = points @ pose[:3, :3].T + pose[:3, 3]
+    z = q[:, 2]
+    uv = q @ np.asarray(K).T
+    xy = np.rint(uv[:, :2] / np.maximum(z[:, None], 1e-6)).astype(int)
+    h, w = depth.shape
+    valid = np.isfinite(q).all(axis=1) & (z > .05) & \
+        (xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h)
+    u, v = np.clip(xy[:, 0], 0, w - 1), np.clip(xy[:, 1], 0, h - 1)
+    d = depth[v, u]
+    valid &= np.isfinite(d) & (d > .05)
+    obj = mask[v, u] > 0
+    support = valid & obj & (np.abs(z - d) <= tolerance)
+    contradiction = valid & ((z < d - tolerance) | (~obj & (z <= d + tolerance)))
+    return {"support": float(support.mean()),
+            "contradiction": float(contradiction.mean()),
+            "visible": float((support | contradiction).mean())}

@@ -184,3 +184,37 @@ def test_retro_history_requires_support_from_whole_discovered_part():
                 (1, s.anchor_xyz, np.ones(10, bool), np.ones(10, bool))]
     history = s._retro_hist(NaivePart(idx=np.arange(10)))
     assert [frame for frame, _, _ in history] == [1]
+
+
+def test_reprojection_occlusion_is_not_motion_evidence():
+    from examples.multi_part.surface_memory import reprojection_evidence
+    K = np.array([[100., 0, 20], [0, 100., 20], [0, 0, 1.]])
+    depth = np.ones((40, 40), np.float32)
+    mask = np.ones((40, 40), np.uint8)
+    pts = np.array([[0., 0., 1.], [.03, 0, 1.], [0, .03, 1.]])
+    T = np.eye(4)
+    assert reprojection_evidence(pts, T, depth, mask, K)['support'] == 1
+    T[2, 3] = .1
+    hidden = reprojection_evidence(pts, T, depth, mask, K)
+    assert hidden == {'support': 0., 'contradiction': 0., 'visible': 0.}
+    T[2, 3] = -.1
+    assert reprojection_evidence(pts, T, depth, mask, K)['contradiction'] == 1
+
+
+def test_reprojection_invalid_depth_and_offscreen_are_neutral():
+    from examples.multi_part.surface_memory import reprojection_evidence
+    K = np.array([[100., 0, 20], [0, 100., 20], [0, 0, 1.]])
+    depth = np.zeros((40, 40), np.float32)
+    mask = np.ones((40, 40), np.uint8)
+    pts = np.array([[0., 0., 1.], [10, 10, 1.]])
+    assert reprojection_evidence(pts, np.eye(4), depth, mask, K) == {
+        'support': 0., 'contradiction': 0., 'visible': 0.}
+
+
+def test_reprojection_silhouette_contradiction():
+    from examples.multi_part.surface_memory import reprojection_evidence
+    K = np.array([[100., 0, 20], [0, 100., 20], [0, 0, 1.]])
+    depth = np.ones((40, 40), np.float32)
+    mask = np.zeros((40, 40), np.uint8)
+    pts = np.array([[0., 0., 1.]])
+    assert reprojection_evidence(pts, np.eye(4), depth, mask, K)['contradiction'] == 1
