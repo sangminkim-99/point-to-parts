@@ -51,6 +51,24 @@ def joint_trajectory(n, lo, hi, static_prefix=0.2, open_frac=0.5, mode="open"):
     to split, and several detectors were only ever tested on data where the
     object was already moving.
     """
+    if n < 4 or not 0 <= static_prefix < .5 or not 0 < open_frac <= 1:
+        raise ValueError("need n>=4, 0<=static_prefix<0.5 and 0<open_frac<=1")
+    if mode == "static":
+        return np.full(n, lo, dtype=np.float64)
+    if mode == "open_close":
+        q = np.full(n, lo, dtype=np.float64)
+        a = int(n * static_prefix)
+        duration = min(max(2, int(n * open_frac / 2)), (n - 2 * a) // 2)
+        if duration < 2:
+            raise ValueError("too few moving frames for open_close")
+        ramp = .5 - .5 * np.cos(np.linspace(0, np.pi, duration))
+        q[a:a + duration] = lo + (hi - lo) * ramp
+        c = n - a - duration
+        q[a + duration:c] = hi
+        q[c:n - a] = lo + (hi - lo) * ramp[::-1]
+        return q
+    if mode != "open":
+        raise ValueError(f"unknown motion: {mode}")
     q = np.empty(n, dtype=np.float64)
     a = int(n * static_prefix)
     b = a + max(1, int(n * open_frac))
@@ -59,10 +77,23 @@ def joint_trajectory(n, lo, hi, static_prefix=0.2, open_frac=0.5, mode="open"):
     smooth = 0.5 - 0.5 * np.cos(np.pi * ramp)          # ease in/out
     q[a:b] = lo + (hi - lo) * smooth[: max(0, min(b, n) - a)]
     q[b:] = hi
-    if mode == "open_close":
-        half = n // 2
-        q[half:] = q[:n - half][::-1]
     return q
+
+
+def motion_groups(link_names, relations, moving):
+    """Merge fixed and unexcited joints into observable rigid motion groups."""
+    parent = {name: name for name in link_names}
+    def root(name):
+        while parent[name] != name:
+            name = parent[name]
+        return name
+    for name, a, b in relations:
+        if name not in moving:
+            parent[root(b)] = root(a)
+    groups = {}
+    for name in link_names:
+        groups.setdefault(root(name), []).append(name)
+    return groups
 
 
 def add_depth_noise(z, sigma_rel, quant_mm, rng):
@@ -106,10 +137,16 @@ def main():
     ap.add_argument("--view-elevations", default="15,30,45")
     ap.add_argument("--camera-orbit", type=float, default=0.0,
                     help="degrees of camera travel over the sequence (0 = static)")
+    ap.add_argument("--camera-azimuth", type=float, default=0.0)
+    ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--motion-parts", action="store_true",
+                    help="GT parts are rigid motion groups, merging fixed/unexcited joints")
+    ap.add_argument("--active-joints", default=None,
+                    help="comma-separated movable joint names; others stay at their start state")
     ap.add_argument("--static-prefix", type=float, default=0.2,
                     help="fraction of the sequence with no articulation")
     ap.add_argument("--open-frac", type=float, default=0.5)
-    ap.add_argument("--motion", choices=["open", "open_close"], default="open")
+    ap.add_argument("--motion", choices=["open", "open_close", "static"], default="open")
     ap.add_argument("--joint-range", type=float, default=1.0,
                     help="fraction of each joint's limit range to traverse")
     ap.add_argument("--start-frac", type=float, default=0.25,
@@ -124,6 +161,10 @@ def main():
     ap.add_argument("--depth-quant-mm", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    if not 0 <= args.start_frac <= 1 or not 0 <= args.joint_range <= 1 or args.fps <= 0:
+        ap.error("start-frac and joint-range must be in [0,1]; fps must be positive")
+    if os.path.exists(os.path.join(args.out, "meta.json")):
+        ap.error("output already contains a sequence; choose a new directory")
 
     rng = np.random.default_rng(args.seed)
     scene = sapien.Scene()
@@ -150,16 +191,13 @@ def main():
     if not joints:
         raise SystemExit("model has no movable joint")
 
-    # Size the shot from the object itself, over its whole articulation range:
-    # a fixed distance either crops a long object or wastes the frame on a small
-    # one, and the extent changes as the object opens.
+    # Fit the initial asset bounding sphere. The suite validator separately
+    # checks every rendered frame for clipping throughout articulation/orbit.
     # PartNet-Mobility ships the model's bounding box; use it rather than probing
     # collision shapes, whose bounds came back empty and collapsed the camera
     # distance to the floor value.
     bmin = np.array(bb0["min"], dtype=np.float64) * scale
     bmax = np.array(bb0["max"], dtype=np.float64) * scale
-    art.set_qpos(np.array([j.get_limits()[0][0] for j in joints]))
-    scene.step()
     root = art.get_root_pose().p
     centre = root + 0.5 * (bmin + bmax)
     radius = float(np.linalg.norm(bmax - bmin) / 2)
@@ -186,7 +224,6 @@ def main():
             [np.cos(e) * np.cos(np.radians(az)), np.cos(e) * np.sin(np.radians(az)),
              np.sin(e)])
         cam.set_local_pose(look_at(eye, centre))
-        scene.step()
         scene.update_render()
         cam.take_picture()
         seg_ent = cam.get_picture("Segmentation")[..., 1]
@@ -203,6 +240,14 @@ def main():
     span_q = q_hi - q_lo
     q_a = q_lo + span_q * args.start_frac
     q_b = q_a + span_q * args.joint_range * (1.0 - args.start_frac)
+    active = {j.get_name() for j in joints} if args.active_joints is None else \
+        set(filter(None, args.active_joints.split(",")))
+    unknown = active - {j.get_name() for j in joints}
+    if unknown:
+        ap.error(f"unknown active joints: {sorted(unknown)}")
+    for k, j in enumerate(joints):
+        if j.get_name() not in active or args.motion == "static":
+            q_b[k] = q_a[k]
 
     if args.auto_view:
         # A viewpoint is only useful if BOTH parts stay visible across the whole
@@ -247,8 +292,6 @@ def main():
         else:
             args.camera_azimuth = 0.0
             print("[sim] auto-view found no pose with two visible parts; using default")
-    else:
-        args.camera_azimuth = 0.0
 
     # scripted joint trajectories
     Q = []
@@ -263,25 +306,38 @@ def main():
         lo = lo + span * args.start_frac
         hi = lo + span * args.joint_range * (1.0 - args.start_frac)
         Q.append(joint_trajectory(args.frames, lo, hi, args.static_prefix,
-                                  args.open_frac, args.motion))
+                                  args.open_frac, args.motion if j.get_name() in active else "static"))
     Q = np.stack(Q, axis=1)                                   # (T, J)
+
+    moving = {j.get_name() for k, j in enumerate(joints) if np.ptp(Q[:, k]) > 1e-7}
+    relations = [(j.get_name(), j.get_parent_link().get_name(), j.get_child_link().get_name())
+                 for j in art.get_joints() if j.get_parent_link() is not None]
+    groups = motion_groups(part_names, relations, moving) if args.motion_parts else \
+        {name: [name] for name in part_names}
+    output_names = list(groups)
+    group_of = {link: name for name, members in groups.items() for link in members}
+    output_index = {link: output_names.index(group_of[link]) for link in part_names}
+    output_links = [links[part_names.index(name)] for name in output_names]
+    output_joint_indices = [k for k, j in enumerate(joints)
+                            if not args.motion_parts or j.get_name() in moving]
 
     for d in ("rgb", "depth", "seg"):
         os.makedirs(os.path.join(args.out, d), exist_ok=True)
 
-    poses = np.zeros((args.frames, len(links), 4, 4))
+    poses = np.zeros((args.frames, len(output_links), 4, 4))
     cam_poses = np.zeros((args.frames, 4, 4))
-    reproj_err = []
+    pixel_reprojection_errors = []
 
     for t in range(args.frames):
         art.set_qpos(Q[t])
+        if not np.allclose(art.get_qpos(), Q[t], atol=1e-6):
+            raise RuntimeError("simulator joint state differs from scripted GT")
         ang = np.radians(args.camera_azimuth) + \
             np.radians(args.camera_orbit) * (t / max(1, args.frames - 1))
         el = np.radians(args.elevation)
         eye = centre + args.distance * np.array(
             [np.cos(el) * np.cos(ang), np.cos(el) * np.sin(ang), np.sin(el)])
         cam.set_local_pose(look_at(eye, centre))
-        scene.step()
         scene.update_render()
         cam.take_picture()
 
@@ -289,73 +345,84 @@ def main():
         pos = cam.get_picture("Position")
         z = -pos[..., 2].astype(np.float64)          # camera looks down -z
         z[z <= 1e-6] = 0.0
+        # Position uses OpenGL camera coordinates; verify CV projection before noise.
+        valid = z > 1e-6
+        yy, xx = np.where(valid)
+        xyz_cv = pos[valid, :3] * np.array([1, -1, -1])
+        uvz = xyz_cv @ K.T
+        uv = uvz[:, :2] / uvz[:, 2:]
+        if len(uv):
+            error = np.max(np.linalg.norm(uv - np.stack([xx + .5, yy + .5], axis=1), axis=1))
+            pixel_reprojection_errors.append(float(error))
+            if error > .1:
+                raise RuntimeError(f"RGB/depth projection mismatch: {error} pixels")
         z = add_depth_noise(z, args.depth_noise, args.depth_quant_mm, rng)
         seg_ent = cam.get_picture("Segmentation")[..., 1]
 
         seg = np.full(seg_ent.shape, 255, dtype=np.uint8)
         for k, name in enumerate(part_names):
-            seg[seg_ent == ent_id[name]] = k
+            seg[seg_ent == ent_id[name]] = output_index[name]
 
         cv2.imwrite(f"{args.out}/rgb/{t:06d}.png", rgb[..., ::-1])
         cv2.imwrite(f"{args.out}/depth/{t:06d}.png",
-                    np.clip(z * 1000, 0, 65535).astype(np.uint16))
+                    np.clip(np.rint(z * 1000), 0, 65535).astype(np.uint16))
         cv2.imwrite(f"{args.out}/seg/{t:06d}.png", seg)
 
         E = cam.get_extrinsic_matrix()               # world -> camera, OpenCV
         T_cam_world = np.eye(4)
         T_cam_world[:3, :4] = E
         cam_poses[t] = np.linalg.inv(T_cam_world)
-        for k, l in enumerate(links):
+        for k, l in enumerate(output_links):
             p = l.get_pose()
             T = np.eye(4)
             T[:3, :3] = _quat_to_R(p.q)
             T[:3, 3] = p.p
             poses[t, k] = T_cam_world @ T
 
-        # self-check: does each part's origin project inside its own mask?
-        if t % 25 == 0:
-            for k, name in enumerate(part_names):
-                m = seg == k
-                if m.sum() < 50:
-                    continue
-                c = poses[t, k][:3, 3]
-                if c[2] <= 1e-6:
-                    continue
-                uv = K @ c
-                u, v = uv[0] / uv[2], uv[1] / uv[2]
-                ys, xs = np.where(m)
-                reproj_err.append(float(np.hypot(u - xs.mean(), v - ys.mean())))
-
     np.savez_compressed(os.path.join(args.out, "poses.npz"),
-                        T_cam_part=poses, joint_states=Q, cam_poses=cam_poses)
+                        T_cam_part=poses, joint_states=Q[:, output_joint_indices],
+                        source_joint_states=Q, cam_poses=cam_poses,
+                        timestamps=np.arange(args.frames) / args.fps)
     json.dump({
         "model_dir": args.model_dir,
         "category": json.load(open(os.path.join(args.model_dir, "meta.json"))).get("model_cat"),
-        "parts": part_names,
+        "parts": output_names,
+        "link_groups": groups,
+        "source_joint_names": [j.get_name() for j in joints],
         "intrinsics": K.tolist(),
         "image_size": [args.height, args.width],
         "joints": [{"name": j.get_name(), "type": str(j.type),
-                    "parent": j.get_parent_link().get_name(),
-                    "child": j.get_child_link().get_name(),
-                    "limits": [float(x) for x in j.get_limits()[0]]} for j in joints],
+                    "parent": group_of[j.get_parent_link().get_name()],
+                    "child": group_of[j.get_child_link().get_name()],
+                    "limits": [float(x) for x in j.get_limits()[0]]}
+                   for k, j in enumerate(joints) if k in output_joint_indices],
         "frames": args.frames,
+        "pixel_reprojection_max_px": max(pixel_reprojection_errors, default=0.0),
         "depth_noise": args.depth_noise,
         "depth_quant_mm": args.depth_quant_mm,
+        "depth_storage_mm": 1.0,
+        "fps": args.fps,
+        "seed": args.seed,
+        "motion": args.motion,
+        "scripted_kinematics": True,
+        "manipulators": False,
+        "object_scale": scale,
+        "distance_m": args.distance,
+        "start_frac": args.start_frac,
+        "joint_range": args.joint_range,
+        "open_frac": args.open_frac,
         "camera_orbit_deg": args.camera_orbit,
         "camera_azimuth_deg": float(args.camera_azimuth),
         "camera_elevation_deg": float(args.elevation),
         "static_prefix": args.static_prefix,
     }, open(os.path.join(args.out, "meta.json"), "w"), indent=2)
 
-    print(f"[sim] {args.out}: {args.frames} frames, parts {part_names}")
+    print(f"[sim] {args.out}: {args.frames} frames, parts {output_names}")
     print(f"[sim] joint travel: " + ", ".join(
         f"{j.get_name()}={np.degrees(Q[:,i].max()-Q[:,i].min()):.0f}deg"
         if "revolute" in str(j.type) else
         f"{j.get_name()}={1000*(Q[:,i].max()-Q[:,i].min()):.0f}mm"
         for i, j in enumerate(joints)))
-    if reproj_err:
-        print(f"[sim] part-origin reprojection check: median "
-              f"{np.median(reproj_err):.1f} px (sanity only, not an error metric)")
 
 
 def _quat_to_R(q):

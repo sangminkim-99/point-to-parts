@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "defaults": {"frames": 120, "width": 640, "height": 480, "fps": 30, "motion-parts": true, "no-auto-view": true, "camera-azimuth": 247.5, "elevation": 35, "seed": 0},
+  "cases": [
+    {"name": "laptop_static", "model": "9748", "expected_parts": 1, "args": {"motion": "static"}},
+    {"name": "laptop_hinge", "model": "9748", "expected_parts": 2, "args": {"motion": "open_close"}},
+    {"name": "laptop_orbit", "model": "9748", "expected_parts": 1, "args": {"motion": "static", "camera-orbit": 360}},
+    {"name": "laptop_hinge_orbit", "model": "9748", "expected_parts": 2, "args": {"motion": "open_close", "camera-orbit": 360}},
+    {"name": "laptop_hinge_noisy", "model": "9748", "expected_parts": 2, "args": {"motion": "open_close", "depth-noise": 0.003}},
+    {"name": "storage_slide", "model": "40147", "expected_parts": 2, "args": {"motion": "open_close", "active-joints": "joint_1", "no-auto-view": false, "auto-view": true}}
+  ]
+}
