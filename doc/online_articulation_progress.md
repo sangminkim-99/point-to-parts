@@ -10,6 +10,15 @@ tapnet/, segment-anything-2-real-time/, inspect, or test/reconstruction/.
 
 ## Working environment
 
+Latest recorded-data check: completed take01 (321 frames), lift01 (504), and
+take01 with split reprojection disabled. See `doc/realsense_recorded_replay.md`
+and local `results/realsense_recorded_v1/`. Both take01 runs split at 168 and
+merge back at 170; disabling reprojection does not solve late discovery. Rings
+are removable, so constrained joint fits do not establish permanent topology.
+Next inspect/protect newborn parts with matched tests and separate free motion
+from persistent joints. Recording now caches compressed masks once; 74 object
+tests pass. No tracking default changed; existing saved masks were used.
+
 Use `/home/smkim/miniconda3/envs/point2pose_model/bin/python`.
 GPU commands need host/GPU permission. Environment:
 
