@@ -142,6 +142,14 @@ python -m examples.multi_part.urdf_view results/urdf_validation/drawer.urdf \
 
 ## Next concrete work
 
+User steering: mesh creation is no longer required. Use part-local point clouds
+against robot spheres; cuRobo explicitly approved. Real Franka cuRobo FK (65
+spheres) + custom differentiable point query is implemented and GPU smoke-tested
+on saved drawer points. See `doc/curobo_point_collision.md` for source/runtime,
+Warp limitation, and next planner integration steps. Actual robot model pending
+user answer; do not interpret synthetic object placement as calibration. Prioritize
+this mesh-free manipulation path alongside texture/no-texture tracking controls.
+
 1. The first RGB-D keyframe control is complete (`doc/keyframe_baseline.md`).
    LightGlue previous-only / best-keyframe / pooled-keyframe median errors are
    145.0 / 128.6 / 40.3 mm on the locked orbit. All observe 120 frames, but none
