@@ -46,9 +46,9 @@ correct part association must be measured separately.
 
 ## Gaussian diagnostics (September 10 checkpoint)
 
-Restart the demo to load the new UI. Enable **Render diagnostics (low-rate)**
+Restart the demo to load the new UI. Enable **Render diagnostics**
 while frames are arriving. **Diagnostic panel** selects rendered RGB, depth
-residual or observed RGB. Rendering runs at most once per 1.5 seconds and is
+residual or observed RGB. Rendering runs at a configurable target rate (0.5–5 FPS, default 5 FPS) and is
 off by default. The 3D view remains a point cloud; the diagnostic image uses
 actual Gaussian rasterization with approximate nearest-depth compositing across
 parts (not global alpha composition). Timing and render-frame age are displayed.
@@ -70,7 +70,7 @@ interaction was not exercised by this smoke. User CUDA cache was not modified.
 
 Gaussian diagnostics now live in a native Viser panel docked on the **left**,
 in the same browser page. No extra port or browser window is needed. Restart
-the demo to load this layout. Enable **Render diagnostics (low-rate)** in the
+the demo to load this layout. Enable **Render diagnostics** in the
 **Gaussian diagnostics** tab for the whole render, observed RGB and depth error.
 The **Part renders** tab shows all assigned parts as separate image cards, added
 and removed as identities change. Images share the camera frame. The panel uses
@@ -86,3 +86,5 @@ CONFIG=reprojection_split_residual_veto.yaml PORT=8090 OUT=results/author_demo_l
 The gate was checked through recorded author_demo replay and can detect a
 prismatic part earlier, but may produce an extra late part. It is not the
 default and does not guarantee correct decomposition of a new recording.
+
+Diagnostic target FPS controls render start spacing; achieved rate is limited by incoming frames and tracker/UI work. No render jobs are queued to catch up. User observed about 21 ms per diagnostic render on their live model; this is not a general benchmark.

@@ -101,7 +101,8 @@ class AuthorView:
         from examples.multi_part.render_dock import RenderDock
         self.render_dock = RenderDock(self.server)
         with self.render_dock.controls:
-            self.diag = self.server.gui.add_checkbox('Render diagnostics (low-rate)', initial_value=False)
+            self.diag = self.server.gui.add_checkbox('Render diagnostics', initial_value=False)
+            self.diag_fps = self.server.gui.add_slider('Diagnostic target FPS', min=0.5, max=5., step=0.5, initial_value=5.)
             self.diag_panel = self.server.gui.add_dropdown('Diagnostic panel',
                 ['Rendered RGB (approx)', 'Depth residual', 'Observed RGB'])
             self.diag_status = self.server.gui.add_markdown('Enable diagnostics for Gaussian render status.')
@@ -176,7 +177,7 @@ class AuthorView:
                 self.last_diag_t = 0.
                 self.last_update = 0.
                 if not self.diag.value:
-                    self.diag_status.content = 'Diagnostics paused. Enable Render diagnostics (low-rate) to render.'
+                    self.diag_status.content = 'Diagnostics paused. Enable Render diagnostics to render.'
                     self.render_dock.status('Diagnostics paused — previous images are stale.')
                 continue
             try:
@@ -197,10 +198,10 @@ class AuthorView:
         # Actual Gaussian render happens HERE, in the tracking thread (GPU-safe),
         # default-off and rate-limited -- never inside a GUI callback.
         if not self.diag.value:
-            self.diag_status.content = 'Enable Render diagnostics (low-rate) to render.'
-        if self.diag.value and time.monotonic() - self.last_diag_t > 1.5:
-            self._render_diag(stream, depth, raw_rgb, rgb)
+            self.diag_status.content = 'Enable Render diagnostics to render.'
+        if self.diag.value and time.monotonic() - self.last_diag_t >= 1. / self.diag_fps.value:
             self.last_diag_t = time.monotonic()
+            self._render_diag(stream, depth, raw_rgb, rgb)
         with self.lock:
             self.state = snapshot(stream)
             if not tracking_valid:
@@ -308,7 +309,7 @@ class AuthorView:
             self.last_render_frame = int(stream.n - 1)
             self.render_error = None
             if hasattr(self, 'render_dock'):
-                self.render_dock.publish(self.last_render_frame, [('Overall (approx)', self.diag_rgb), ('Observed RGB', self.diag_obs), ('Depth residual', self.diag_resid)] + part_images, f'{self.last_render_ms:.0f} ms; updates at most every 1.5 s')
+                self.render_dock.publish(self.last_render_frame, [('Overall (approx)', self.diag_rgb), ('Observed RGB', self.diag_obs), ('Depth residual', self.diag_resid)] + part_images, f'{self.last_render_ms:.0f} ms; target {self.diag_fps.value:g} FPS (limited by incoming frames)')
         except Exception as exc:            # never fake a render; surface in UI + log
             self.render_error = f'{type(exc).__name__}: {exc}'
             print(f'[author] render diagnostic failed: {exc}', flush=True)
@@ -444,7 +445,7 @@ def replay():
     print('[author] replay complete; browser remains interactive',flush=True)
     if not args.exit_after_replay:
         while True:
-            if view.commands or (view.diag.value and time.monotonic() - view.last_diag_t > 1.5):
+            if view.commands or (view.diag.value and time.monotonic() - view.last_diag_t >= 1. / view.diag_fps.value):
                 view.last_update = 0
                 view.publish(stream, rgb, depth=depth, raw_rgb=rgb)
             time.sleep(.1)
