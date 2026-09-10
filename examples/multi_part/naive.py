@@ -169,6 +169,7 @@ class NaiveConfig:
     # Step 3b: once a joint is confident the part has one degree of freedom, not
     # six. Searching that scalar instead is what survives occlusion.
     joint_track: bool = True
+    joint_reprojection_gate: bool = False  # experimental observed-surface veto
     joint_min_obs: int = 12
     # The object is "controllable" once a joint is identified well enough to
     # command a target q; that moment, not the runtime, is the online claim.
@@ -847,6 +848,18 @@ class NaivePartTracker:
             del part.hist[:len(part.hist) - self.cfg.hist_max]
         part.pose = T_free
         jf = self._fit_joint(part, sel, cur)
+        if jf is not None and cfg.joint_reprojection_gate:
+            from examples.multi_part.pose_memory import joint_pose_supported
+            points = np.empty((0, 3))
+            if self.model is not None:
+                j = next(k for k, p in enumerate(self.parts) if p is part)
+                ids = np.flatnonzero(self.model.labels == j)
+                ids = ids[::max(1, int(np.ceil(len(ids) / 1024)))]
+                points = self.model.cloud.means[ids].detach().cpu().numpy()
+            if not joint_pose_supported(points, T_free, jf[0],
+                                        self.current_depth, self.mask, self.K):
+                self.joint_reprojection_vetoes = getattr(self, 'joint_reprojection_vetoes', 0) + 1
+                jf = None
         if jf is not None and jf[1] <= max(float(np.median(d)), 1e-4) * cfg.joint_tol:
             part.pose = jf[0]
             part.on_joint = True

@@ -3,6 +3,18 @@ import numpy as np
 from examples.multi_part.surface_memory import reprojection_evidence
 
 
+def joint_pose_supported(points, free_pose, joint_pose, depth, mask, K,
+                         min_support=.25, slack=.02):
+    """A joint constraint may not override better observed surface evidence."""
+    if len(points) < 40 or not np.isfinite(joint_pose).all():
+        return False
+    free = reprojection_evidence(points, free_pose, depth, mask, K)
+    joint = reprojection_evidence(points, joint_pose, depth, mask, K)
+    return bool(joint['support'] >= min_support and
+                joint['support'] - joint['contradiction'] + slack >=
+                free['support'] - free['contradiction'])
+
+
 def choose_pose(points, sparse_pose, predicted_pose, depth, mask, K,
                 refine, tolerance=.012, margin=.08, min_support=.3,
                 previous_pose=None, max_step_deg=20.):

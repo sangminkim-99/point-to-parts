@@ -171,5 +171,11 @@ python -m examples.multi_part.urdf_view results/urdf_validation/drawer.urdf \
 4. Validate the corrected URDF exporter on a reliably learned hinge as well as the
    slider, then load and render the artifact in SAPIEN. GT/oracle joint/pose tests
    are useful diagnostics but must not be presented as online inference results.
+   Latest matched joint-tracking ablation (`doc/joint_tracking_ablation.md`):
+   removing the scalar override reduces shared hinge error 432 to 119 mm but
+   loses six observed frames and introduces an ID switch. Experimental
+   `joint_reprojection_gate` reproduces no-joint hinge and mostly retains drawer
+   overrides, with no evidence to promote it. Defaults unchanged. Missing-surface
+   pose initialization/identity remains the next substantial tracking target.
 5. Keep matched ablations and negative results. Commit/push tested checkpoints,
    leave larger data local, and report meaningful progress in Korean.

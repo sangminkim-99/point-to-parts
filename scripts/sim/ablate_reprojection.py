@@ -8,6 +8,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 VARIANTS = {
+    'guarded_joint_reprojection': ['incremental_pose=true', 'incremental_jump_only=true', 'joint_reprojection_gate=true'],
+    'guarded_no_joint_track': ['incremental_pose=true', 'incremental_jump_only=true', 'joint_track=false'],
     'guarded_incremental': ['incremental_pose=true', 'incremental_jump_only=true'],
     'incremental': ['incremental_pose=true'],
     'incremental_nogate': ['incremental_pose=true', 'split_reprojection=false'],
