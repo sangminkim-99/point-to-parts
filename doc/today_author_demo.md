@@ -43,3 +43,25 @@ contradictions. Saved labels alone do not prove that sequence caused the loss.
 The viewer hides labels=-1. A worker is replaying with temporal ownership/carve
 instrumentation before changing assignment defaults. Geometry retention and
 correct part association must be measured separately.
+
+## Gaussian diagnostics (September 10 checkpoint)
+
+Restart the demo to load the new UI. Enable **Render diagnostics (low-rate)**
+while frames are arriving. **Diagnostic panel** selects rendered RGB, depth
+residual or observed RGB. Rendering runs at most once per 1.5 seconds and is
+off by default. The 3D view remains a point cloud; the diagnostic image uses
+actual Gaussian rasterization with approximate nearest-depth compositing across
+parts (not global alpha composition). Timing and render-frame age are displayed.
+
+Depth coverage uses object-mask pixels with valid depth; agreement is the
+fraction of covered valid object pixels within 20 mm. This measures current-view
+agreement, not full-object completeness. Residual heatmap saturates at 30 mm.
+Held poses and rendering errors are explicit. Refiner presence indicates
+configuration, not proof of a successful optimization on the current frame.
+
+Manager validation: 110 object tests passed; actual GPU rasterizer smoke on
+recorded frame50 with 2682 depth-initialized Gaussians produced RGB/depth output.
+Artifacts: results/viser_diagnostics_smoke/{render.png,observed.png,metrics.json}.
+The same-frame initialized smoke verifies plumbing, not reconstruction accuracy
+or live throughput. Live input RGB/depth handoff was connected; physical camera
+interaction was not exercised by this smoke. User CUDA cache was not modified.

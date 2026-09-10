@@ -17,7 +17,8 @@ from examples.multi_part.naive import NaivePartTracker, NaiveConfig
 from examples.multi_part.acquire import apply_config, apply_overrides
 from examples.multi_part.author_state import (snapshot, displayed_poses, save_snapshot,
                                                cloud_center_radius, frame_view,
-                                               PALETTE, geometry_counts, legend_markdown)
+                                               PALETTE, geometry_counts, legend_markdown,
+                                               render_status_markdown, uncertainty_markdown)
 
 
 class ReferenceTracker(NaivePartTracker):
@@ -65,6 +66,16 @@ class AuthorView:
         self.radius = 0.
         self.framed = False           # have we auto-framed once data arrived?
         self.counts = None            # assigned/unassigned geometry counts
+        # Diagnostics: default off + low-rate so overhead stays near zero. The
+        # actual Gaussian render is produced in the tracking thread (publish),
+        # never in a GUI callback, and is snapshotted for the GUI to show.
+        self.diag_rgb = self.diag_resid = self.diag_obs = None
+        self.diag_coverage = self.diag_agreement = None
+        self.last_render_frame = None
+        self.last_render_ms = 0.
+        self.last_ref_observed_frame = -1     # reference specifically, not any part
+        self.last_diag_t = 0.
+        self.render_error = None
         self.server = viser.ViserServer(host='127.0.0.1', port=args.port,
                                         label='Teach an articulated object')
         self.server.scene.set_up_direction('-y')
@@ -86,6 +97,19 @@ class AuthorView:
         reset = self.server.gui.add_button('Reset preview & annotations')
         self.saved = self.server.gui.add_markdown('Cloud + kinematic URDF when fitted. Observed surfaces only.')
         self.legend = self.server.gui.add_markdown('Legend appears once geometry is tracked.')
+        self.uncertainty = self.server.gui.add_markdown('Tracking confidence appears with parts.')
+        self.diag = self.server.gui.add_checkbox('Render diagnostics (low-rate)', initial_value=False)
+        self.diag_panel = self.server.gui.add_dropdown('Diagnostic panel',
+            ['Rendered RGB (approx)', 'Depth residual', 'Observed RGB'])
+        self.diag_status = self.server.gui.add_markdown('Enable diagnostics for Gaussian render status.')
+        self.diag_image = self.server.gui.add_image(np.zeros((240,320,3), np.uint8),
+            label='Gaussian render diagnostic (not the point-cloud preview)')
+        self.server.gui.add_markdown(
+            '_Rendered RGB is an approximate per-part z-buffer composite (not joint '
+            'alpha compositing). Observed RGB is the raw camera image, or the annotated '
+            'tracking overlay if the raw frame is unavailable._')
+        self._obs_is_overlay = False
+        self.diag_panel.on_update(lambda _: self._show_diag())
         self.server.gui.add_markdown('Select the physical body after parts separate. Reference pose is tracked, not fixed. Preview does not move the real object.')
         choose.on_click(lambda _: self.commands.append(('reference', int(self.root.value))))
         save.on_click(lambda _: self.save())
@@ -151,16 +175,26 @@ class AuthorView:
             except ValueError as exc:
                 self.saved.content = str(exc)
 
-    def publish(self, stream, rgb, step_ms=0., tracking_valid=True):
+    def publish(self, stream, rgb, step_ms=0., tracking_valid=True, depth=None, raw_rgb=None):
+        # `rgb` is the annotated tracking overlay (shown in the RGB-D panel).
+        # `raw_rgb` is the unannotated camera image for the Observed RGB panel;
+        # if None, that panel falls back to the overlay and is labelled as such.
         self.process_commands(stream)
         if time.monotonic() - self.last_update < .2:
             return
         self.last_update = time.monotonic()
+        # Actual Gaussian render happens HERE, in the tracking thread (GPU-safe),
+        # default-off and rate-limited -- never inside a GUI callback.
+        if self.diag.value and time.monotonic() - self.last_diag_t > 1.5:
+            self._render_diag(stream, depth, raw_rgb, rgb)
+            self.last_diag_t = time.monotonic()
         with self.lock:
             self.state = snapshot(stream)
             if not tracking_valid:
                 for p in self.state.parts:
                     p.observed = False
+            if self.state.parts[self.state.root].observed:   # REFERENCE specifically
+                self.last_ref_observed_frame = self.state.frame
             self.image.image = cv2.resize(rgb, (320,240))
             options = [str(p.part_id) for p in self.state.parts]
             if tuple(self.root.options) != tuple(options):
@@ -173,7 +207,93 @@ class AuthorView:
                                  f'Reference **{root.part_id}**: '
                                  f'{"tracked" if root.observed else "LOST — held pose"} · '
                                  f'tracker step {step_ms:.0f} ms')
+            self.uncertainty.content = uncertainty_markdown(self.state)
+            model = getattr(stream, 'model', None)
+            self.diag_status.content = render_status_markdown(
+                model_present=model is not None and getattr(model, 'cloud', None) is not None,
+                diag_enabled=self.diag.value,
+                refiner_present=getattr(stream, 'refiner', None) is not None,
+                counts=counts, last_render_frame=self.last_render_frame,
+                last_render_ms=self.last_render_ms, current_frame=self.state.frame,
+                frames_since_ref_observed=max(0, self.state.frame - self.last_ref_observed_frame),
+                coverage=self.diag_coverage, agreement=self.diag_agreement,
+                render_error=self.render_error)
+            self._show_diag()
             self.draw()
+
+    def _show_diag(self):
+        """Swap which stored diagnostic image is shown. Pure display, no GPU."""
+        img = {'Rendered RGB (approx)': self.diag_rgb, 'Depth residual': self.diag_resid,
+               'Observed RGB': self.diag_obs}.get(self.diag_panel.value)
+        if img is not None:
+            self.diag_image.image = img
+
+    def _render_diag(self, stream, depth, raw_rgb, overlay_rgb, tol=0.02):
+        """Rasterise the actual Gaussians per part under its own pose, then
+        z-buffer composite. This is an APPROXIMATE composite (nearest-depth, not
+        true joint alpha compositing across parts); exact only for a single part.
+
+        Tracking-thread only, under no_grad. Never fakes a result: on failure it
+        records the error (surfaced in the UI) and keeps the previous images.
+        Observed RGB uses the RAW camera image; if absent, the annotated overlay
+        is shown and labelled as such."""
+        model = getattr(stream, 'model', None)
+        if model is None or getattr(model, 'cloud', None) is None:
+            return
+        try:
+            import torch
+            t0 = time.perf_counter()
+            H, W = (depth.shape[:2] if depth is not None else
+                    (raw_rgb if raw_rgb is not None else overlay_rgb).shape[:2])
+            labels = np.asarray(model.labels)
+            rgb_acc = np.zeros((H, W, 3), np.float32)
+            z_acc = np.full((H, W), np.inf, np.float32)
+            cover = np.zeros((H, W), bool)
+            with torch.no_grad():
+                for j, p in enumerate(stream.parts):
+                    sub = np.where(labels == j)[0]
+                    if len(sub) == 0:
+                        continue
+                    idx = torch.as_tensor(sub, device=model.cloud.device)
+                    rgb_t, dep_t, al_t = model.cloud.render(p.pose, stream.K, H, W, subset=idx)
+                    rgb = rgb_t.detach().cpu().numpy(); dep = dep_t.detach().cpu().numpy()
+                    al = al_t.detach().cpu().numpy()
+                    good = (al > 0.3) & np.isfinite(dep) & (dep > 0)   # valid finite positive depth
+                    win = good & (dep < z_acc)
+                    rgb_acc[win] = rgb[win]; z_acc[win] = dep[win]; cover |= win
+            self.diag_rgb = cv2.resize(np.clip(rgb_acc * 255, 0, 255).astype(np.uint8), (320, 240))
+            obs = raw_rgb if raw_rgb is not None else overlay_rgb
+            self.diag_obs = cv2.resize(obs, (320, 240)) if obs is not None else None
+            self._obs_is_overlay = raw_rgb is None
+            # Coverage (how much of the OBJECT the render draws) and depth
+            # agreement (of covered object pixels, how many match observed depth)
+            # are SEPARATE. The object is mask & finite depth, never background.
+            self.diag_coverage = self.diag_agreement = self.diag_resid = None
+            mask = getattr(stream, 'mask', None)
+            if depth is not None and mask is not None and np.asarray(mask).shape == depth.shape:
+                obj = (depth > 0) & np.isfinite(depth)
+                if mask is not None and np.asarray(mask).shape[:2] == obj.shape:
+                    obj &= np.asarray(mask) > 0
+                nobj = int(obj.sum())
+                if nobj:
+                    self.diag_coverage = float((cover & obj).sum() / nobj)
+                    valid = cover & obj
+                    nv = int(valid.sum())
+                    if nv:
+                        res = np.zeros_like(depth, dtype=np.float32)
+                        res[valid] = np.abs(z_acc[valid] - depth[valid])
+                        self.diag_agreement = float((res[valid] < tol).sum() / nv)
+                        heat = cv2.applyColorMap(
+                            np.clip(res / (tol * 1.5) * 255, 0, 255).astype(np.uint8),
+                            cv2.COLORMAP_MAGMA)
+                        heat[~valid] = 0
+                        self.diag_resid = cv2.resize(cv2.cvtColor(heat, cv2.COLOR_BGR2RGB), (320, 240))
+            self.last_render_ms = 1000 * (time.perf_counter() - t0)
+            self.last_render_frame = int(stream.n - 1)
+            self.render_error = None
+        except Exception as exc:            # never fake a render; surface in UI + log
+            self.render_error = f'{type(exc).__name__}: {exc}'
+            print(f'[author] render diagnostic failed: {exc}', flush=True)
 
     def draw(self):
         with self.lock:
@@ -292,7 +412,7 @@ def replay():
         else:
             stream.step(rgb,depth,mask)
         view.publish(stream,cv2.cvtColor(stream.render(cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR), style='clean'),cv2.COLOR_BGR2RGB),
-                     1000*(time.perf_counter()-t))
+                     1000*(time.perf_counter()-t), depth=depth, raw_rgb=rgb)
         root = stream.parts[stream.root]
         trace.append(dict(frame=i, part_id=root.part_id, observed=bool(root.observed),
                           pose=root.pose.tolist(), parts=len(stream.parts)))
@@ -328,6 +448,7 @@ def live():
             count = 0
             def record(rgb, depth, mask):
                 nonlocal count
+                stream.author_input = (rgb.copy(), depth.copy())
                 filename = f'{count:06d}.png'
                 for sub, data in [('rgb', cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR)),
                                   ('depth', np.clip(np.nan_to_num(depth)*1000,0,65535).astype(np.uint16)),
@@ -345,7 +466,9 @@ def live():
                     self.stream.root = 0
                 self.author.publish(self.stream,cv2.cvtColor(vis,cv2.COLOR_BGR2RGB),
                                     self.times[-1] if self.times else 0.,
-                                    tracking_valid=not self.acq.tracking_lost)
+                                    tracking_valid=not self.acq.tracking_lost,
+                                    raw_rgb=getattr(self.stream, "author_input", (None, None))[0],
+                                    depth=getattr(self.stream, "author_input", (None, None))[1])
             return super()._panel(vis,conf,kind,i)
 
         def run(self):

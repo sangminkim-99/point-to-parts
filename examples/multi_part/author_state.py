@@ -10,6 +10,8 @@ import numpy as np
 def snapshot(stream):
     parts = [SimpleNamespace(part_id=p.part_id, parent=p.parent,
                             pose=p.pose.copy(), observed=bool(p.observed),
+                            resid=float(getattr(p, 'resid', 0.) or 0.),
+                            sigma=float(getattr(p, 'sigma', 0.) or 0.),
                             joint=copy.deepcopy(p.joint)) for p in stream.parts]
     if stream.model is not None:
         points = stream.model.cloud.means.detach().cpu().numpy().copy()
@@ -77,6 +79,64 @@ def legend_markdown(part_ids, counts):
         name = PALETTE_NAMES[pid % len(PALETTE_NAMES)]
         lines.append(f'- {name} — part {pid}: {counts["per_part"][k]:,} pts')
     lines.append(f'- unassigned (hidden, no part pose): {counts["unassigned"]:,} pts')
+    return '\n'.join(lines)
+
+
+def render_status_markdown(model_present, diag_enabled, refiner_present, counts,
+                           last_render_frame, last_render_ms, current_frame,
+                           frames_since_ref_observed, coverage=None, agreement=None,
+                           render_error=None):
+    """Honest render/diagnostic status. Never claims a render that did not run.
+
+    Distinguishes *configured* (dense model exists / refiner exists) from
+    *executed* (a render actually ran on a given frame). The 3D scene is a
+    POINT-CLOUD preview; the Gaussian render is the separate diagnostic image.
+    """
+    if not model_present:
+        return ('**Render diagnostics** — dense Gaussian model **disabled** '
+                '(`--set dense=true` to enable). 3D view is a point-cloud preview.')
+    lines = ['**Render diagnostics** (3D view = point-cloud preview, not a render)']
+    lines.append(f'- Gaussians: **{counts["assigned"]:,} assigned** / '
+                 f'{counts["unassigned"]:,} unassigned')
+    # configured, not executed: dense model present; refiner object exists.
+    lines.append(f'- Configured: Gaussian model **present** · refiner '
+                 f'**{"present" if refiner_present else "absent"}** · '
+                 f'diagnostic render **{"enabled" if diag_enabled else "off"}**')
+    if last_render_frame is None:
+        lines.append('- Latest Gaussian render: **not executed yet**')
+    else:
+        stale = current_frame - last_render_frame
+        lines.append(f'- Latest Gaussian render **executed** at frame **{last_render_frame}** '
+                     f'({last_render_ms:.0f} ms)' + ('' if stale <= 0 else f', **{stale} frame(s) stale**'))
+        if coverage is not None:
+            lines.append(f'  - coverage {coverage*100:.0f}% of object pixels rendered · '
+                         f'depth agreement {agreement*100:.0f}% (within tolerance)'
+                         if agreement is not None else
+                         f'  - coverage {coverage*100:.0f}% of object pixels rendered')
+    fresh = ('current frame' if frames_since_ref_observed == 0
+             else f'**{frames_since_ref_observed} frame(s) since the REFERENCE was observed** (held pose)')
+    lines.append(f'- Reference tracking: {fresh}')
+    if render_error:
+        lines.append(f'- ⚠ **render error**: {render_error}')
+    return '\n'.join(lines)
+
+
+def uncertainty_markdown(state, resid_edge_on=0.02):
+    """Per-part tracking confidence, honest about held vs observed poses.
+
+    A thin object turned edge-on loses depth support: its pose is HELD, not
+    measured. This never renders a held pose as if it were observed; it labels
+    it and flags high-residual (edge-on) parts.
+    """
+    lines = ['**Tracking confidence** (held ≠ observed)']
+    for p in state.parts:
+        if not p.observed:
+            tag = '⟂ **HELD — not observed** (e.g. edge-on / occluded); pose is last-known, not measured'
+        elif p.resid >= resid_edge_on:
+            tag = f'△ observed but **high residual {p.resid*1000:.0f} mm** — inspect alignment'
+        else:
+            tag = f'● observed, residual {p.resid*1000:.0f} mm'
+        lines.append(f'- part {p.part_id}: {tag}')
     return '\n'.join(lines)
 
 

@@ -9,7 +9,8 @@ from examples.multi_part.author_demo import ReferenceTracker
 from examples.multi_part.author_state import (displayed_poses, save_snapshot, snapshot,
                                               union_mask, cloud_center_radius, frame_view,
                                               geometry_counts, legend_markdown, PALETTE,
-                                              PALETTE_NAMES)
+                                              PALETTE_NAMES, render_status_markdown,
+                                              uncertainty_markdown)
 from examples.multi_part.recording import Recording
 from test.object.test_urdf_export import model, fk
 
@@ -201,6 +202,57 @@ def test_legend_names_each_part_and_states_unassigned():
 
 def test_palette_and_names_are_aligned():
     assert len(PALETTE) == len(PALETTE_NAMES)           # swatch and label always agree
+
+
+# ---- render / tracking diagnostics (honest status, no fake render) ----------
+
+def test_render_status_states_disabled_when_no_model():
+    md = render_status_markdown(model_present=False, diag_enabled=False,
+        refiner_present=False, counts=dict(assigned=0, unassigned=0),
+        last_render_frame=None, last_render_ms=0., current_frame=5,
+        frames_since_ref_observed=0)
+    assert 'disabled' in md and 'point-cloud preview' in md
+
+
+def test_render_status_distinguishes_configured_from_executed():
+    c = geometry_counts(np.array([0, 0, 1, -1]), 2)
+    # configured (model present) but never executed -> must NOT invent a render
+    md0 = render_status_markdown(True, True, True, c, None, 0., 10, 3)
+    assert 'not executed yet' in md0 and 'refiner **present**' in md0
+    assert '3 frame(s) since the REFERENCE was observed' in md0
+    # executed at frame 8, refiner absent, stale by 2, with coverage/agreement
+    md1 = render_status_markdown(True, True, False, c, 8, 12.5, 10, 0,
+                                 coverage=0.62, agreement=0.80)
+    assert 'executed** at frame **8**' in md1 and '12 ms' in md1
+    assert 'refiner **absent**' in md1 and '2 frame(s) stale' in md1
+    assert 'coverage 62%' in md1 and 'agreement 80%' in md1
+
+
+def test_render_status_surfaces_render_error_in_ui():
+    c = geometry_counts(np.array([0]), 1)
+    md = render_status_markdown(True, True, True, c, None, 0., 3, 0,
+                                render_error='RuntimeError: CUDA oom')
+    assert 'render error' in md and 'CUDA oom' in md      # visible in UI, not console-only
+
+
+def test_uncertainty_never_calls_a_held_pose_observed():
+    s = state()
+    s.parts[0].observed = False; s.parts[0].resid = 0.0
+    s.parts[1].observed = True;  s.parts[1].resid = 0.03      # edge-on high residual
+    md = uncertainty_markdown(s)
+    assert 'HELD' in md and 'not observed' in md              # held part flagged, not "observed"
+    assert 'high residual' in md and '30 mm' in md            # edge-on flagged
+    s.parts[1].resid = 0.001
+    assert 'high residual' not in uncertainty_markdown(s)     # good support -> no flag
+
+
+def test_snapshot_carries_resid_for_uncertainty():
+    s = state()
+    for j, p in enumerate(s.parts):
+        p.idx = np.array([j]); p.resid = 0.01 * (j + 1); p.sigma = 0.004
+    s.model = None; s.anchor_xyz = np.ones((2, 3)); s.n = 3
+    shot = snapshot(s)
+    assert abs(shot.parts[1].resid - 0.02) < 1e-9            # per-part residual preserved
 
 
 def test_lost_root_is_saved_as_unobserved_not_tracked(tmp_path):
