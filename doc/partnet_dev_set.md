@@ -115,3 +115,12 @@ case for reprojection-based association first, then the combined hinge/orbit cas
 A useful success criterion is one continuous ID under camera-only motion, then
 two continuous IDs and correct hinge motion under articulation. This avoids
 accepting a final part count or purity score that hides intermediate identity loss.
+
+## Reprojection follow-up
+
+The experimental `--config reprojection_split.yaml` adds visibility-aware RGB-D
+validation before accepting a split. It fixes the locked-orbit false split and
+reduces noisy-hinge over-segmentation, while combined hinge/orbit still fails and
+loses GT coverage. Keep the original preset for baseline comparisons. See
+`doc/reprojection_ablations.md` for the full 24-run matrix, matched sparse/dense
+controls, temporal-pose negative results and research claim boundaries.

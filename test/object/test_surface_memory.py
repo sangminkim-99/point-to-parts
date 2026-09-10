@@ -227,3 +227,32 @@ def test_symmetric_depth_ablation_counts_occlusion_as_error():
     result = reprojection_evidence(pts, np.eye(4), depth, np.ones_like(depth), K,
                                    occlusion_aware=False)
     assert result['contradiction'] == 1.
+
+
+def _split_gate_scene(moving_depth):
+    from types import SimpleNamespace
+    from examples.multi_part.naive import NaiveConfig, NaivePartTracker
+    tracker = NaivePartTracker.__new__(NaivePartTracker)
+    tracker.cfg = NaiveConfig(split_reprojection_min_points=6)
+    tracker.model = None
+    x, y = np.meshgrid(np.linspace(-.03, .03, 3), np.linspace(-.03, .03, 3))
+    base = np.column_stack([x.ravel() - .15, y.ravel(), np.ones(x.size)])
+    moving = np.column_stack([x.ravel() + .15, y.ravel(), np.full(x.size, moving_depth)])
+    tracker.anchor_xyz = np.concatenate([base, moving])
+    tracker.K = K
+    tracker.current_depth = np.ones((200, 240))
+    tracker.mask = np.ones((200, 240), np.uint8)
+    tracker.n = 10
+    shifted = np.eye(4)
+    shifted[2, 3] = 1 - moving_depth
+    return tracker, SimpleNamespace(pose=np.eye(4)), [np.arange(9), np.arange(9, 18)], [np.eye(4), shifted]
+
+
+def test_split_gate_requires_observable_contradiction_reduction():
+    tracker, part, groups, motions = _split_gate_scene(.8)
+    assert tracker._validate_split_reprojection(0, part, groups, motions)
+
+
+def test_split_gate_does_not_use_hidden_geometry_as_articulation_evidence():
+    tracker, part, groups, motions = _split_gate_scene(1.2)
+    assert not tracker._validate_split_reprojection(0, part, groups, motions)
