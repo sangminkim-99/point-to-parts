@@ -150,9 +150,13 @@ python -m examples.multi_part.urdf_view results/urdf_validation/drawer.urdf \
    pooled fixed poses are not bundle adjustment. Test additional views/objects
    before coupling articulation. Implementation and runner are
    `examples/multi_part/keyframe_rigid.py`, `scripts/sim/keyframe_baseline.py`.
-2. Improve evaluation over common frame windows after discovery, while reporting
-   birth delay, identity changes and missing coverage explicitly. Preserve full
-   traces; do not claim pose improvements by discarding difficult frames.
+2. Shared-frame evaluation is now implemented in
+   `scripts/sim/compare_pose_traces.py`; see `doc/common_window_evaluation.md`.
+   Combined-motion guarded lid has only 31/119 qualifying observed frames,
+   versus zero for reference, so comparative lid accuracy is unavailable.
+   Clean-hinge incremental and guarded both exceed 430 mm on 44 shared frames.
+   Do not mistake held poses or late discovery for continuous recovery. Keep
+   coverage and alignment limitations alongside every accuracy comparison.
 3. Couple part discovery with trustworthy pose histories and inspect existing
    Sturm-style model selection. Track type/axis confidence over time, not just the
    final or earliest confident label. Avoid false early "controllable" claims.
