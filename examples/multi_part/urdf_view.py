@@ -51,6 +51,7 @@ def read_urdf(path):
             "parent": jn.find("parent").get("link"),
             "child": jn.find("child").get("link"),
             "origin": _vec(jn.find("origin"), "xyz", [0, 0, 0]),
+            "rpy": _vec(jn.find("origin"), "rpy", [0, 0, 0]),
             "axis": _vec(jn.find("axis"), "xyz", [0, 0, 1]),
             "lower": 0.0 if lim is None else float(lim.get("lower", 0.0)),
             "upper": 0.0 if lim is None else float(lim.get("upper", 0.0)),
@@ -67,29 +68,30 @@ def joint_pose(j, q):
     if j["type"] == "prismatic":
         T[:3, 3] = a * q
     elif j["type"] == "revolute":
-        # Rodrigues about the axis, then carried around the joint's origin so
-        # the link swings about the hinge instead of about the world centre
+        # Motion is expressed in the joint frame, after its parent-frame origin.
         K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
         R = np.eye(3) + np.sin(q) * K + (1 - np.cos(q)) * (K @ K)
         T[:3, :3] = R
-        T[:3, 3] = j["origin"] - R @ j["origin"]
-    return T
+    from scipy.spatial.transform import Rotation
+    O = np.eye(4)
+    O[:3, :3] = Rotation.from_euler('xyz', j.get('rpy', [0, 0, 0])).as_matrix()
+    O[:3, 3] = j['origin']
+    return O @ T
 
 
 def link_poses(joints, root, q):
     """World transform per link, walking down from the root."""
     pose = {root: np.eye(4)}
-    todo, guard = list(joints), 0
-    while todo and guard < 100:
-        guard += 1
+    todo = list(enumerate(joints))
+    while todo:
         left = []
-        for k, j in enumerate(todo):
+        for k, j in todo:
             if j["parent"] in pose:
                 pose[j["child"]] = pose[j["parent"]] @ joint_pose(j, q[k])
             else:
-                left.append(j)
+                left.append((k, j))
         if len(left) == len(todo):
-            break                       # a joint whose parent never appears
+            raise ValueError("disconnected or cyclic URDF joints")
         todo = left
     return pose
 
@@ -142,17 +144,22 @@ def main():
 
     # centre the whole thing on its own root: the export writes geometry in the
     # anchor camera's frame, which puts the object a metre in front of nothing
-    allpts = np.vstack([np.asarray(m.vertices) for m in geoms.values()])
+    rest_poses = link_poses(joints, root, np.zeros(len(joints)))
+    allpts = np.vstack([np.asarray(m.vertices) @ rest_poses[n][:3, :3].T + rest_poses[n][:3, 3]
+                       for n, m in geoms.items()])
     centre = allpts.mean(0)
     radius = float(np.linalg.norm(allpts - centre, axis=1).max())
     rest = {n: np.asarray(m.vertices).copy() for n, m in geoms.items()}
 
     # one sweep per joint, the others held at rest, then all together
     plans = []
-    for k in range(len(joints)):
+    moving = [k for k, j in enumerate(joints) if j["type"] != "fixed"]
+    for k in moving:
         plans.append(("%s alone" % joints[k]["name"], k))
-    if len(joints) > 1:
+    if len(moving) > 1:
         plans.append(("all together", None))
+    if not plans:
+        plans.append(("static", None))
 
     def q_at(t, only):
         q = np.zeros(len(joints))
@@ -242,14 +249,22 @@ def main():
                                 int(255 * min(g * s_, 1)),
                                 int(255 * min(r * s_, 1))), -1)
             for k, j in enumerate(joints):
+                if j["type"] == "fixed":
+                    continue
                 Tp = pose.get(j["parent"], np.eye(4))
-                a = Tp[:3, :3] @ (j["axis"] / np.linalg.norm(j["axis"]))
+                a = Tp[:3, :3] @ joint_pose(j, 0.)[:3, :3] @ (j["axis"] / np.linalg.norm(j["axis"]))
                 if j["type"] == "revolute":
                     b0 = Tp[:3, :3] @ j["origin"] + Tp[:3, 3] - off
                 else:
-                    ch = geoms.get(j["child"])
-                    b0 = (np.asarray(ch.vertices).mean(0) if ch is not None
-                          else Tp[:3, 3] - off)
+                    child = j['child']
+                    while child not in rest:
+                        fixed = next((edge for edge in joints if edge['parent'] == child and edge['type'] == 'fixed'), None)
+                        if fixed is None:
+                            break
+                        child = fixed['child']
+                    Tc = pose[child]
+                    b0 = (Tc[:3, :3] @ rest[child].mean(0) + Tc[:3, 3] - off
+                          if child in rest else Tp[:3, :3] @ j['origin'] + Tp[:3, 3] - off)
                 seg = np.stack([b0 - a * radius * 0.7, b0 + a * radius * 0.7])
                 cc = Rc @ (seg - eye).T
                 if (cc[2] <= 1e-3).any():
@@ -262,7 +277,7 @@ def main():
                          cv2.LINE_AA)
                 t = f"{j['name']} {j['type']}  q={q[k]:+.3f}"
                 for c_, w_ in (((20, 20, 20), 3), ((235, 235, 235), 1)):
-                    cv2.putText(img, t, (uv[1][0] + 8, uv[1][1]),
+                    cv2.putText(img, t, (int(np.clip(uv[1][0] + 8, 8, W - 300)), int(np.clip(uv[1][1], 18, H - 45))),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, c_, w_,
                                 cv2.LINE_AA)
             cv2.rectangle(img, (0, H - 30), (W, H), (18, 20, 23), -1)

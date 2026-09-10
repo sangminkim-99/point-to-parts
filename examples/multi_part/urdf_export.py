@@ -48,16 +48,74 @@ def part_mesh(points, colors=None, depth=8, trim=0.20, voxel=0.004,
 
 
 def _xyz(e, v):
-    e.set("xyz", " ".join(f"{float(x):.6f}" for x in v))
+    e.set("xyz", " ".join(f"{float(x):.9g}" for x in v))
 
+
+
+def joint_frames(jm):
+    """Factor A(q) = origin @ motion(axis,q) @ child_offset.
+
+    JointModel stores public axis/point in parent coordinates. URDF expresses
+    the axis in its joint frame. A fixed helper link preserves the physical
+    child's canonical mesh frame, including an off-origin hinge pivot.
+    """
+    A0 = np.asarray(jm.at(0.), dtype=float)
+    axis = A0[:3, :3].T @ np.asarray(jm.axis, float)
+    norm = np.linalg.norm(axis)
+    if not np.isfinite(A0).all() or not np.isfinite(axis).all() or norm < 1e-8:
+        raise ValueError("invalid joint frame or axis")
+    axis /= norm
+    point = np.zeros(3)
+    if jm.kind == 'revolute' and jm.point is not None:
+        point = A0[:3, :3].T @ (np.asarray(jm.point) - A0[:3, 3])
+    origin, offset = A0.copy(), np.eye(4)
+    origin[:3, 3] += A0[:3, :3] @ point
+    offset[:3, 3] = -point
+    return origin, axis, offset
+
+
+def _origin(joint, T):
+    from scipy.spatial.transform import Rotation
+    e = ET.SubElement(joint, 'origin')
+    _xyz(e, T[:3, 3])
+    e.set('rpy', ' '.join(f'{v:.9g}' for v in Rotation.from_matrix(T[:3, :3]).as_euler('xyz')))
+
+
+def _tree(parts):
+    if not parts:
+        raise ValueError('cannot export an empty object')
+    parents = [int(getattr(p, 'parent', j)) for j, p in enumerate(parts)]
+    roots = [j for j, par in enumerate(parents) if j == par]
+    if len(roots) != 1:
+        raise ValueError('URDF requires one connected rooted tree')
+    for j, par in enumerate(parents):
+        if not 0 <= par < len(parts):
+            raise ValueError('invalid parent index')
+        if par == j:
+            continue
+        jm = getattr(parts[j], 'joint', None)
+        if jm is None or jm.kind not in ('rigid', 'revolute', 'prismatic'):
+            raise ValueError(f'part{j} has no supported fitted joint; cannot export a connected URDF')
+        seen, k = set(), j
+        while k != roots[0]:
+            if k in seen:
+                raise ValueError('cyclic part graph')
+            seen.add(k)
+            k = parents[k]
+            if not 0 <= k < len(parts):
+                raise ValueError('invalid parent index')
+    return parents
 
 def export(path, parts, points_of, colors_of=None, name="discovered",
            mesh_dir=None, mass=0.2):
     """Write <path>.urdf plus one collision mesh per part.
 
     `parts` are objects with .parent and .joint (a fitted JointModel); the joint
-    frame is the parent's frame, which is how the joint was estimated.
+    axis and pivot are expressed in the parent frame. Physical link mesh frames
+    are preserved using fixed joint-frame adapters.
     """
+    path = os.fspath(path)
+    parents = _tree(parts)
     mesh_dir = mesh_dir or os.path.join(os.path.dirname(path) or ".", "meshes")
     os.makedirs(mesh_dir, exist_ok=True)
     root = ET.Element("robot", {"name": name})
@@ -81,52 +139,41 @@ def export(path, parts, points_of, colors_of=None, name="discovered",
         for tag in ("visual", "collision"):
             v = ET.SubElement(link, tag)
             g = ET.SubElement(v, "geometry")
-            ET.SubElement(g, "mesh", {"filename": f"meshes/{rel}"})
+            ET.SubElement(g, "mesh", {"filename": os.path.relpath(os.path.join(mesh_dir, rel), os.path.dirname(path) or ".")})
         ine = ET.SubElement(link, "inertial")
         _xyz(ET.SubElement(ine, "origin"), c)
         ET.SubElement(ine, "mass", {"value": f"{mass}"})
         ET.SubElement(ine, "inertia", {"ixx": "1e-3", "iyy": "1e-3", "izz": "1e-3",
                                        "ixy": "0", "ixz": "0", "iyz": "0"})
 
-    # The tracker's root is part 0, which is simply the part that existed
-    # first, and that is often a drawer rather than the body it slides in. A
-    # URDF rooted on a drawer is kinematically fine and reads as nonsense: you
-    # hold the drawer still and push the cabinet. Measured on ikeasmall02, the
-    # axis was within 1 degree of the truth and pointed the opposite way for
-    # exactly this reason. So the biggest part becomes the root here, and any
-    # relation that has to be reversed is inverted rather than re-fitted --
-    # the child moves by +axis q relative to the parent, so the parent moves
-    # by -axis q relative to the child, and the observed range flips with it.
-    def _extent(j):
-        q = points_of(j)
-        if q is None or len(q) < 4:
-            return 0.0
-        q = np.asarray(q)
-        return float(np.linalg.norm(q.max(0) - q.min(0)))
-    # by size, not by point count: on ikeasmall02 the body has the FEWEST
-    # gaussians of the three parts, 5,510 against 11,000 for each drawer,
-    # because the drawers face the camera and the body is mostly behind them
-    hub = max(range(len(parts)), key=_extent) if len(parts) else 0
+    # Preserve the fitted tree. Re-rooting requires transforming complete
+    # relative models, not just negating a parent-frame axis.
     for j, p in enumerate(parts):
-        jm = getattr(p, "joint", None)
-        par = getattr(p, "parent", 0)
-        if jm is None or jm.kind is None or par == j or par >= len(parts):
+        par = parents[j]
+        if par == j:
             continue
-        vs = [jm.value_of(A) for A in jm.A] if jm.A else [0.0]
-        axis, lo, hi = np.asarray(jm.axis, float), min(vs), max(vs)
-        if j == hub:                    # this relation points the wrong way
-            par, j, axis, lo, hi = j, par, -axis, -hi, -lo
-        jt = ET.SubElement(root, "joint", {"name": f"j{par}_{j}",
-                                           "type": jm.kind})
-        ET.SubElement(jt, "parent", {"link": f"part{par}"})
-        ET.SubElement(jt, "child", {"link": f"part{j}"})
-        _xyz(ET.SubElement(jt, "origin"),
-             jm.point if (jm.kind == "revolute" and jm.point is not None)
-             else np.zeros(3))
-        _xyz(ET.SubElement(jt, "axis"), axis)
-        # only the range that was actually observed is claimed as the limit
-        ET.SubElement(jt, "limit", {"lower": f"{lo:.4f}", "upper": f"{hi:.4f}",
-                                    "effort": "50", "velocity": "1.0"})
+        jm = p.joint
+        if jm.kind == 'rigid':
+            jt = ET.SubElement(root, 'joint', name=f'j{par}_{j}', type='fixed')
+            ET.SubElement(jt, 'parent', link=f'part{par}')
+            ET.SubElement(jt, 'child', link=f'part{j}')
+            _origin(jt, jm.at(0.))
+            continue
+        origin, axis, offset = joint_frames(jm)
+        helper = f'joint_frame{j}'
+        ET.SubElement(root, 'link', name=helper)
+        jt = ET.SubElement(root, 'joint', name=f'j{par}_{j}', type=jm.kind)
+        ET.SubElement(jt, 'parent', link=f'part{par}')
+        ET.SubElement(jt, 'child', link=helper)
+        _origin(jt, origin)
+        _xyz(ET.SubElement(jt, 'axis'), axis)
+        vs = [jm.value_of(A) for A in jm.A] if jm.A else [0.]
+        ET.SubElement(jt, 'limit', lower=f'{min(vs):.9g}', upper=f'{max(vs):.9g}',
+                      effort='50', velocity='1.0')
+        fixed = ET.SubElement(root, 'joint', name=f'j{j}_mesh_frame', type='fixed')
+        ET.SubElement(fixed, 'parent', link=helper)
+        ET.SubElement(fixed, 'child', link=f'part{j}')
+        _origin(fixed, offset)
     ET.indent(root)
     out = path if path.endswith(".urdf") else path + ".urdf"
     ET.ElementTree(root).write(out, encoding="utf-8", xml_declaration=True)
