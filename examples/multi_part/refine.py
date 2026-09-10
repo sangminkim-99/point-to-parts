@@ -24,6 +24,9 @@ class RenderRefiner:
         a = self.m.assign
         out = []
         for j, p in enumerate(parts):
+            if not getattr(p, "observed", True) or getattr(p, "surface_recovered", False):
+                out.append(None)
+                continue
             w = self.m.weights(j)
             if w.sum() < 20 or p.pose is None:
                 out.append(None)

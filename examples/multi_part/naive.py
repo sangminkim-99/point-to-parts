@@ -274,11 +274,22 @@ class NaiveConfig:
     surface_reseed: bool = False       # seed new surface even if the base tracks well
     surface_radius: int = 14
     surface_min_region: int = 400
+    surface_recovery: bool = False     # recover a known joint without old point tracks
+    recovery_grid: int = 121
+    recovery_tol: float = 0.012
+    recovery_fraction: float = 0.3
+    recovery_margin: float = 0.05
+    recovery_confirm: int = 2
 
 
 @dataclass
 class NaivePart:
     idx: np.ndarray                     # track indices owned by this part
+    part_id: int = -1                    # persistent identity, independent of list position
+    observed: bool = True               # a fresh sparse pose, not a held pose
+    surface_recovered: bool = False
+    recovery_region: object = None
+    recovery_pending: object = None
     pose: np.ndarray = field(default_factory=lambda: np.eye(4))
     parent: int = 0
     joint: JointModel = None
@@ -347,7 +358,8 @@ class NaivePartTracker:
         self.anchor_xyz, self.anchor_ok = lift(pts0, depth, self.K)
         self.track_born = np.zeros(len(pts0), np.int32)
         self.pend = {}          # track index -> (n, sum, sumsq) per part
-        self.parts = [NaivePart(idx=np.where(self.anchor_ok)[0])]
+        self.parts = [NaivePart(idx=np.where(self.anchor_ok)[0], part_id=0)]
+        self.next_part_id = 1
         self.parts[0].box = self._fit_box(self.parts[0])
         self.n = 1
         n = len(self.anchor_xyz)
@@ -413,6 +425,8 @@ class NaivePartTracker:
 
         for p in self.parts:
             self._fit(p, cur, cur_ok, vis)
+        if cfg.surface_recovery:
+            self._recover_surfaces(depth, mask, i)
         if cfg.persist:
             for p in self.parts:
                 self._accumulate(p, cur, cur_ok, vis)
@@ -439,7 +453,7 @@ class NaivePartTracker:
         for j, p in enumerate(self.parts):
             if p.joint is None or j == p.parent or p.parent >= len(self.parts):
                 continue
-            if p.resid < cfg.joint_gate:
+            if p.observed and self.parts[p.parent].observed and p.resid < cfg.joint_gate:
                 # the BIC needs the real observation noise, and the fit itself
                 # is the only thing that knows it
                 p.joint.sigma = max(p.sigma, self.parts[p.parent].sigma)
@@ -492,14 +506,16 @@ class NaivePartTracker:
             for p, o in zip(self.parts, out):
                 if o is not None:
                     p.pose, p.energy = o
-            self.moved = getattr(self, "moved", 0) + self.refiner.update_labels(
-                self.parts, depth, mask, self.K, H, W)
+            if all(p.observed for p in self.parts):
+                self.moved = getattr(self, "moved", 0) + self.refiner.update_labels(
+                    self.parts, depth, mask, self.K, H, W)
             poses = [p.pose for p in self.parts]
 
         if i % cfg.carve_every == 0:
             self.carved = getattr(self, "carved", 0) + \
-                self.model.carve(depth, poses)
-        if cfg.grow_every > 0 and i % cfg.grow_every == 0:
+                self.model.carve(depth, [p.pose if p.observed else None for p in self.parts])
+        fresh = [p.observed or p.surface_recovered for p in self.parts]
+        if cfg.grow_every > 0 and i % cfg.grow_every == 0 and all(fresh):
             ok = [p.resid < cfg.joint_gate for p in self.parts]
             self.grown = getattr(self, "grown", 0) + \
                 self.model.grow(rgb, depth, mask, poses, grow_ok=ok)
@@ -608,7 +624,9 @@ class NaivePartTracker:
                 # was clean at frame 96 and mixed again by 130. A part with no
                 # visible region of its own has nothing to re-seed from.
                 own = None
-                if self.reproj is not None:
+                if p.surface_recovered and p.recovery_region is not None:
+                    own = (p.recovery_region > 0) & (mask > 0)
+                elif self.reproj is not None:
                     own = (self.reproj == j) & (mask > 0) & (depth > 0.05)
                 elif idx.size >= 3:
                     q = t2[idx].astype(int)
@@ -728,6 +746,11 @@ class NaivePartTracker:
     def _fit(self, part, cur, cur_ok, vis):
         """Rigid fit of this part's points from the anchor frame, RANSAC + SVD."""
         cfg = self.cfg
+        part.observed = False
+        part.surface_recovered = False
+        part.recovery_region = None
+        part.resid = float("inf")
+        part.on_joint = False
         # tracks added this frame have no measurement yet
         idx = part.idx[(part.idx < len(cur_ok)) & (part.idx < len(self.anchor_ok))]
         sel = idx[self.anchor_ok[idx] & cur_ok[idx] & vis[idx]]
@@ -763,6 +786,7 @@ class NaivePartTracker:
         else:
             part.on_joint = False
         part.resid = float(np.median(d))
+        part.observed = True
         if part.hist:                   # stamp the frame we just appended
             n_, T_, _ = part.hist[-1]
             part.hist[-1] = (n_, T_, part.resid)
@@ -779,6 +803,60 @@ class NaivePartTracker:
         part.n_mature = int(mature.sum())
         hot = (part.out_pts >= cfg.split_out_pts) or (part.resid > cfg.split_res)
         part.over = part.over + 1 if hot else 0
+
+    def _recover_surfaces(self, depth, mask, i):
+        """Keep a known part's identity while recovering its joint configuration.
+
+        Recovery is an observation of joint STATE, not independent evidence of
+        joint type/axis: it never feeds its own predictions back to joint.fit.
+        """
+        from examples.multi_part.surface_memory import match_joint_surface
+        cfg = self.cfg
+        for j, p in enumerate(self.parts):
+            if p.observed:
+                p.recovery_pending = None
+                continue
+            jm = p.joint
+            if jm is None or jm.kind not in ("revolute", "prismatic") \
+                    or p.parent == j or not 0 <= p.parent < len(self.parts):
+                continue
+            parent = self.parts[p.parent]
+            conf = jm.confidence()
+            if not parent.observed or not conf.get("valid", False) \
+                    or conf.get("conf", 0) < cfg.joint_conf or not jm.A:
+                continue
+            if self.model is not None:
+                lb = self.model.labels
+                selected = np.flatnonzero(lb == j)
+                selected = selected[::max(1, int(np.ceil(len(selected) / 768)))]
+                points = self.model.cloud.means[selected].detach().cpu().numpy()
+            else:
+                points = self.anchor_xyz[p.idx[self.anchor_ok[p.idx]]]
+            values = [jm.value_of(A) for A in jm.A]
+            extra = np.pi / 2 if jm.kind == "revolute" else .1
+            grid = np.linspace(min(values) - extra, max(values) + extra, cfg.recovery_grid)
+            poses = [parent.pose @ jm.at(float(v)) for v in grid]
+            result = match_joint_surface(points, poses, depth, mask, self.K,
+                                         tolerance=cfg.recovery_tol,
+                                         min_fraction=cfg.recovery_fraction,
+                                         margin=cfg.recovery_margin)
+            if result is None:
+                p.recovery_pending = None
+                continue
+            value = float(grid[result["index"]])
+            pending = p.recovery_pending
+            step = np.radians(20) if jm.kind == "revolute" else .03
+            count = pending[2] + 1 if pending is not None and pending[0] == i - 1 \
+                and abs(value - pending[1]) < step else 1
+            p.recovery_pending = (i, value, count)
+            if count < cfg.recovery_confirm:
+                continue
+            p.pose = result["pose"]
+            p.surface_recovered = True
+            p.recovery_region = result["region"]
+            p.resid = cfg.recovery_tol
+            p.on_joint = True
+            self.surface_recoveries = getattr(self, "surface_recoveries", 0) + 1
 
     def _grow_co(self, n):
         """Keep the co-association matrices as wide as the track set."""
@@ -1459,6 +1537,9 @@ class NaivePartTracker:
         new = [NaivePart(idx=np.asarray(groups[k]), pose=motions[k],
                          born=self.n, view_dirs=[np.array([0., 0., 1.])])
                for k in order]
+        new[0].part_id = part.part_id
+        new[1].part_id = self.next_part_id
+        self.next_part_id += 1
         # the affinity that justified this split has been spent; each new part
         # has to earn its own before it may split again
         all_idx = np.concatenate([np.asarray(g) for g in groups])
@@ -1545,7 +1626,8 @@ class NaivePartTracker:
         image rather than one line among many.
         """
         import cv2
-        pal = palette or self.PAL
+        colors = palette or self.PAL
+        pal = [colors[p.part_id % len(colors)] for p in self.parts]
         out, K = bgr, self.K
         cur, cur_ok, vis = getattr(self, "cur", (None, None, None))
         t2 = getattr(self, "cur_tracks_2d", None)
@@ -1613,7 +1695,11 @@ class NaivePartTracker:
                                     tipLength=0.35)
             cv2.circle(out, org, 4, col, -1, cv2.LINE_AA)
             cv2.circle(out, org, 4, (25, 25, 25), 1, cv2.LINE_AA)
-            lab = f"p{j}"
+            lab = f"p{p.part_id}"
+            if p.surface_recovered:
+                lab += " depth"
+            elif not p.observed:
+                lab += " lost"
             if debug:
                 lab += f" {p.resid * 1000:.0f}mm {p.out_pts}pt"
             cv2.putText(out, lab, (org[0] + 8, org[1] - 8),

@@ -23,6 +23,41 @@ def gt_labels_at(reader, anchor, pts2d):
     return pim[v, u]
 
 
+def aligned_trajectory_errors(reader, rows, pose_log, id_log, final_ids):
+    """Pose-trajectory errors after one fixed per-part frame alignment.
+
+    A newly discovered back face may use a different canonical frame from the
+    original camera. Align once at its first estimated pose, never each frame.
+    Persistent IDs prevent a later split from mixing another part's trajectory.
+    This measures subsequent tracking, not absolute initial pose accuracy.
+    """
+    output = []
+    for row in rows:
+        identity = final_ids[row["part"]]
+        reference = None
+        translations, rotations = [], []
+        for (frame, poses), ids in zip(pose_log, id_log):
+            if identity not in ids:
+                continue
+            estimate = poses[ids.index(identity)]
+            truth = reader.get_gt_pose(frame, row["gt"])
+            if estimate is None or truth is None or not np.isfinite(estimate).all() \
+                    or not np.isfinite(truth).all():
+                continue
+            if reference is None:
+                reference = np.linalg.inv(truth) @ estimate
+            expected = truth @ reference
+            error = np.linalg.inv(expected) @ estimate
+            translations.append(float(np.linalg.norm(error[:3, 3])) * 1000)
+            rotations.append(float(np.degrees(_R.from_matrix(error[:3, :3]).magnitude())))
+        if translations:
+            output.append({"part_id": int(identity), "gt": row["gt"],
+                           "frames": len(translations),
+                           "translation_mm": float(np.median(translations)),
+                           "rotation_deg": float(np.median(rotations))})
+    return output
+
+
 def report(reader, anchor, parts_gt, lab_gt, stream, pose_log, min_group=30):
     """Purity, coverage and per-part pose error. `pose_log` is [(frame, [T...])]."""
     out = {}

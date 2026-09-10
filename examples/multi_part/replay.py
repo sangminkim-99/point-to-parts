@@ -36,6 +36,11 @@ def _naive_tail(s, cfg, args, r, a, gt):
     except Exception as exc:
         print(f"[eval] joint metrics unavailable ({exc})")
     print("[eval] " + _ev.fmt(_P(args.seq_dir).name, res, len(s.parts)))
+    for row in _ev.aligned_trajectory_errors(
+            r, res["rows"], gt["log"], gt["id_log"], [p.part_id for p in s.parts]):
+        print(f"[eval] first-pose-aligned trajectory p{row['part_id']} ({row['gt']}): "
+              f"{row['translation_mm']:.1f} mm, {row['rotation_deg']:.2f} deg median "
+              f"over {row['frames']} frames")
 
 
 def main():
@@ -339,7 +344,7 @@ def main():
             lab = (_ev.gt_labels_at(r, a, s.pts0) if args.method == "naive"
                    else _ev.gt_labels(r, a, r.get_depth(a), object_mask(a),
                                       s.gauss_stride))
-            gt = {"parts": list(r.get_object_names()), "lab": lab, "log": []}
+            gt = {"parts": list(r.get_object_names()), "lab": lab, "log": [], "id_log": []}
         except Exception as exc:
             print(f"[replay] no GT evaluation ({exc})")
             gt = None
@@ -374,6 +379,7 @@ def main():
         if gt is not None and s.parts:
             gt["log"].append((int(i), [None if p.pose is None else p.pose.copy()
                                        for p in s.parts]))
+            gt["id_log"].append([getattr(p, "part_id", j) for j, p in enumerate(s.parts)])
             # Label every track, not only the ones sampled at the anchor. A
             # sequence whose first frame is too dark or too small to yield
             # keypoints starts with a handful of points and recovers by
@@ -536,11 +542,13 @@ def main():
               + (f", grown {getattr(s, 'grown', 0)}, carved "
                  f"{getattr(s, 'carved', 0)}, relabelled {getattr(s, 'moved', 0)}"
                  if s.model else ""))
+        print(f"[replay] depth-only recovery: {getattr(s, 'surface_recoveries', 0)} part-frames")
         if args.save_model:
             cloud = s.model.cloud
             data = {k: getattr(cloud, k).detach().cpu().numpy()
                     for k in ("means", "colors", "scales", "quats", "opacities")}
             data.update(labels=s.model.labels, poses=np.stack([p.pose for p in s.parts]),
+                        part_ids=np.array([p.part_id for p in s.parts]),
                         parents=np.array([p.parent for p in s.parts]),
                         K=r.K, frame=np.array(i if times else a),
                         coordinate_frame=np.array("per_part_anchor; poses map anchor to camera"))

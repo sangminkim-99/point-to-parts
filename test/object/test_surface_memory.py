@@ -70,3 +70,104 @@ def test_two_equally_supported_distinct_poses_are_ambiguous():
     db, mb = panel_depth(b)
     result = match_joint_surface(points(), [a, b], np.maximum(da, db), ma | mb, K)
     assert result is None
+
+
+def recovery_tracker():
+    from examples.multi_part.naive import NaivePart, NaiveConfig, NaivePartTracker
+    from point2pose.pipeline.components.joint_model import JointModel
+    cfg = NaiveConfig(surface_recovery=True)
+    s = NaivePartTracker(K, cfg, None, None)
+    s.model = None
+    s.anchor_xyz = points()
+    s.anchor_ok = np.ones(len(s.anchor_xyz), bool)
+    parent = NaivePart(idx=np.array([], int), part_id=0)
+    jm = JointModel()
+    jm.kind = "revolute"
+    jm.A0 = pose(0)
+    jm._axis0 = np.array([0., 1., 0.])
+    jm._point0 = np.zeros(3)
+    jm.A = [pose(a) for a in range(0, 61, 5)]
+    jm.conf = {"valid": True, "conf": .95}
+    child = NaivePart(idx=np.arange(len(s.anchor_xyz)), part_id=7,
+                     pose=pose(60), joint=jm, parent=0, observed=False)
+    s.parts = [parent, child]
+    return s
+
+
+def test_recovery_keeps_identity_and_does_not_train_joint_on_its_predictions():
+    s = recovery_tracker()
+    child = s.parts[1]
+    old_observations = np.stack(child.joint.A).copy()
+    old_anchors = s.anchor_xyz.copy()
+    depth, mask = panel_depth(pose(140), thickness=.003)
+    s._recover_surfaces(depth, mask, 10)
+    assert not child.surface_recovered  # temporal confirmation required
+    s._recover_surfaces(depth, mask, 11)
+    assert child.surface_recovered
+    assert child.part_id == 7 and len(s.parts) == 2
+    error = Rotation.from_matrix(child.pose[:3, :3].T @ pose(140)[:3, :3]).magnitude()
+    assert np.degrees(error) < 4
+    np.testing.assert_array_equal(np.stack(child.joint.A), old_observations)
+    np.testing.assert_array_equal(s.anchor_xyz, old_anchors)
+
+
+def test_stale_parent_cannot_confirm_child_recovery():
+    s = recovery_tracker()
+    s.parts[0].observed = False
+    depth, mask = panel_depth(pose(140))
+    for i in range(10, 14):
+        s._recover_surfaces(depth, mask, i)
+    assert not s.parts[1].surface_recovered
+
+
+def test_missing_tracks_hold_pose_but_invalidate_measurement():
+    s = recovery_tracker()
+    p = s.parts[1]
+    previous = p.pose.copy()
+    p.observed, p.resid = True, .001
+    s._fit(p, np.zeros_like(s.anchor_xyz), np.zeros(len(s.anchor_xyz), bool),
+           np.zeros(len(s.anchor_xyz), bool))
+    assert not p.observed and np.isinf(p.resid)
+    np.testing.assert_array_equal(p.pose, previous)
+
+
+def test_split_does_not_renumber_existing_part_identities():
+    from examples.multi_part.naive import NaivePart, NaiveConfig, NaivePartTracker
+    s = NaivePartTracker(K, NaiveConfig(), None, None)
+    s.anchor_xyz = points()[:18]
+    s.anchor_ok = np.ones(18, bool)
+    s.track_born = np.zeros(18, int)
+    s.co_same = np.zeros((18, 18))
+    s.co_seen = np.zeros((18, 18))
+    s.model = None
+    s.parts = [NaivePart(idx=np.arange(12), part_id=10),
+               NaivePart(idx=np.arange(12, 18), part_id=11)]
+    s.next_part_id = 12
+    s._reparent = lambda: None
+    s._fit_box = lambda p: None
+    s._accept(0, s.parts[0], [np.arange(6), np.arange(6, 12)],
+              [np.eye(4), pose(20)], s.anchor_xyz, s.anchor_ok, "test", 1., None)
+    assert [p.part_id for p in s.parts] == [10, 12, 11]
+
+
+def test_trajectory_alignment_handles_new_frame_and_list_reordering():
+    from examples.multi_part.evaluate import aligned_trajectory_errors
+    class Reader:
+        def get_gt_pose(self, frame, name):
+            return pose(frame * 10)
+    r = Reader()
+    offset = pose(35)
+    log = [(1, [pose(10) @ offset]),
+           (2, [np.eye(4), pose(20) @ offset]),
+           (3, [pose(30) @ offset, np.eye(4)])]
+    ids = [[7], [9, 7], [7, 9]]
+    result = aligned_trajectory_errors(r, [{"part": 0, "gt": "lid"}], log, ids, [7, 9])
+    assert result[0]["frames"] == 3
+    assert result[0]["translation_mm"] < 1e-8
+    assert result[0]["rotation_deg"] < 1e-8
+    # A fixed alignment must not erase real drift later in the sequence.
+    for _, poses in log[1:]:
+        for T in poses:
+            T[0, 3] += .03
+    result = aligned_trajectory_errors(r, [{"part": 0, "gt": "lid"}], log, ids, [7, 9])
+    assert result[0]["translation_mm"] > 20

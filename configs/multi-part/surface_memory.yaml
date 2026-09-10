@@ -2,6 +2,7 @@
 # rigid object's point count to collapse. No new segmentation or GT parts.
 extends: dense_refine.yaml
 surface_reseed: true
+surface_recovery: true
 surface_radius: 14
 surface_min_region: 400
 max_points: 600
