@@ -142,6 +142,14 @@ python -m examples.multi_part.urdf_view results/urdf_validation/drawer.urdf \
 
 ## Next concrete work
 
+RealSense D435 live session actually ran SAM2+TAPIR/current NaivePartTracker with
+user-selected box, split at f107 and exited normally after ~287 frames. No live
+recording or model was saved. `doc/realsense_live_status.md` records verified
+scope/launch command. Acquisition UI now revokes stale readiness and requires
+the same observed joint across the hold window; changes apply next launch.
+Next live task: optional recording and mesh-free cloud/joint export, measured
+end-to-end timing. Do not automatically reopen the camera while user is absent.
+
 User steering: mesh creation is no longer required. Use part-local point clouds
 against robot spheres; cuRobo explicitly approved. Real Franka cuRobo FK (65
 spheres) + custom differentiable point query is implemented and GPU smoke-tested

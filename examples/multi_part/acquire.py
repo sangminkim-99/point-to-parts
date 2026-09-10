@@ -1,8 +1,7 @@
-"""Watch an unknown object become controllable.
+"""Monitor articulated-object estimation quality.
 
 Reports, frame by frame, what the system knows about the object's joints and how
-sure it is, and declares the object controllable only when that confidence has
-held. The headline number is when that happens, not how fast a frame runs.
+sure it is. Sustained confidence is diagnostic readiness, not verified control.
 
     python -m examples.multi_part.acquire --seq-dir <sequence> --view 1
 """
@@ -119,27 +118,45 @@ class Acquisition:
         self.streak = 0
         self.ready_at = None
         self.first_split = None
+        self.ready = False
+        self.tracking_lost = False
+        self._candidate = None
+
+    def invalidate_tracking(self):
+        """A missing mask/observation invalidates current readiness immediately."""
+        self.streak, self.ready, self._candidate = 0, False, None
+        self.tracking_lost = True
 
     def step(self, i, stream, t_ms):
         best, kind, lim = 0.0, None, "none"
-        for p in stream.parts:
-            if p.joint is None or p.joint.kind is None:
+        candidates = []
+        self.tracking_lost = False
+        for j, p in enumerate(stream.parts):
+            if p.joint is None or p.joint.kind not in ("revolute", "prismatic"):
                 continue
             c = p.joint.confidence()
             # a joint that has not passed the gate is not a candidate at all
-            v = c["conf"] if c.get("valid", True) else 0.0
+            v = c["conf"] if c.get("valid", False) and np.isfinite(c["conf"]) else 0.0
             if v >= best:
                 best, kind, lim = v, p.joint.kind, limiting_factor(c)
+            parent = getattr(p, 'parent', -1)
+            fresh = (getattr(p, 'observed', False) and 0 <= parent < len(stream.parts)
+                     and parent != j and getattr(stream.parts[parent], 'observed', False))
+            if fresh and v >= self.thresh and c.get('excitation', 0) >= self.min_range:
+                candidates.append((v, (getattr(p, 'part_id', j), p.joint.kind)))
         if self.first_split is None and len(stream.parts) > 1:
             self.first_split = i
         # ready means: it is a joint, we know which kind and where, AND we have
-        # watched enough of its range to command inside it
-        enough = any(p.joint is not None and p.joint.kind
-                     and p.joint.confidence().get("valid", False)
-                     and p.joint.confidence()["conf"] >= self.thresh
-                     and p.joint.confidence()["excitation"] >= self.min_range
-                     for p in stream.parts)
-        self.streak = self.streak + 1 if enough else 0
+        # observed enough motion for this diagnostic threshold
+        candidate = max(candidates, key=lambda x: x[0])[1] if candidates else None
+        consecutive = not self.rows or i == self.rows[-1]['frame'] + 1
+        self.streak = (self.streak + 1 if candidate == self._candidate and consecutive
+                       else 1) if candidate is not None else 0
+        self._candidate = candidate
+        self.ready = self.streak >= self.hold
+        if self.ready:
+            kind = candidate[1]
+            best = next(v for v, key in candidates if key == candidate)
         if self.ready_at is None and self.streak >= self.hold:
             # date it from the frame the run of confidence began, not its end
             self.ready_at = i - self.hold + 1
@@ -151,8 +168,10 @@ class Acquisition:
         r = self.rows[-1] if self.rows else None
         if r is None:
             return "starting", (150, 150, 150)
-        if self.ready_at is not None:
-            return (f"READY  {r['kind']}  {100 * r['conf']:.0f}%", (90, 200, 120))
+        if self.tracking_lost:
+            return "tracking lost -- reacquire the object", (70, 180, 235)
+        if self.ready:
+            return (f"ESTIMATE STABLE  {r['kind']}  {100 * r['conf']:.0f}%", (90, 200, 120))
         if r["parts"] < 2:
             return ("one rigid body so far -- " + ADVICE["none"], (150, 150, 150))
         return (f"{r['kind'] or 'joint'} {100 * r['conf']:.0f}%  "
@@ -171,12 +190,12 @@ class Acquisition:
         print()
         if self.ready_at is None:
             best = max(r["conf"] for r in self.rows)
-            print(f"[acquire] never became controllable "
+            print(f"[acquire] estimate readiness not reached "
                   f"(best confidence {100 * best:.0f}%, needed "
                   f"{100 * self.thresh:.0f}% held for {self.hold} frames)")
         else:
             r = next(x for x in self.rows if x["frame"] >= self.ready_at)
-            print(f"[acquire] CONTROLLABLE after {self.ready_at} frames of "
+            print(f"[acquire] first stable estimate after {self.ready_at} frames of "
                   f"object motion = {self.ready_at / max(cam_fps, 1e-6):.1f} s "
                   f"at {cam_fps:.0f} Hz   ({r['kind']})")
             print(f"[acquire]   wall clock at our {proc_fps:.1f} fps: "
@@ -216,7 +235,7 @@ def main():
     ap.add_argument("--sampler", default=None)
     ap.add_argument("--thresh", type=float, default=0.6)
     ap.add_argument("--hold", type=int, default=8,
-                    help="frames the confidence must hold before READY")
+                    help="frames the same observed joint must hold diagnostic confidence")
     ap.add_argument("--view", type=int, default=1)
     ap.add_argument("--out", default=None, help="mp4 of the acquisition")
     ap.add_argument("--csv", default=None, help="confidence curve")

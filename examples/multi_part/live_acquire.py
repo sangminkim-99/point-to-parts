@@ -1,8 +1,8 @@
-"""Wiggle an unknown object in front of the camera until it becomes controllable.
+"""Observe articulation from a live RGB-D stream.
 
 Click the object, press s, then move one of its parts. The bar is how sure the
-system is about the joint it has found; the line on it is the threshold. When
-the confidence has HELD there, the object is ready to be commanded.
+system is about the joint it has found; the line on it is the threshold.
+Stable estimates are diagnostics, not verification of robot controllability.
 
     Left click   a point on the object   (drag a box with --bbox-prompt)
     Right click  a point that is not the object
@@ -26,7 +26,7 @@ from examples.multi_part.acquire import (Acquisition, ADVICE, apply_config,
 
 
 class LiveAcquire:
-    """RealSense in, a controllable joint out."""
+    """RealSense input and live joint-estimation diagnostics."""
 
     def __init__(self, args):
         import pyrealsense2 as rs
@@ -150,7 +150,7 @@ class LiveAcquire:
         where is it, how far does it go -- so they are shown apart. Only "which
         kind" and "where" are about knowing the joint, so only they make the
         bar; the gate decides whether the row is a joint at all, and the range
-        is what a robot may command inside.
+        is observed motion, not a verified mechanical limit.
         """
         joints = [(j, p) for j, p in enumerate(self.stream.parts)
                   if p.joint is not None and p.joint.kind] if self.stream else []
@@ -205,7 +205,7 @@ class LiveAcquire:
             cv2.putText(bar,
                         f"joint? {'yes' if ok else 'NO'} (smooth "
                         f"{c.get('smooth', 0):.2f})    type {c['type_p']:.2f}"
-                        f"    axis +-{c['axis_std_deg']:.1f} deg"
+                        f"    axis RMS {c['axis_std_deg']:.1f} deg"
                         + (f"    watched {rng}" if rng else "")
                         + (f" (need {need:.0f} {u})"
                            if c["excitation"] < 1.0 else ""),
@@ -294,6 +294,7 @@ class LiveAcquire:
                     _, logits = self.sam.segment(rgb)
                     mask = self._flat(logits, rgb.shape[:2])
                     if mask is None or mask.sum() < 200:
+                        self.acq.invalidate_tracking()
                         cv2.putText(disp, "mask lost", (12, 28),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                     (60, 60, 235), 2, cv2.LINE_AA)
