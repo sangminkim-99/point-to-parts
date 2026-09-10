@@ -99,19 +99,18 @@ class AuthorView:
         self.legend = self.server.gui.add_markdown('Legend appears once geometry is tracked.')
         self.uncertainty = self.server.gui.add_markdown('Tracking confidence appears with parts.')
         from examples.multi_part.render_dock import RenderDock
-        self.render_dock = RenderDock(args.port + 1)
-        self.server.gui.add_markdown(f'[Open Gaussian render panel]({self.render_dock.url}) — separate window/panel')
-        print(f'[Gaussian panel] {self.render_dock.url}', flush=True)
-        self.diag = self.server.gui.add_checkbox('Render diagnostics (low-rate)', initial_value=False)
-        self.diag_panel = self.server.gui.add_dropdown('Diagnostic panel',
-            ['Rendered RGB (approx)', 'Depth residual', 'Observed RGB'])
-        self.diag_status = self.server.gui.add_markdown('Enable diagnostics for Gaussian render status.')
-        self.diag_image = self.server.gui.add_image(np.zeros((240,320,3), np.uint8),
-            label='Gaussian render diagnostic (not the point-cloud preview)')
-        self.server.gui.add_markdown(
-            '_Rendered RGB is an approximate per-part z-buffer composite (not joint '
-            'alpha compositing). Observed RGB is the raw camera image, or the annotated '
-            'tracking overlay if the raw frame is unavailable._')
+        self.render_dock = RenderDock(self.server)
+        with self.render_dock.controls:
+            self.diag = self.server.gui.add_checkbox('Render diagnostics (low-rate)', initial_value=False)
+            self.diag_panel = self.server.gui.add_dropdown('Diagnostic panel',
+                ['Rendered RGB (approx)', 'Depth residual', 'Observed RGB'])
+            self.diag_status = self.server.gui.add_markdown('Enable diagnostics for Gaussian render status.')
+            self.diag_image = self.server.gui.add_image(np.zeros((240,320,3), np.uint8),
+                label='Gaussian render diagnostic (not the point-cloud preview)')
+            self.server.gui.add_markdown(
+                '_Rendered RGB is an approximate per-part z-buffer composite (not joint '
+                'alpha compositing). Observed RGB is the raw camera image, or the annotated '
+                'tracking overlay if the raw frame is unavailable._')
         self._obs_is_overlay = False
         self.diag_panel.on_update(lambda _: self._show_diag())
         self.diag.on_update(lambda _: self.commands.append(('diagnostics', None)))

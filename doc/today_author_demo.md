@@ -66,17 +66,15 @@ The same-frame initialized smoke verifies plumbing, not reconstruction accuracy
 or live throughput. Live input RGB/depth handoff was connected; physical camera
 interaction was not exercised by this smoke. User CUDA cache was not modified.
 
-## Separate Gaussian panel
+## Native Gaussian dock (left side)
 
-Use the **Open Gaussian render panel** link in Viser to open an independent
-browser panel next to the main scene. It listens on localhost at Viser port+1
-(or a free port if occupied; the link/terminal prints the actual URL). Enable
-Render diagnostics in the main Viser UI. Overall, observed RGB, depth residual
-and each assigned persistent part get separate image cards. Part images retain
-the common camera framing and are approximate Gaussian contributions; they are
-not independently centered object views. Cards reflect the last render frame;
-paused/error states are shown. This is a separate web panel, not native Viser
-drag-and-drop docking. No tracker settings are changed by opening it.
+Gaussian diagnostics now live in a native Viser panel docked on the **left**,
+in the same browser page. No extra port or browser window is needed. Restart
+the demo to load this layout. Enable **Render diagnostics (low-rate)** in the
+**Gaussian diagnostics** tab for the whole render, observed RGB and depth error.
+The **Part renders** tab shows all assigned parts as separate image cards, added
+and removed as identities change. Images share the camera frame. The panel uses
+Viser's native docking controls and can be moved by the user.
 
 To opt into the experimental drawer split gate:
 
