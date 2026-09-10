@@ -271,8 +271,11 @@ def main():
             masks = [(logits[k, 0] > 0).cpu().numpy().astype(np.uint8)
                      for k in range(logits.shape[0])]
 
-        # score against GT for whichever GT part each object best matches
+        # A whole-object prediction must be scored against the whole object,
+        # not its largest matching part. GT part prompting keeps part scoring.
         gt = reader.get_masks(i)
+        if args.init != "gt":
+            gt = [np.logical_or.reduce(gt)] if len(gt) else []
         txt = []
         for k, name in enumerate(kept):
             if k >= len(masks):
@@ -283,7 +286,7 @@ def main():
                 union = np.logical_or(masks[k] > 0, g > 0).sum()
                 iou = inter / union if union else 0.0
                 if iou > best:
-                    best, best_i = iou, parts[gi]
+                    best, best_i = iou, (parts[gi] if args.init == "gt" else "object")
             ious[name].append(best)
             txt.append(f"{name}:{best:.2f}")
         iou_txt = "IoU " + " ".join(txt) if txt else ""
@@ -326,6 +329,11 @@ def main():
                             names=np.array(kept))
         print(f"[sam2] wrote {args.save_masks}")
     json.dump({"sequence": reader.get_video_name(), "init": args.init,
+               "iou_target": "best_gt_part" if args.init == "gt" else "gt_object_union",
+               "iou_note": "Rendered RBO GT does not mask external occluders such as hands",
+               "initialization_frame_selection": "gt_guided_usable_frame",
+               "prompt_source": ("explicit_bbox" if args.bbox else "gt_bbox")
+                   if args.init == "bbox" else args.init,
                "objects": kept, "history": hist},
               open(os.path.splitext(args.out)[0] + "_report.json", "w"), indent=2)
 

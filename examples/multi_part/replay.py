@@ -127,6 +127,8 @@ def main():
                          "GT part-index map on the frames that add tracks")
     ap.add_argument("--dump-joint", default=None,
                     help="npz of every joint's relative-pose stack, for analysis")
+    ap.add_argument("--save-model", default=None,
+                    help="naive dense path: save final labelled Gaussians and part poses as npz")
     ap.add_argument("--urdf", default=None,
                     help="write the discovered object out as a URDF")
     ap.add_argument("--resplit-cov-frac", type=float, default=None)
@@ -145,6 +147,8 @@ def main():
     ap.add_argument("--checkpoint",
                     default="checkpoints/tapir/causal_bootstapir_checkpoint.pt")
     args = ap.parse_args()
+    if args.save_model and args.method != "naive":
+        ap.error("--save-model currently requires --method naive with dense enabled")
 
     # a RealSense recording (rgb/, depth/, cam_K.txt), an RBO sequence
     # (camera_rgb/, tf.csv) or a rendered SAPIEN sequence
@@ -316,6 +320,8 @@ def main():
         s = StreamingPartDiscovery(r.K, cfg, tracker, reg)
     a = frames[0]
     s.start(r.get_color(a), r.get_depth(a), object_mask(a))
+    if args.save_model and s.model is None:
+        raise ValueError("--save-model requires a config with dense enabled")
     if args.method == "naive":
         print(f"[replay] naive: {len(s.anchor_xyz)} points"
               + (f", {len(s.model.cloud)} gaussians" if s.model else "")
@@ -530,6 +536,17 @@ def main():
               + (f", grown {getattr(s, 'grown', 0)}, carved "
                  f"{getattr(s, 'carved', 0)}, relabelled {getattr(s, 'moved', 0)}"
                  if s.model else ""))
+        if args.save_model:
+            cloud = s.model.cloud
+            data = {k: getattr(cloud, k).detach().cpu().numpy()
+                    for k in ("means", "colors", "scales", "quats", "opacities")}
+            data.update(labels=s.model.labels, poses=np.stack([p.pose for p in s.parts]),
+                        parents=np.array([p.parent for p in s.parts]),
+                        K=r.K, frame=np.array(i if times else a),
+                        coordinate_frame=np.array("per_part_anchor; poses map anchor to camera"))
+            Path(args.save_model).parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(args.save_model, **data)
+            print(f"[replay] saved model -> {args.save_model}")
         if args.urdf:
             from examples.multi_part import urdf_export as _ux
             gm = (s.model.cloud.means.detach().cpu().numpy()
