@@ -13,17 +13,20 @@ def snapshot(stream):
                             resid=float(getattr(p, 'resid', 0.) or 0.),
                             sigma=float(getattr(p, 'sigma', 0.) or 0.),
                             joint=copy.deepcopy(p.joint)) for p in stream.parts]
+    gaussian = {}
     if stream.model is not None:
         points = stream.model.cloud.means.detach().cpu().numpy().copy()
         colors = stream.model.cloud.colors.detach().cpu().numpy().copy()
         labels = stream.model.labels.copy()
+        gaussian = {name: getattr(stream.model.cloud, name).detach().cpu().numpy().copy()
+                    for name in ('scales', 'quats', 'opacities')}
     else:
         points = np.concatenate([stream.anchor_xyz[p.idx] for p in stream.parts])
         labels = np.concatenate([np.full(len(p.idx), j) for j,p in enumerate(stream.parts)])
         colors = np.full_like(points, .7)
     return SimpleNamespace(parts=parts, points=points, colors=colors,
                            labels=labels, root=int(stream.root),
-                           frame=int(stream.n - 1), K=stream.K.copy())
+                           frame=int(stream.n - 1), K=stream.K.copy(), gaussian=gaussian)
 
 
 def union_mask(seg, background=255):
@@ -192,7 +195,8 @@ def save_snapshot(state, directory, source=None):
                         part_ids=[p.part_id for p in state.parts],
                         parents=[p.parent for p in state.parts], K=state.K,
                         frame=state.frame,
-                        coordinate_frame='per_part_anchor; poses map anchor to camera')
+                        coordinate_frame='per_part_anchor; poses map anchor to camera',
+                        **getattr(state, 'gaussian', {}))
     meta = dict(frame=state.frame, reference_part_id=state.parts[state.root].part_id,
                 observed=[p.observed for p in state.parts],
                 capture_source=source,
