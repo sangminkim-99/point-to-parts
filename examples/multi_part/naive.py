@@ -266,6 +266,7 @@ class NaiveConfig:
     mask_pad: int = 4
     mask_strikes: int = 5
     # optional layers, each measurable on its own
+    orphan_reassociate: bool = False   # experimental re-observed sparse orphan recovery
     dense: bool = False                 # step 4: per-part gaussian model
     dense_stride: int = 2
     grow_every: int = 4
@@ -460,6 +461,21 @@ class NaivePartTracker:
             self._fit(p, cur, cur_ok, vis)
         if cfg.surface_recovery:
             self._recover_surfaces(depth, mask, i)
+        if cfg.orphan_reassociate:
+            from examples.multi_part.orphan_tracks import OrphanTracks
+            if not hasattr(self, '_orphan_tracks'):
+                self._orphan_tracks = OrphanTracks()
+            eligible = np.zeros(len(cur), bool)
+            eligible[:min(len(cur), len(self.anchor_ok))] = self.anchor_ok[:len(cur)]
+            valid = cur_ok & vis & self._on_object(tracks, mask)
+            recovered = self._orphan_tracks.update(i, cur, valid, eligible,
+                                                     self.parts, self.pend)
+            for idx, j, anchor, count in recovered:
+                self.anchor_xyz[idx] = anchor
+                self.track_born[idx] = i
+                self.parts[j].idx = np.unique(np.append(self.parts[j].idx, idx))
+                print(f'[orphan] f{i} track={idx} -> part={self.parts[j].part_id} observations={count}')
+
         if cfg.persist:
             for p in self.parts:
                 self._accumulate(p, cur, cur_ok, vis)
