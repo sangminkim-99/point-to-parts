@@ -27,10 +27,10 @@ under ignored `results/`. No manipulator mask removal is being pursued.
 ## Established methods to prioritize
 
 - [BundleTrack (IROS 2021)](https://arxiv.org/abs/2108.00516): memory-augmented pose
-  graph optimization for model-free object tracking. Next step is to inspect its
-  actual keyframe matching/optimization implementation before adapting a bounded
-  keyframe graph here. Neither a complete reproduction nor a BundleTrack baseline
-  has been run in this repository during this phase.
+  graph optimization for model-free object tracking. Its official keyframe
+  matching/selection implementation has now been inspected; a small independent
+  feature/keyframe diagnostic is documented in `doc/keyframe_baseline.md`.
+  Neither a complete reproduction nor a BundleTrack baseline has been run.
 - [Sturm, Stachniss and Burgard (JAIR 2011)](https://arxiv.org/abs/1405.7705): noisy
   part-pose observations to kinematic graph/model selection and pose prediction.
   Audit the existing JointModel against this established formulation, particularly
@@ -142,9 +142,14 @@ python -m examples.multi_part.urdf_view results/urdf_validation/drawer.urdf \
 
 ## Next concrete work
 
-1. Read BundleTrack's primary implementation and establish a small keyframe-based
-   RGB-D rigid tracking baseline. Compare against anchored-only and guarded
-   incremental tracking on the locked-orbit control before coupling articulation.
+1. The first RGB-D keyframe control is complete (`doc/keyframe_baseline.md`).
+   LightGlue previous-only / best-keyframe / pooled-keyframe median errors are
+   145.0 / 128.6 / 40.3 mm on the locked orbit. All observe 120 frames, but none
+   establishes a replacement for the existing approximately 22 mm tracker.
+   Next inspect robust joint keyframe refinement and reprojection consistency;
+   pooled fixed poses are not bundle adjustment. Test additional views/objects
+   before coupling articulation. Implementation and runner are
+   `examples/multi_part/keyframe_rigid.py`, `scripts/sim/keyframe_baseline.py`.
 2. Improve evaluation over common frame windows after discovery, while reporting
    birth delay, identity changes and missing coverage explicitly. Preserve full
    traces; do not claim pose improvements by discarding difficult frames.
