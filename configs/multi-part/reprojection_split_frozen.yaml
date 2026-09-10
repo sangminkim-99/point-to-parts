@@ -1,0 +1,3 @@
+# Experimental: keep the original gate, preserve pre-maintenance geometry.
+extends: reprojection_split.yaml
+split_reprojection_frozen: true

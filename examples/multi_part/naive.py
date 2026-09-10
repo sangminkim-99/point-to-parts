@@ -293,6 +293,7 @@ class NaiveConfig:
     # contradiction path and ADDS a fit-improvement + persistence path so a
     # prismatic slide (whose moved surface leaves the silhouette) is not
     # rejected for failing to reduce free-space contradiction.
+    split_reprojection_frozen: bool = False  # preserve evidence before map maintenance
     split_reprojection_mode: str = "contradiction"   # or "residual_veto"
     split_reprojection_resid_gain: float = .004      # m; paired residual must fall this much
     split_reprojection_support_gain: float = .05     # or support must rise this much
@@ -475,6 +476,12 @@ class NaivePartTracker:
                 self.track_born[idx] = i
                 self.parts[j].idx = np.unique(np.append(self.parts[j].idx, idx))
                 print(f'[orphan] f{i} track={idx} -> part={self.parts[j].part_id} observations={count}')
+
+        if cfg.split_reprojection and cfg.split_reprojection_frozen:
+            from examples.multi_part.split_evidence import SplitEvidence
+            if not hasattr(self, '_split_evidence'):
+                self._split_evidence = SplitEvidence()
+            self._split_evidence.update(self.parts, self.model, i)
 
         if cfg.persist:
             for p in self.parts:
@@ -1692,6 +1699,13 @@ class NaivePartTracker:
             selected = np.flatnonzero(self.model.labels == j)
             selected = selected[::max(1, int(np.ceil(len(selected) / 1536)))]
             points = self.model.cloud.means[selected].detach().cpu().numpy()
+        evidence_source = "live"
+        if cfg.split_reprojection_frozen and cfg.split_reprojection_dense:
+            evidence = getattr(self, '_split_evidence', None)
+            snapshot = evidence.snapshots.get(part.part_id) if evidence is not None else None
+            if snapshot is not None:
+                snapshot_frame, points = snapshot
+                evidence_source = f"frozen@{snapshot_frame}"
         if len(points) < 2 * cfg.split_reprojection_min_points:
             print(f"[reprojection] f{self.n} insufficient total geometry accept=False")
             return False
@@ -1742,7 +1756,7 @@ class NaivePartTracker:
                   "fit_or_persistence_pending")
         print(f"[reprojection] f{self.n} split gain={gain:.3f} "
               f"support={[round(b['support'], 3) for _, b in rows]} accept={accept} "
-              f"mode={cfg.split_reprojection_mode} reason={reason} "
+              f"mode={cfg.split_reprojection_mode} geometry={evidence_source} reason={reason} "
               f"gain_min={cfg.split_reprojection_gain:.3f} "
               f"support_min={cfg.split_reprojection_support:.3f}{detail}")
         return accept
