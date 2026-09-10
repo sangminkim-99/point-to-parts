@@ -586,7 +586,8 @@ class GaussianPartAssignment:
         pa = (pc - Ta[:3, 3]) @ Ta[:3, :3]
         cols = torch.as_tensor(rgb[vs.cpu().numpy(), us.cpu().numpy()],
                                dtype=torch.float32, device=self.device) / 255.0
-        foot = (z / float(Kt[0, 0])) * 1.2
+        # Match from_depth: one sample spans stride source pixels.
+        foot = (z / float(Kt[0, 0])) * stride * 1.2
 
         c = self.cloud
         c.means = torch.cat([c.means, pa], 0)
@@ -732,7 +733,8 @@ class GaussianPartAssignment:
                           (vs.float() - Kt[1, 2]) * z / Kt[1, 1], z], dim=1)
         cols = torch.as_tensor(rgb[vn, un], dtype=torch.float32,
                                device=self.device) / 255.0
-        foot = (z / float(Kt[0, 0])) * 1.2
+        # Match from_depth: one sample spans stride source pixels.
+        foot = (z / float(Kt[0, 0])) * stride * 1.2
 
         pa = torch.zeros_like(pc)
         for k, T in enumerate(poses):
