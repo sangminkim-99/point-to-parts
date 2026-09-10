@@ -344,7 +344,8 @@ class JointModel:
         keep = (self.kind, self._axis0, self._point0)
         axes = []
         n = len(A)
-        for _ in range(boots if n >= 6 else 0):
+        articulated = self.kind in ("revolute", "prismatic")
+        for _ in range(boots if n >= 6 and articulated else 0):
             i = rng.integers(0, n, n)
             m = (self._fit_revolute(A[i], ang[i], t[i]) if self.kind == "revolute"
                  else self._fit_prismatic(A[i], ang[i], t[i]))
@@ -353,10 +354,13 @@ class JointModel:
         self.kind, self._axis0, self._point0 = keep
         if len(axes) >= 4:
             V = np.stack(axes)
-            mean = V.mean(0)
-            mean /= np.linalg.norm(mean) + 1e-12
-            axis_std = float(np.degrees(np.arccos(
-                np.clip(V @ mean, -1, 1)).std()))
+            # RMS angular deviation from the fitted axis, treating axis signs
+            # as equivalent. std(angles) is wrong: axes at +/-30 degrees both
+            # have angle 30, so it reports zero uncertainty for a wide cone.
+            V = V / np.maximum(np.linalg.norm(V, axis=1, keepdims=True), 1e-12)
+            reference = keep[1] / max(np.linalg.norm(keep[1]), 1e-12)
+            angles = np.degrees(np.arccos(np.clip(np.abs(V @ reference), 0, 1)))
+            axis_std = float(np.sqrt(np.mean(angles ** 2)))
         else:
             axis_std = float("nan")
 
@@ -381,7 +385,7 @@ class JointModel:
         exc = float(np.clip(span / max(need, 1e-9), 0.0, 1.0))
         self._need = float(need)
 
-        axis_ok = 1.0 if axis_std != axis_std else \
+        axis_ok = 0.0 if not np.isfinite(axis_std) else \
             float(np.exp(-axis_std / axis_scale_deg))
         # Four answers to four different questions, not one number.
         #   smooth  -- is this a joint at all, or tracking error with a shape?
@@ -397,8 +401,11 @@ class JointModel:
         # them into the product made "5 mm seen but the axis is exact" look
         # uncertain while hiding the 5 mm from anything that could use it.
         self.conf = {"type_p": type_p, "axis_std_deg": axis_std, "span": span,
+                     "axis_rms_deg": axis_std,  # axis_std_deg retained for callers
+                     "axis_bootstrap_samples": len(axes),
                      "excitation": exc, "smooth": smooth, "n": int(n),
-                     "axis_ok": axis_ok, "valid": bool(smooth >= 0.15),
+                     "axis_ok": axis_ok, "valid": bool(smooth >= 0.15 and
+                         (not articulated or len(axes) >= 4)),
                      "need": float(need),
                      "rmse": float(np.sqrt(rows[0][1])),      # in sigma
                      "sigma_t": float(self.sigma_t),
@@ -417,6 +424,7 @@ class JointModel:
     def confidence(self):
         """The last fit's confidence, or zeros if it has never been fitted."""
         return self.conf or {"type_p": 0.0, "axis_std_deg": float("nan"),
+                             "axis_rms_deg": float("nan"), "axis_bootstrap_samples": 0,
                              "span": 0.0, "excitation": 0.0, "smooth": 0.0,
                              "axis_ok": 0.0, "valid": False, "need": 0.0,
                              "n": len(self.A),
