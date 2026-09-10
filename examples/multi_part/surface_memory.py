@@ -70,7 +70,8 @@ def match_joint_surface(points, poses, depth, mask, K, tolerance=0.012,
             "region": region}
 
 
-def reprojection_evidence(points, pose, depth, mask, K, tolerance=.012):
+def reprojection_evidence(points, pose, depth, mask, K, tolerance=.012,
+                          occlusion_aware=True):
     """Depth support and free-space contradiction for a fixed canonical sample.
 
     Behind-surface geometry is unobserved, not evidence of a second motion.
@@ -94,6 +95,8 @@ def reprojection_evidence(points, pose, depth, mask, K, tolerance=.012):
     obj = mask[v, u] > 0
     support = valid & obj & (np.abs(z - d) <= tolerance)
     contradiction = valid & ((z < d - tolerance) | (~obj & (z <= d + tolerance)))
+    if not occlusion_aware:
+        contradiction |= valid & (z > d + tolerance)
     return {"support": float(support.mean()),
             "contradiction": float(contradiction.mean()),
             "visible": float((support | contradiction).mean())}

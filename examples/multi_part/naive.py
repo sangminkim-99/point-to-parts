@@ -272,6 +272,10 @@ class NaiveConfig:
     refine_every: int = 3
     carve_every: int = 3
     split_reprojection: bool = False   # require independent RGB-D evidence for a split
+    pose_reprojection: bool = False
+    split_reprojection_min_points: int = 20
+    split_reprojection_dense: bool = True
+    split_reprojection_occlusion: bool = True
     split_reprojection_gain: float = .08
     split_reprojection_support: float = .25
     split_reprojection_tol: float = .012
@@ -768,6 +772,27 @@ class NaivePartTracker:
             part.over = 0
             return
         T_free = np.asarray(c["T"])
+        if cfg.pose_reprojection and self.model is not None:
+            from examples.multi_part.pose_memory import choose_pose
+            j = next(k for k, p in enumerate(self.parts) if p is part)
+            previous = getattr(part, "temporal_previous", None)
+            predicted = part.pose if previous is None else part.pose @ np.linalg.inv(previous) @ part.pose
+            part.temporal_previous = part.pose.copy()
+            selected = np.flatnonzero(self.model.labels == j)
+            selected = selected[::max(1, int(np.ceil(len(selected) / 1024)))]
+            points = self.model.cloud.means[selected].detach().cpu().numpy()
+            if len(points) >= 40:
+                H, W = self.current_depth.shape
+                weights = self.model.weights(j)
+                def refine(T):
+                    visible = self.model.assign.self_visible(T, weights, self.K, H, W)
+                    return self.model.assign.refine_pose(T, weights, self.K, H, W,
+                        self.current_depth, obs_mask=self.mask, visible=visible, iters=6)
+                T_free, rescued = choose_pose(points, T_free, predicted,
+                    self.current_depth, self.mask, self.K, refine)
+                if rescued:
+                    self.pose_rescues = getattr(self, "pose_rescues", 0) + 1
+                    print(f"[pose-reprojection] f{self.n} p{part.part_id} temporal candidate selected")
         d = np.linalg.norm(
             self.anchor_xyz[sel] @ T_free[:3, :3].T + T_free[:3, 3]
             - cur[sel], axis=1)
@@ -1540,25 +1565,27 @@ class NaivePartTracker:
         from scipy.spatial import cKDTree
         from examples.multi_part.surface_memory import reprojection_evidence
         cfg = self.cfg
-        if self.model is None:
+        if self.model is None or not cfg.split_reprojection_dense:
             points = self.anchor_xyz[np.concatenate(groups)]
         else:
             selected = np.flatnonzero(self.model.labels == j)
             selected = selected[::max(1, int(np.ceil(len(selected) / 1536)))]
             points = self.model.cloud.means[selected].detach().cpu().numpy()
-        if len(points) < 40:
+        if len(points) < 2 * cfg.split_reprojection_min_points:
+            print(f"[reprojection] f{self.n} insufficient total geometry accept=False")
             return False
         distances = np.stack([cKDTree(self.anchor_xyz[g]).query(points)[0] for g in groups])
         labels = distances.argmin(axis=0)
         rows = []
         for k, motion in enumerate(motions):
             pts = points[labels == k]
-            if len(pts) < 20:
+            if len(pts) < cfg.split_reprojection_min_points:
+                print(f"[reprojection] f{self.n} insufficient group geometry accept=False")
                 return False
             common = reprojection_evidence(pts, part.pose, self.current_depth, self.mask,
-                                           self.K, cfg.split_reprojection_tol)
+                                           self.K, cfg.split_reprojection_tol, cfg.split_reprojection_occlusion)
             separate = reprojection_evidence(pts, motion, self.current_depth, self.mask,
-                                             self.K, cfg.split_reprojection_tol)
+                                             self.K, cfg.split_reprojection_tol, cfg.split_reprojection_occlusion)
             rows.append((common, separate))
         # A hidden old face cannot justify articulation just by finding new RGB tracks.
         gain = max(a['contradiction'] - b['contradiction'] for a, b in rows)

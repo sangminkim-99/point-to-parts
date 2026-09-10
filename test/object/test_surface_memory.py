@@ -218,3 +218,12 @@ def test_reprojection_silhouette_contradiction():
     mask = np.zeros((40, 40), np.uint8)
     pts = np.array([[0., 0., 1.]])
     assert reprojection_evidence(pts, np.eye(4), depth, mask, K)['contradiction'] == 1
+
+
+def test_symmetric_depth_ablation_counts_occlusion_as_error():
+    from examples.multi_part.surface_memory import reprojection_evidence
+    depth = np.ones((200, 240), np.float32)
+    pts = np.array([[0., 0., 1.1]])
+    result = reprojection_evidence(pts, np.eye(4), depth, np.ones_like(depth), K,
+                                   occlusion_aware=False)
+    assert result['contradiction'] == 1.
