@@ -271,6 +271,9 @@ class NaiveConfig:
     refine: bool = False                # step 5: rendering-based refinement
     refine_every: int = 3
     carve_every: int = 3
+    surface_reseed: bool = False       # seed new surface even if the base tracks well
+    surface_radius: int = 14
+    surface_min_region: int = 400
 
 
 @dataclass
@@ -565,9 +568,18 @@ class NaivePartTracker:
             # a direction already covered is never sampled twice; comparing only
             # against the last one re-seeds forever once a part oscillates
             new_view = bool(cfg.key_view and np.all(ang >= cfg.key_angle_deg))
+            fresh_surface = None
+            if cfg.surface_reseed and len(self.parts) == 1:
+                from examples.multi_part.surface_memory import uncovered_surface
+                reliable = idx[cok[idx] & cvi[idx]]
+                fresh_surface = uncovered_surface(
+                    mask, depth, t2[reliable], cfg.surface_radius,
+                    cfg.surface_min_region)
+                if fresh_surface.sum() < cfg.surface_min_region:
+                    fresh_surface = None
             # Point2Pose's own pair: a viewpoint not yet sampled, or a part
             # that still shows surface but has run out of live tracks.
-            if not (new_view or live < cfg.min_live):
+            if not (new_view or live < cfg.min_live or fresh_surface is not None):
                 why[j] = "no new view, not starved"
                 continue
             if len(self.anchor_xyz) >= cfg.max_points:
@@ -586,7 +598,7 @@ class NaivePartTracker:
             # the surface this part shows now, which is what _reseed samples
             # in the dense pipeline; the sampler's own novelty term is what
             # keeps the new points off the ones already there
-            m = mask.copy()
+            m = mask.copy() if fresh_surface is None else fresh_surface
             if len(self.parts) > 1:
                 # Sample inside this part's OWN region or not at all. The old
                 # code widened to the whole object mask whenever the region
@@ -611,9 +623,10 @@ class NaivePartTracker:
                 m = own.astype(np.uint8)
             new = np.asarray(sample_superpoint(
                 self.sampler, rgb, depth, m, self.K, cfg.reseed_points,
-                existing=t2[idx] if idx.size else None), np.float32)
+                existing=t2[idx[cok[idx] & cvi[idx]]] if idx.size else None), np.float32)
             _, nok = lift(new, depth, self.K)
-            new = new[nok][:cfg.reseed_points]
+            new = new[nok][:min(cfg.reseed_points,
+                               cfg.max_points - len(self.anchor_xyz))]
             if len(new) < 4:
                 continue
             f = Frame(id=i, rgb=rgb, depth=depth, intrinsics=self.K)
@@ -641,7 +654,8 @@ class NaivePartTracker:
             p.last_seed = i
             p.view_dirs.append(u)
             fresh = base + np.where(ok)[0]
-            if cfg.seed_prior > 0 and fresh.size and not cfg.pending:
+            if cfg.seed_prior > 0 and fresh.size and not cfg.pending \
+                    and fresh_surface is None:
                 self._grow_co(len(self.anchor_xyz))
                 old_i = p.idx[(p.idx < len(self.anchor_xyz))
                               & ~np.isin(p.idx, fresh)]
