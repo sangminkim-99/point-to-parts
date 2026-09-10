@@ -171,3 +171,16 @@ def test_trajectory_alignment_handles_new_frame_and_list_reordering():
             T[0, 3] += .03
     result = aligned_trajectory_errors(r, [{"part": 0, "gt": "lid"}], log, ids, [7, 9])
     assert result[0]["translation_mm"] > 20
+
+
+def test_retro_history_requires_support_from_whole_discovered_part():
+    from types import SimpleNamespace
+    from examples.multi_part.naive import NaivePart, NaiveConfig, NaivePartTracker
+    reg = SimpleNamespace(_RANSAC=lambda **kwargs: {"T": np.eye(4)})
+    s = NaivePartTracker(K, NaiveConfig(retro_min_frac=.6), None, reg)
+    s.anchor_xyz = points()[:10]
+    s.anchor_ok = np.ones(10, bool)
+    s.frames = [(0, s.anchor_xyz[:3], np.ones(3, bool), np.ones(3, bool)),
+                (1, s.anchor_xyz, np.ones(10, bool), np.ones(10, bool))]
+    history = s._retro_hist(NaivePart(idx=np.arange(10)))
+    assert [frame for frame, _, _ in history] == [1]

@@ -1186,7 +1186,7 @@ class NaivePartTracker:
             # protected by the residual gate; the retro path needs its own,
             # and support is what it lacks.
             if m.sum() < cfg.min_inliers or \
-                    m.sum() < cfg.retro_min_frac * sel.size:
+                    m.sum() < cfg.retro_min_frac * idx0.size:
                 continue
             g = sel[m]
             c = self.reg._RANSAC(p0=self.anchor_xyz[g], tgt_pcd=cur[g], w=None,
