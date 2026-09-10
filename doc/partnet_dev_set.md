@@ -85,3 +85,33 @@ The known poses permit an oracle reprojection experiment to separate geometry
 coverage failures from pose-estimation failures. These oracle poses must stay out
 of the normal tracker input. Gaussian rendering can add color/silhouette losses
 once this geometric association is reliable.
+
+## Initial baseline (2026-09-10)
+
+Run with `--method naive --config surface_memory.yaml --stride 1` at generator
+commit `e5b6669`. These are single-run diagnostics, not aggregate benchmark scores.
+
+| Case | Final parts / GT | Sparse label purity | Diagnosis |
+|---|---:|---:|---|
+| Static | 1 / 1 | 100.0% | No false split; aligned pose median 1.2 mm / 0.12° |
+| Hinge | 2 / 2 | 96.6% | Extra split at frame 110; final lid ID has only 11 frames of history |
+| Orbit only | 3 / 1 | 100.0% | False articulation caused by changing visibility |
+| Hinge + orbit | 2 / 2 | 68.9% | Pose failure; 79% of current object surface unmodelled |
+| Hinge + noise | 3 / 2 | 78.5% | Over-segmentation and severe lid pose drift |
+| Drawer | 2 / 2 | 97.6% | Correct prismatic type; drawer aligned median 5.1 mm / 0.67°, axis 4.7° |
+
+Purity is a sparse final-point label score and does not penalize splitting one GT
+part into several predicted parts: orbit-only gets 100% while clearly failing.
+Always read it alongside part count, persistent-ID history, and aligned trajectory
+errors. The hinge's final lid has a median aligned error of 90.0 mm / 8.16° over
+only 11 frames, so its high purity does not mean successful tracking. Hinge+orbit
+has approximately 1 m lid trajectory error and an incorrect prismatic joint.
+Depth-only recovery triggered zero times on all six baselines; these results do
+not validate that fallback on real rendered view changes.
+
+Local `tracking.log` and `tracking.mp4` in every case retain the full outputs.
+No tracker tuning was applied to these six clips. Prioritize the locked orbit
+case for reprojection-based association first, then the combined hinge/orbit case.
+A useful success criterion is one continuous ID under camera-only motion, then
+two continuous IDs and correct hinge motion under articulation. This avoids
+accepting a final part count or purity score that hides intermediate identity loss.
