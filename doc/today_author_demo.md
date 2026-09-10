@@ -88,3 +88,19 @@ prismatic part earlier, but may produce an extra late part. It is not the
 default and does not guarantee correct decomposition of a new recording.
 
 Diagnostic target FPS controls render start spacing; achieved rate is limited by incoming frames and tracker/UI work. No render jobs are queued to catch up. User observed about 21 ms per diagnostic render on their live model; this is not a general benchmark.
+
+## Shared low-resolution render products
+
+The diagnostic rasterizer now renders at maximum width 320 (640×480 input gives
+320×240), scaling intrinsics and depth/mask consistently. `render_part_views`
+returns per-part RGB, depth and alpha products; these can be consumed by both
+candidate scoring and the viewer. Exact same-frame/model/labels/poses reuse the
+cached product without rerendering. Pose, label, geometry or frame changes
+invalidate it. This is a bounded one-snapshot cache, not accumulated images.
+
+The active ICP pose refiner still uses projective depth evidence; it does not
+currently generate the shared RGB products. Therefore the viewer is still the
+fallback producer until a rendering-based candidate scorer calls the shared
+function. Do not claim pipeline render reuse is already wired end-to-end.
+Validation: 134 object tests passed, including cached-call suppression and
+pose/label/geometry invalidation; actual GPU 320×240 packet reuse verified.

@@ -259,25 +259,23 @@ class AuthorView:
             t0 = time.perf_counter()
             H, W = (depth.shape[:2] if depth is not None else
                     (raw_rgb if raw_rgb is not None else overlay_rgb).shape[:2])
-            labels = np.asarray(model.labels)
+            from examples.multi_part.render_views import render_part_views
+            packet, reused = render_part_views(model, stream.parts, stream.K, H, W, stream.n - 1)
+            H, W = packet['height'], packet['width']
+            if depth is not None:
+                depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
             rgb_acc = np.zeros((H, W, 3), np.float32)
             z_acc = np.full((H, W), np.inf, np.float32)
             cover = np.zeros((H, W), bool)
             part_images = []
-            with torch.no_grad():
-                for j, p in enumerate(stream.parts):
-                    sub = np.where(labels == j)[0]
-                    if len(sub) == 0:
-                        continue
-                    idx = torch.as_tensor(sub, device=model.cloud.device)
-                    rgb_t, dep_t, al_t = model.cloud.render(p.pose, stream.K, H, W, subset=idx)
-                    rgb = rgb_t.detach().cpu().numpy(); dep = dep_t.detach().cpu().numpy()
-                    al = al_t.detach().cpu().numpy()
-                    good = (al > 0.3) & np.isfinite(dep) & (dep > 0)   # valid finite positive depth
-                    part_rgb = cv2.resize(np.clip(rgb * 255, 0, 255).astype(np.uint8), (320, 240))
-                    part_images.append((f'Part {p.part_id} — {"observed" if p.observed else "held pose"}', part_rgb))
-                    win = good & (dep < z_acc)
-                    rgb_acc[win] = rgb[win]; z_acc[win] = dep[win]; cover |= win
+            observed = {p.part_id: p.observed for p in stream.parts}
+            for view in packet['views']:
+                rgb, dep, al = view['rgb'], view['depth'], view['alpha']
+                good = (al > 0.3) & np.isfinite(dep) & (dep > 0)
+                part_rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+                part_images.append((f'Part {view["part_id"]} — {"observed" if observed[view["part_id"]] else "held pose"}', part_rgb))
+                win = good & (dep < z_acc)
+                rgb_acc[win] = rgb[win]; z_acc[win] = dep[win]; cover |= win
             self.diag_rgb = cv2.resize(np.clip(rgb_acc * 255, 0, 255).astype(np.uint8), (320, 240))
             obs = raw_rgb if raw_rgb is not None else overlay_rgb
             self.diag_obs = cv2.resize(obs, (320, 240)) if obs is not None else None
@@ -287,6 +285,8 @@ class AuthorView:
             # are SEPARATE. The object is mask & finite depth, never background.
             self.diag_coverage = self.diag_agreement = self.diag_resid = None
             mask = getattr(stream, 'mask', None)
+            if mask is not None:
+                mask = cv2.resize(np.asarray(mask), (W, H), interpolation=cv2.INTER_NEAREST)
             if depth is not None and mask is not None and np.asarray(mask).shape == depth.shape:
                 obj = (depth > 0) & np.isfinite(depth)
                 if mask is not None and np.asarray(mask).shape[:2] == obj.shape:
@@ -309,7 +309,7 @@ class AuthorView:
             self.last_render_frame = int(stream.n - 1)
             self.render_error = None
             if hasattr(self, 'render_dock'):
-                self.render_dock.publish(self.last_render_frame, [('Overall (approx)', self.diag_rgb), ('Observed RGB', self.diag_obs), ('Depth residual', self.diag_resid)] + part_images, f'{self.last_render_ms:.0f} ms; target {self.diag_fps.value:g} FPS (limited by incoming frames)')
+                self.render_dock.publish(self.last_render_frame, [('Overall (approx)', self.diag_rgb), ('Observed RGB', self.diag_obs), ('Depth residual', self.diag_resid)] + part_images, f'{W}×{H}; {"cached" if reused else "rasterized"}; {self.last_render_ms:.0f} ms; target {self.diag_fps.value:g} FPS')
         except Exception as exc:            # never fake a render; surface in UI + log
             self.render_error = f'{type(exc).__name__}: {exc}'
             print(f'[author] render diagnostic failed: {exc}', flush=True)
