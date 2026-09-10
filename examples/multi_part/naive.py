@@ -272,6 +272,14 @@ class NaiveConfig:
     refine_every: int = 3
     carve_every: int = 3
     split_reprojection: bool = False   # require independent RGB-D evidence for a split
+    incremental_jump_only: bool = False
+    incremental_pose: bool = False
+    refine_step_guard: bool = False
+    refine_max_rotation_deg: float = 15.
+    refine_max_surface_step: float = .03
+    pose_continuity: bool = False
+    pose_max_step_deg: float = 20.
+    pose_min_support: float = .3
     pose_reprojection: bool = False
     split_reprojection_min_points: int = 20
     split_reprojection_dense: bool = True
@@ -364,6 +372,7 @@ class NaivePartTracker:
             pts0 = self._top_up(pts0, depth, mask, self.cfg.n_points)
         self.pts0 = pts0
         self.anchor_xyz, self.anchor_ok = lift(pts0, depth, self.K)
+        self.previous_measurement = (self.anchor_xyz.copy(), self.anchor_ok.copy(), self.anchor_ok.copy())
         self.track_born = np.zeros(len(pts0), np.int32)
         self.pend = {}          # track index -> (n, sum, sumsq) per part
         self.parts = [NaivePart(idx=np.where(self.anchor_ok)[0], part_id=0)]
@@ -499,6 +508,7 @@ class NaivePartTracker:
             self._dense_step(rgb, depth, mask, i)
             t_dense = time.perf_counter()
 
+        self.previous_measurement = (cur.copy(), cur_ok.copy(), vis.copy())
         self.last_timings = {"track_ms": (t_track - t0) * 1e3,
                              "dense_ms": (t_dense - t_track) * 1e3,
                              "total_ms": (time.perf_counter() - t0) * 1e3}
@@ -514,6 +524,15 @@ class NaivePartTracker:
             out = self.refiner.refine_poses(self.parts, depth, mask, self.K, H, W)
             for p, o in zip(self.parts, out):
                 if o is not None:
+                    from scipy.spatial.transform import Rotation
+                    correction = np.degrees(Rotation.from_matrix(o[0][:3, :3] @ p.pose[:3, :3].T).magnitude())
+                    pts = self.anchor_xyz[p.idx[self.anchor_ok[p.idx]]]
+                    centre = pts.mean(axis=0) if len(pts) else np.zeros(3)
+                    displacement = np.linalg.norm((o[0][:3, :3] - p.pose[:3, :3]) @ centre + o[0][:3, 3] - p.pose[:3, 3])
+                    if correction > cfg.refine_max_rotation_deg or displacement > cfg.refine_max_surface_step:
+                        print(f"[refine-step] f{i} p{p.part_id} {correction:.1f}deg {displacement*1000:.1f}mm guarded={cfg.refine_step_guard}")
+                        if cfg.refine_step_guard:
+                            continue
                     p.pose, p.energy = o
             if all(p.observed for p in self.parts):
                 self.moved = getattr(self, "moved", 0) + self.refiner.update_labels(
@@ -772,6 +791,19 @@ class NaivePartTracker:
             part.over = 0
             return
         T_free = np.asarray(c["T"])
+        relative_rotation = T_free[:3, :3] @ part.pose[:3, :3].T
+        pose_jump = np.degrees(np.arccos(np.clip((np.trace(relative_rotation)-1)/2, -1, 1)))
+        if cfg.incremental_pose and (not cfg.incremental_jump_only or pose_jump > cfg.pose_max_step_deg):
+            old, old_ok, old_vis = self.previous_measurement
+            shared = sel[sel < len(old)]
+            shared = shared[old_ok[shared] & old_vis[shared]]
+            if len(shared) >= cfg.min_inliers:
+                from examples.multi_part.pose_memory import incremental_candidate
+                candidate = incremental_candidate(old[shared], cur[shared], part.pose,
+                    self.reg, cfg.pose_max_step_deg, cfg.reseed_max_resid)
+                if candidate is not None:
+                    T_free = candidate
+                    self.incremental_frames = getattr(self, 'incremental_frames', 0) + 1
         if cfg.pose_reprojection and self.model is not None:
             from examples.multi_part.pose_memory import choose_pose
             j = next(k for k, p in enumerate(self.parts) if p is part)
@@ -789,7 +821,9 @@ class NaivePartTracker:
                     return self.model.assign.refine_pose(T, weights, self.K, H, W,
                         self.current_depth, obs_mask=self.mask, visible=visible, iters=6)
                 T_free, rescued = choose_pose(points, T_free, predicted,
-                    self.current_depth, self.mask, self.K, refine)
+                    self.current_depth, self.mask, self.K, refine,
+                    previous_pose=part.pose if cfg.pose_continuity else None,
+                    max_step_deg=cfg.pose_max_step_deg, min_support=cfg.pose_min_support)
                 if rescued:
                     self.pose_rescues = getattr(self, "pose_rescues", 0) + 1
                     print(f"[pose-reprojection] f{self.n} p{part.part_id} temporal candidate selected")

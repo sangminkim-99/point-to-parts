@@ -8,6 +8,12 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 VARIANTS = {
+    'guarded_incremental': ['incremental_pose=true', 'incremental_jump_only=true'],
+    'incremental': ['incremental_pose=true'],
+    'incremental_nogate': ['incremental_pose=true', 'split_reprojection=false'],
+    'bounded_refine': ['refine_step_guard=true'],
+    'continuity': ['pose_reprojection=true', 'pose_continuity=true'],
+    'continuity_low_support': ['pose_reprojection=true', 'pose_continuity=true', 'pose_min_support=0.1'],
     'proposed_min6': ['split_reprojection_min_points=6'],
     'sparse_min6': ['split_reprojection_dense=false', 'split_reprojection_min_points=6'],
     'temporal_pose': ['pose_reprojection=true'],
@@ -41,6 +47,7 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--cases', nargs='+', default=['laptop_orbit', 'laptop_hinge', 'storage_slide'])
     parser.add_argument('--variants', nargs='+', choices=list(VARIANTS), default=['baseline', 'proposed', 'symmetric_depth', 'sparse_only'])
+    parser.add_argument('--trace', action='store_true', help='archive all per-frame IDs/poses, including deleted IDs')
     args = parser.parse_args()
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
     diff = subprocess.check_output(['git', 'diff'], cwd=ROOT, text=True)
@@ -54,6 +61,8 @@ def main():
                    '--seq-dir', str(args.data.resolve() / case), '--method', 'naive',
                    '--config', 'reprojection_split.yaml', '--stride', '1', '--view', '0',
                    '--hyp-panel', '0', '--out', str(out.resolve() / 'tracking.mp4')]
+            if args.trace:
+                cmd += ['--trace-out', str(out.resolve() / 'trace.npz')]
             for override in VARIANTS[variant]:
                 cmd += ['--set', override]
             if (out / 'run.json').exists():

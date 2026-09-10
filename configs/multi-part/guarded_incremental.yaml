@@ -1,0 +1,3 @@
+extends: reprojection_split.yaml
+incremental_pose: true
+incremental_jump_only: true
