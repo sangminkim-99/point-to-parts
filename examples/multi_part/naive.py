@@ -279,6 +279,7 @@ class NaiveConfig:
     refine_step_guard: bool = False
     refine_max_rotation_deg: float = 15.
     refine_max_surface_step: float = .03
+    pose_relock_max_deg: float = 0.  # opt-in abstention after a lost observation
     pose_continuity: bool = False
     pose_max_step_deg: float = 20.
     pose_min_support: float = .3
@@ -819,6 +820,7 @@ class NaivePartTracker:
     def _fit(self, part, cur, cur_ok, vis):
         """Rigid fit of this part's points from the anchor frame, RANSAC + SVD."""
         cfg = self.cfg
+        was_observed = part.observed
         part.observed = False
         part.surface_recovered = False
         part.recovery_region = None
@@ -872,6 +874,15 @@ class NaivePartTracker:
                 if rescued:
                     self.pose_rescues = getattr(self, "pose_rescues", 0) + 1
                     print(f"[pose-reprojection] f{self.n} p{part.part_id} temporal candidate selected")
+        if cfg.pose_relock_max_deg > 0 and not was_observed:
+            R_step = T_free[:3, :3] @ part.pose[:3, :3].T
+            relock_angle = np.degrees(np.arccos(np.clip((np.trace(R_step)-1)/2, -1, 1)))
+            if not np.isfinite(relock_angle) or relock_angle > cfg.pose_relock_max_deg:
+                part.over = 0
+                self.relock_rejections = getattr(self, 'relock_rejections', 0) + 1
+                print(f"[pose-relock] f{self.n} p{part.part_id} held "
+                      f"jump_deg={relock_angle:.1f} limit={cfg.pose_relock_max_deg:.1f}")
+                return
         d = np.linalg.norm(
             self.anchor_xyz[sel] @ T_free[:3, :3].T + T_free[:3, 3]
             - cur[sel], axis=1)

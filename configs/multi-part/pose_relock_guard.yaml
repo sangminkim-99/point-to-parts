@@ -1,0 +1,3 @@
+# Abstention control, not an opposite-face recovery method.
+extends: reprojection_split.yaml
+pose_relock_max_deg: 20.0

@@ -45,3 +45,26 @@ as a fresh observation.
 
 This matched ablation is assigned to the existing Fable tracking worker.
 No defaults have changed on the strength of this diagnosis.
+
+## Existing-method comparison completed; abstention control added
+
+The worker's `results/thin_turnover_diag_v1/turnover_config_ablation.md` reports
+that all four configurations fail to recover, with approximately 179-degree
+median observed rotation error. At relock there are too few previous-frame
+tracks to form an incremental candidate. The continuity arm never selects a
+temporal candidate. These preferences do not repair missing hypotheses.
+
+`pose_relock_guard.yaml` now adds an explicitly limited abstention baseline:
+when the previous fit was unobserved, reject a new pose more than 20 degrees
+from the held pose. It runs after existing pose-candidate selection, before
+pose/history/joint updates. Rejection retains `observed=False`, infinite
+residual and the held pose. The ordinary observed-pose dense update path is
+therefore withheld. Separate surface-recovery options remain independent and
+are off in this config.
+
+This is NOT motion recovery or a speed bound. It measures rotation since the
+last held pose, not rotation per elapsed second. Real motion over a long gap
+can exceed the threshold and remain held indefinitely; small wrong relocks
+can still pass. Existing pre-hold drift is not repaired. Defaults remain off;
+compare incorrect-observed rate AND recovery/coverage before judging benefit.
+Regression tests check that repeated rejection leaves pose/history untouched.
