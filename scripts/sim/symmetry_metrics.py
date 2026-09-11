@@ -40,3 +40,43 @@ def surface_pose_errors(predicted, truth, points, symmetries=()):
     errors=np.array(errors)
     return {'strict_rms_m': errors[0], 'symmetry_rms_m': errors.min(axis=0),
             'symmetry_index': errors.argmin(axis=0)}
+
+
+def main():
+    import argparse
+    import json
+    from pathlib import Path
+    ap = argparse.ArgumentParser(description='Evaluate keyframe_baseline trace; all geometry and symmetry are evaluation-only.')
+    ap.add_argument('trace', type=Path)
+    ap.add_argument('--points', required=True, type=Path, help='NPY object-link-local surface samples')
+    ap.add_argument('--symmetries', type=Path, help='NPY (N,4,4), explicitly verified object-local symmetries')
+    ap.add_argument('--out', required=True, type=Path)
+    args = ap.parse_args()
+    if args.out.exists():
+        ap.error('output already exists; preserve previous evaluations')
+    with np.load(args.trace, allow_pickle=False) as z:
+        truth, observed = z['gt_poses'], z['observed'].astype(bool)
+        # Keyframe baseline maps initial camera coordinates to current camera.
+        # Geometry/symmetries live in the physical object link frame.
+        predicted = z['poses'] @ truth[0]
+    points = np.load(args.points, allow_pickle=False)
+    symmetries = () if args.symmetries is None else np.load(args.symmetries, allow_pickle=False)
+    values = surface_pose_errors(predicted, truth, points, symmetries)
+    result = {'trace': str(args.trace), 'points': str(args.points),
+              'symmetries': str(args.symmetries) if args.symmetries else None,
+              'scope': 'evaluation only; supplied symmetries must preserve object appearance and geometry',
+              'frames': len(truth), 'observed_frames': int(observed.sum())}
+    for name in ('strict_rms_m', 'symmetry_rms_m'):
+        result[name] = {}
+        for label, keep in (('all', np.ones(len(truth), bool)), ('observed', observed), ('held', ~observed)):
+            x = values[name][keep]
+            result[name][label] = {'count': len(x), 'median': float(np.median(x)) if len(x) else None,
+                                  'max': float(np.max(x)) if len(x) else None}
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open('x') as f:
+        json.dump(result, f, indent=2, allow_nan=False)
+    print(json.dumps(result, indent=2, allow_nan=False))
+
+
+if __name__ == '__main__':
+    main()

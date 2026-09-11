@@ -75,3 +75,17 @@ A regression test now directly checks that replacing the live geometry cannot
 erase the retained gate evidence, and that disabling the option returns to the
 live-model decision. Keep the option experimental until noisy rigid controls
 actually exercise the gate and coverage/ownership errors are evaluated.
+
+### Noisy rigid controls (reviewed September 11)
+
+The demo worker's `doc/gaussian_growth_probe.md` in its worktree records three
+noisy/occluded slab controls plus rigid moving_laptop. Slabs still generated no
+split proposals. Moving_laptop generated one at f50: live gain 0.001 and frozen
+snapshot f6 gain 0.002, both rejected. This exercises the gate on one negative
+candidate, not a broad false-positive guarantee. Artifacts are under
+`results/thin_turnover_v1/*_gate/growth_probe.json`.
+
+Noisy turnover remained observed through the flip with roughly 180-degree
+pose error. A guard triggered only after an unobserved frame cannot address
+this failure. Do not conflate stable part count with correct pose or promote
+relock abstention based solely on the clean control.
