@@ -126,6 +126,7 @@ def joint_metrics(reader, parts_gt, stream, rows, log):
     from point2pose.pipeline.components.joint_model import JointModel
     of = {r["part"]: r["gt"] for r in rows}
     gt_type = {j["child"]: j["type"] for j in getattr(reader, "joints", [])}
+    gt_parent = {j["child"]: j.get("parent") for j in getattr(reader, "joints", [])}
     out = []
     for j, p in enumerate(stream.parts):
         if p.joint is None or p.joint.kind is None or j not in of:
@@ -177,6 +178,8 @@ def joint_metrics(reader, parts_gt, stream, rows, log):
         ang = float(np.median(angs))
         d = float(np.median(dists)) if dists else None
         out.append({"part": j, "parent_part": p.parent, "gt_parent": par,
+                    "spec_parent": gt_parent.get(chi),
+                    "parent_matches_spec": (par == gt_parent[chi]) if gt_parent.get(chi) is not None else None,
                     "gt": chi, "kind": p.joint.kind, "ref_kind": ref.kind,
                     "spec_kind": gt_type.get(chi), "ang": ang, "dist": d})
     return out
@@ -195,6 +198,9 @@ def joint_summary(joints):
         counts[row['gt']] = counts.get(row['gt'], 0) + 1
     return {"n": len(joints), "unique_gt_joints": len(counts),
             "duplicate_gt_rows": sum(n-1 for n in counts.values()),
+            "correct_parent_rows": sum(j.get('parent_matches_spec') is True for j in joints),
+            "wrong_parent_rows": sum(j.get('parent_matches_spec') is False for j in joints),
+            "unknown_parent_rows": sum(j.get('parent_matches_spec') is None for j in joints),
             "ang_med": float(np.median(ang)),
             "ang_mean": float(ang.mean()), "type_acc": acc,
             "dist_med": float(np.median(d)) if d else None}

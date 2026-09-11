@@ -25,3 +25,10 @@ spec joint, but does not explicitly require the mapped parent to equal the
 spec parent. Pose logs filter by final part count, not persistent identity.
 These need auditing before a graph-level accuracy claim. Existing numbers are
 retained under their original protocol, not retrospectively reinterpreted.
+
+The evaluator now also attaches the spec parent and a tri-state
+`parent_matches_spec` flag to each row. Summaries distinguish correct, wrong,
+and unknown-parent rows. Existing angular metrics remain unfiltered for
+backward comparison; correct topology must be checked separately. Historical
+rows without the flag are unknown, never implicitly correct. This implements
+parent attribution but does not resolve the pose-log persistent-ID limitation.
