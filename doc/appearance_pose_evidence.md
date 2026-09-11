@@ -26,3 +26,22 @@ sample counts and the paired count. Fewer than 20 shared samples gives no score
 sample out of the second view and verifies that this produces no paired gain.
 This removes one selection artifact; it does not certify the discarded regions
 or solve illumination changes, occlusions, or front/back ambiguity.
+
+## First diagnostic results (September 11)
+
+Worker artifacts: `results/thin_turnover_v1/appearance_rigid/appearance_probe.json`
+and `appearance_rigid_distinct/appearance_probe.json`. Both are 120-frame
+simulation controls with geometry/colors frozen at frame 16 (about 4,983
+centres), oracle union masks, and an explicitly oracle GT-pose comparison.
+
+Post-flip median RGB L1 under the wrong tracked pose is about 0.000014 for
+uniform faces and 0.289 for distinct faces. This suggests appearance can expose
+an inconsistency in the distinct-face case. It does not establish a threshold
+or a correct pose candidate.
+
+The GT-pose diagnostic scores about 0.353 (uniform) and 0.347 (distinct), with
+only 363 supported centres versus roughly 4,950 for the tracked pose. It is
+therefore not a matched comparison and cannot justify ranking either candidate.
+The stored model has never seen the bottom face; lighting changes also affect
+color. Paired-sample evaluation and a pre-flip error distribution have been
+requested. Keep scoring diagnostic-only until these confounds are resolved.
