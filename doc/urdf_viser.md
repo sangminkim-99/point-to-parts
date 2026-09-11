@@ -25,3 +25,13 @@ Rendering uses Viser's native experimental browser Gaussian renderer; it does
 not invoke CUDA or gsplat. Its appearance/sorting may differ from the pipeline's
 rendered diagnostic images. This viewer targets matching author-demo exports
 (part0, part1, ...), not arbitrary robot mesh URDFs. No meshes are required.
+
+## Independent loader check
+
+`check_urdf_kinematics.py` now sweeps each joint independently and all joints
+together, plus the zero-clipped rest configuration. On saved live export
+`20260910-165808-535626`, SAPIEN and the viewer's matrix composition agree over
+34 configurations (5 links, 2 active joints), maximum matrix-entry difference
+3.73e-7. Artifact: `results/urdf_viewer_validation/saved_box_independent.json`.
+This checks exported kinematic semantics, not whether the inferred three-part
+model matches the physical object or whether its joint limits are mechanical.

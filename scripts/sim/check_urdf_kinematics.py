@@ -29,8 +29,22 @@ def main():
     if loaded != set(links):
         raise RuntimeError('SAPIEN link set differs from exported URDF')
     worst = 0.
+    limits = np.array([j.get_limits()[0] for j in active], dtype=float).reshape(-1, 2)
+    if not np.isfinite(limits).all():
+        raise ValueError('finite observed joint limits required for validation')
+    rest = np.clip(np.zeros(len(active)), limits[:, 0], limits[:, 1])
+    configurations = [rest]
+    # Exercise each joint independently as well as the coupled diagonal sweep.
+    # Coupled motion alone can conceal cancelling errors in a chain.
+    for k in range(len(active)):
+        for fraction in np.linspace(0, 1, args.steps):
+            q = rest.copy()
+            q[k] = limits[k, 0] + fraction * (limits[k, 1]-limits[k, 0])
+            configurations.append(q)
     for fraction in np.linspace(0, 1, args.steps):
-        q = [float(j.get_limits()[0, 0] + fraction * np.ptp(j.get_limits()[0])) for j in active]
+        configurations.append(limits[:, 0] + fraction * (limits[:, 1]-limits[:, 0]))
+    configurations = np.unique(np.array(configurations), axis=0)
+    for q in configurations:
         art.set_qpos(q)
         values = dict(zip([j.get_name() for j in active], q))
         expected = link_poses(joints, root, [values.get(j['name'], 0.) for j in joints])
@@ -39,7 +53,7 @@ def main():
             worst = max(worst, float(np.max(np.abs(actual - expected[link.get_name()]))))
     if worst > 2e-6:
         raise AssertionError(f'SAPIEN FK mismatch: {worst}')
-    result = {'urdf': str(Path(args.urdf).resolve()), 'steps': args.steps,
+    result = {'urdf': str(Path(args.urdf).resolve()), 'steps': args.steps, 'configurations': len(configurations),
               'links': sorted(links), 'active_joints': [j.get_name() for j in active],
               'max_matrix_error': worst, 'passed': True,
               'scope': 'URDF loading and kinematics consistency, not tracking accuracy'}
