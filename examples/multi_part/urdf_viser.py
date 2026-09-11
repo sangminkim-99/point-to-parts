@@ -52,6 +52,8 @@ class ExportViewer:
         with panel.add_tab('Model & joints'):
             server.gui.add_markdown('## Exported articulated model\nMove joints within their observed ranges. Orbit and zoom in the 3D view.')
             self.mode = server.gui.add_dropdown('Geometry', options=('Gaussians', 'Points') if have_gaussians else ('Points',), initial_value='Gaussians' if have_gaussians else 'Points')
+            self.pose_mode = server.gui.add_dropdown('Pose source', options=('Saved tracked poses', 'URDF joint poses'), initial_value='Saved tracked poses')
+            server.gui.add_markdown('Saved poses reproduce the capture. URDF poses follow the fitted joints and may differ because of fit error. Joint sliders start at zero clipped to observed limits, not the saved joint angle.')
             self.axes = server.gui.add_checkbox('Link frames', initial_value=False)
             hidden = int(np.sum((data['labels'] < 0) | (data['labels'] >= len(data['part_ids']))))
             server.gui.add_markdown(f"{len(data['part_ids'])} parts · {hidden:,} unassigned points hidden.\n\n" +
@@ -79,6 +81,7 @@ class ExportViewer:
                 self.splats.append(server.scene.add_gaussian_splats(name+'/gaussians', centers=data['means'][sel], covariances=cov[sel], rgbs=data['colors'][sel], opacities=data['opacities'][sel].reshape(-1,1)))
         self.mode.on_update(lambda _: self.update())
         self.axes.on_update(lambda _: self.update())
+        self.pose_mode.on_update(lambda _: self.update())
         self.update()
         @server.on_client_connect
         def connected(client):
@@ -93,10 +96,14 @@ class ExportViewer:
                 client.camera.position = center + np.array([.3,-.3,-2.8])*radius
 
     def poses(self):
+        if hasattr(self, 'pose_mode') and self.pose_mode.value == 'Saved tracked poses':
+            return {f'part{j}': T for j,T in enumerate(self.data['poses'])}
         return {name: self.base @ T for name, T in link_poses(self.joints, self.root, self.q).items()}
 
     def update(self):
         with self.server.atomic():
+            for slider in self.sliders:
+                slider.disabled = self.pose_mode.value == 'Saved tracked poses'
             for j, handle in self.frames.items():
                 T = self.poses()[f'part{j}']
                 handle.position = T[:3, 3]

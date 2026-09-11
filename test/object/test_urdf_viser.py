@@ -23,3 +23,17 @@ def test_viewer_fk_uses_saved_root_pose(tmp_path):
     v.base=s.parts[0].pose; v.joints=joints; v.root=root
     v.q=np.array([.3 if j['type']=='revolute' else 0. for j in joints])
     np.testing.assert_allclose(v.poses()['part1'],v.base @ s.parts[1].joint.at(.3),atol=2e-8)
+
+
+def test_saved_pose_mode_preserves_off_manifold_tracking_residual(tmp_path):
+    from types import SimpleNamespace
+    s=state();s.parts[1].pose=s.parts[1].pose.copy();s.parts[1].pose[0,3]+=.04
+    save_snapshot(s,tmp_path/'export')
+    data,joints,root=load_export(tmp_path/'export')
+    v=ExportViewer.__new__(ExportViewer)
+    v.data=data;v.base=data['poses'][0];v.joints=joints;v.root=root
+    v.q=np.array([.2 if j['type']=='revolute' else 0 for j in joints])
+    v.pose_mode=SimpleNamespace(value='Saved tracked poses')
+    np.testing.assert_allclose(v.poses()['part1'],s.parts[1].pose)
+    v.pose_mode.value='URDF joint poses'
+    assert np.linalg.norm(v.poses()['part1'][:3,3]-s.parts[1].pose[:3,3]) > .039

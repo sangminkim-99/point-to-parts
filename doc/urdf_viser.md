@@ -35,3 +35,13 @@ together, plus the zero-clipped rest configuration. On saved live export
 3.73e-7. Artifact: `results/urdf_viewer_validation/saved_box_independent.json`.
 This checks exported kinematic semantics, not whether the inferred three-part
 model matches the physical object or whether its joint limits are mechanical.
+
+## Saved versus fitted poses
+
+The viewer now opens in **Saved tracked poses**, reproducing every part's saved
+transform (including residual disagreement with the fitted joint model).
+Switch **Pose source** to **URDF joint poses** to enable joint sliders. This
+mode uses the fitted chain and zero-clipped initial joint values; it is not the
+saved articulation configuration. Existing joint sliders retain their values
+when switching modes. A regression fixture with a 4-cm off-manifold residual
+checks that saved mode preserves it and URDF mode exposes the difference.
