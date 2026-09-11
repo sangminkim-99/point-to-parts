@@ -87,10 +87,18 @@ class RGBDKeyframes:
         return xyz, descriptors[good]
 
     def lift(self, xy, depth, mask):
-        u = np.clip(np.rint(xy[:, 0]).astype(int), 0, depth.shape[1]-1)
-        v = np.clip(np.rint(xy[:, 1]).astype(int), 0, depth.shape[0]-1)
+        xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        h, w = depth.shape
+        finite = np.isfinite(xy).all(axis=1)
+        safe = np.where(finite[:, None], xy, 0.)
+        rounded = np.rint(safe)
+        inside = (finite & (safe[:, 0] >= 0) & (safe[:, 0] < w)
+                  & (safe[:, 1] >= 0) & (safe[:, 1] < h)
+                  & (rounded[:, 0] < w) & (rounded[:, 1] < h))
+        u = np.clip(rounded[:, 0], 0, w-1).astype(int)
+        v = np.clip(rounded[:, 1], 0, h-1).astype(int)
         z = depth[v, u]
-        good = np.isfinite(z) & (z > .05) & (mask[v, u] > 0)
+        good = inside & np.isfinite(z) & (z > .05) & (mask[v, u] > 0)
         xyz = np.column_stack([(xy[:, 0]-self.K[0, 2])*z/self.K[0, 0],
                                (xy[:, 1]-self.K[1, 2])*z/self.K[1, 1], z])
         return xyz[good], good
