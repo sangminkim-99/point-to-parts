@@ -32,3 +32,11 @@ and unknown-parent rows. Existing angular metrics remain unfiltered for
 backward comparison; correct topology must be checked separately. Historical
 rows without the flag are unknown, never implicitly correct. This implements
 parent attribution but does not resolve the pose-log persistent-ID limitation.
+
+Replay now supplies per-frame identity logs to joint evaluation. Frames are
+selected by the evaluated child/parent IDs, and the parent's pose is retrieved
+by its ID rather than current list index. Filtered evaluation windows retain
+frame-keyed IDs. Rows state whether identity alignment was supplied; legacy
+external callers without it retain the old count-based behavior. Published
+historical numbers are not silently replaced and require a new evaluation to
+claim this stronger protocol.

@@ -107,7 +107,7 @@ def report(reader, anchor, parts_gt, lab_gt, stream, pose_log, min_group=30):
     return out
 
 
-def joint_metrics(reader, parts_gt, stream, rows, log):
+def joint_metrics(reader, parts_gt, stream, rows, log, ids_by_frame=None):
     """Axis error against a joint fitted to the mocap poses, and type accuracy.
 
     RBO's spec declares each joint's type but not its axis, so the reference axis
@@ -152,9 +152,18 @@ def joint_metrics(reader, parts_gt, stream, rows, log):
         # earlier, shorter list names a different part
         angs, dists = [], []
         for i, poses in log:
-            if poses is None or len(poses) != len(stream.parts):
+            if poses is None:
                 continue
-            Op = poses[p.parent] if p.parent < len(poses) else None
+            if ids_by_frame is not None:
+                ids = ids_by_frame.get(i, [])
+                parent_id = getattr(stream.parts[p.parent], "part_id", p.parent)
+                if getattr(p, "part_id", j) not in ids or parent_id not in ids or len(ids) != len(poses):
+                    continue
+                Op = poses[ids.index(parent_id)]
+            else:
+                if len(poses) != len(stream.parts):
+                    continue
+                Op = poses[p.parent] if p.parent < len(poses) else None
             Tp = reader.get_gt_pose(i, par)
             if Op is None or Tp is None or not np.all(np.isfinite(Tp)):
                 continue
@@ -178,6 +187,7 @@ def joint_metrics(reader, parts_gt, stream, rows, log):
         ang = float(np.median(angs))
         d = float(np.median(dists)) if dists else None
         out.append({"part": j, "parent_part": p.parent, "gt_parent": par,
+                    "identity_aligned": ids_by_frame is not None,
                     "spec_parent": gt_parent.get(chi),
                     "parent_matches_spec": (par == gt_parent[chi]) if gt_parent.get(chi) is not None else None,
                     "gt": chi, "kind": p.joint.kind, "ref_kind": ref.kind,
