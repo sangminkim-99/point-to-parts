@@ -45,3 +45,14 @@ therefore not a matched comparison and cannot justify ranking either candidate.
 The stored model has never seen the bottom face; lighting changes also affect
 color. Paired-sample evaluation and a pre-flip error distribution have been
 requested. Keep scoring diagnostic-only until these confounds are resolved.
+
+The paired follow-up (`appearance2_rigid*`) still favors the wrong pose on all
+54 post-flip frames with enough common samples. Distinct-face paired median
+errors: tracked 0.183, oracle 0.346 (362 common centres). This is a failed pose
+ranking result, not evidence to promote an appearance-based selector.
+
+Viser now displays RGB MAE from the already-produced approximate composite,
+using only raw camera RGB and depth-supported object pixels. The pixel count
+is shown alongside the value; annotated tracking overlays are never scored.
+This metric is display-only and does not establish pose correctness. It adds
+no rasterizer calls and remains subject to lighting and composite artifacts.

@@ -305,11 +305,19 @@ class AuthorView:
                             cv2.COLORMAP_MAGMA)
                         heat[~valid] = 0
                         self.diag_resid = cv2.resize(cv2.cvtColor(heat, cv2.COLOR_BGR2RGB), (320, 240))
+            rgb_note = 'RGB error unavailable (requires raw RGB/depth/mask)'
+            if raw_rgb is not None and depth is not None and mask is not None:
+                from examples.multi_part.render_views import rendered_rgb_error
+                raw_small = cv2.resize(raw_rgb, (W, H), interpolation=cv2.INTER_AREA)
+                rgb_error, rgb_count = rendered_rgb_error(
+                    rgb_acc, raw_small, z_acc, depth, mask, cover, tol)
+                rgb_note = (f'RGB MAE {rgb_error:.3f} on {rgb_count} depth-supported pixels'
+                            if rgb_error is not None else 'RGB error unavailable (no shared depth support)')
             self.last_render_ms = 1000 * (time.perf_counter() - t0)
             self.last_render_frame = int(stream.n - 1)
             self.render_error = None
             if hasattr(self, 'render_dock'):
-                self.render_dock.publish(self.last_render_frame, [('Overall (approx)', self.diag_rgb), ('Observed RGB', self.diag_obs), ('Depth residual', self.diag_resid)] + part_images, f'{W}×{H}; {"cached" if reused else "rasterized"}; {self.last_render_ms:.0f} ms; target {self.diag_fps.value:g} FPS')
+                self.render_dock.publish(self.last_render_frame, [('Overall (approx)', self.diag_rgb), ('Observed RGB', self.diag_obs), ('Depth residual', self.diag_resid)] + part_images, f'{W}×{H}; {"cached" if reused else "rasterized"}; {self.last_render_ms:.0f} ms; target {self.diag_fps.value:g} FPS; {rgb_note}')
         except Exception as exc:            # never fake a render; surface in UI + log
             self.render_error = f'{type(exc).__name__}: {exc}'
             print(f'[author] render diagnostic failed: {exc}', flush=True)

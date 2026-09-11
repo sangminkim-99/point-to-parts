@@ -42,3 +42,16 @@ def render_part_views(model, parts, K, height, width, frame, max_width=320):
     packet = dict(key=key, frame=int(frame), K=k, height=h, width=w, views=views)
     model._render_views_cache = packet
     return packet, False
+
+
+def rendered_rgb_error(rendered, observed, rendered_depth, depth, mask, cover, tolerance=.02):
+    """Normalized RGB MAE on object pixels agreeing in depth; display only."""
+    valid = (np.asarray(cover, bool) & (mask > 0) & np.isfinite(depth)
+             & (depth > 0) & np.isfinite(rendered_depth)
+             & (np.abs(rendered_depth-depth) < tolerance)
+             & np.isfinite(rendered).all(axis=-1))
+    count = int(valid.sum())
+    if not count:
+        return None, 0
+    error = np.abs(np.clip(rendered[valid],0,1)-observed[valid].astype(float)/255.)
+    return float(error.mean()), count

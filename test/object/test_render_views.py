@@ -35,3 +35,12 @@ def test_reuse_and_invalidation_for_pose_labels_and_geometry():
     assert not get()[1] and model.cloud.calls==3
     model.cloud.means.add_(1)
     assert not get()[1] and model.cloud.calls==4
+
+
+def test_rgb_error_uses_only_depth_supported_object_pixels():
+    from examples.multi_part.render_views import rendered_rgb_error
+    rgb=np.zeros((1,3,3)); obs=np.full((1,3,3),255,np.uint8)
+    value,count=rendered_rgb_error(rgb,obs,np.array([[1.,2.,1.]]),np.ones((1,3)),np.array([[1,1,0]]),np.ones((1,3),bool))
+    assert value==1. and count==1
+    value,count=rendered_rgb_error(rgb,obs,np.ones((1,3)),np.ones((1,3)),np.zeros((1,3)),np.ones((1,3),bool))
+    assert value is None and count==0
