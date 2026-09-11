@@ -89,3 +89,25 @@ Noisy turnover remained observed through the flip with roughly 180-degree
 pose error. A guard triggered only after an unobserved frame cannot address
 this failure. Do not conflate stable part count with correct pose or promote
 relock abstention based solely on the clean control.
+
+### Additional RealSense recordings at 88505c1
+
+The worker compared `/home/smkim/data/mp/take01` and `lift01` using existing
+prepared binary masks. These are **not RBO sequences**, despite the legacy
+artifact filename `results/frozen_gate_v1/frozen_gate_rbo_validation.md`.
+Neither recording provides GT for the reported comparison.
+
+| Recording | First split baseline / frozen | Identity deaths baseline / frozen | Final parts baseline / frozen |
+| --- | --- | --- | --- |
+| take01 | 168 / 172 | 1 / 0 | 2 / 3 |
+| lift01 | 104 / 84 | 0 / 0 | 6 / 4 |
+
+On take01 the baseline's split-168/merge-170 churn disappears, but a small
+additional part is created at f250. Joint-kind estimates differ between the
+arms; fewer deaths and earlier splits are not proof of correct articulation.
+On lift01 minimum observed-frame coverage increases from 0.89 to 1.00, but
+observed status is not independently verified pose accuracy. Step medians are
+97.4/102.3 ms and 170.7/154.3 ms respectively (single runs).
+
+Actual RBO validation with existing predicted masks has been requested
+separately for ikeasmall02_o and cardboardbox01_o. Defaults remain unchanged.
