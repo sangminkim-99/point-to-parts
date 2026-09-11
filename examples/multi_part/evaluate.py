@@ -226,7 +226,16 @@ def fmt(name, res, n_parts):
     for j in res.get("joints", []):
         dd = "n/a" if j["dist"] is None else f"{100 * j['dist']:.1f} cm"
         L.append(f"    joint {j['gt']:6s} {j['kind']:9s} (spec {j['spec_kind']}, "
-                 f"mocap {j['ref_kind']})  axis {j['ang']:5.1f} deg  dist {dd}")
+                 f"mocap {j['ref_kind']})  axis {j['ang']:5.1f} deg  dist {dd} "
+                 f"parent_match={j.get('parent_matches_spec')} "
+                 f"identity_aligned={j.get('identity_aligned', False)}")
+    summary = joint_summary(res.get("joints", []))
+    if summary:
+        L.append(f"    joint coverage: {summary['n']} matched rows, "
+                 f"{summary['unique_gt_joints']} unique GT joints, "
+                 f"{summary['duplicate_gt_rows']} duplicate rows; parent "
+                 f"correct/wrong/unknown={summary['correct_parent_rows']}/"
+                 f"{summary['wrong_parent_rows']}/{summary['unknown_parent_rows']}")
     return "\n".join(L)
 
 

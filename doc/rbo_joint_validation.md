@@ -40,3 +40,13 @@ frame-keyed IDs. Rows state whether identity alignment was supplied; legacy
 external callers without it retain the old count-based behavior. Published
 historical numbers are not silently replaced and require a new evaluation to
 claim this stronger protocol.
+
+## Identity-aligned cardboard rerun at 6c980e7
+
+Worker report `results/frozen_gate_rbo_v1/rbo_joint_identity_rerun.md` confirms
+cardboard fallback: one matched revolute row, 3.900-degree axis error, 0.71-cm
+line distance, identity alignment enabled, rb0 parent matching the spec, no
+duplicate GT rows. Same reported precision as the old protocol. This applies
+to the rerun fallback arm only; ikea and other historical arms retain their
+original protocol labels. The standard evaluator formatter now prints parent
+agreement, identity alignment, and duplicate/unique counts directly.

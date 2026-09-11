@@ -34,3 +34,12 @@ def test_joint_axis_uses_parent_identity_after_reordering(monkeypatch):
     result=joint_metrics(reader,[],NS(parts=parts),rows,log,ids_by_frame={3:[20,10]})
     assert len(result)==1 and result[0]['ang']==0.
     assert result[0]['identity_aligned']
+
+
+def test_formatted_metrics_expose_duplicate_and_parent_status():
+    from examples.multi_part.evaluate import fmt
+    row=dict(gt='rb2',ang=1.,kind='prismatic',spec_kind='prismatic',ref_kind='prismatic',dist=None,parent_matches_spec=False,identity_aligned=True)
+    text=fmt('example',dict(n_gt=3,covered=['rb2'],purity=.9,err={},joints=[row,row]),3)
+    assert '1 unique GT joints' in text and '1 duplicate rows' in text
+    assert 'parent_match=False' in text and 'identity_aligned=True' in text
+    assert 'correct/wrong/unknown=0/2/0' in text
