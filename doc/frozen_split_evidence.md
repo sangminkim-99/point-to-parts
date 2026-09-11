@@ -132,3 +132,34 @@ configs keep their prior behavior. Tests cover stale-support recovery and live
 rejection. Matched replay is still required; this is not yet a proven fix for
 the RBO regression. If combined with residual_veto, persistence may span changes
 in geometry source, so that combination needs separate evaluation.
+
+### Coverage fallback validated at 24189aa
+
+All six baseline/frozen/fallback arms were rerun in the worker's isolated
+checkout. Report: `results/frozen_gate_rbo_v1/frozen_fallback_validation.md`.
+
+| Sequence | Baseline | Frozen | Frozen + coverage fallback |
+| --- | --- | --- | --- |
+| RBO cardboardbox01 | splits 191/234/255, final 3 parts | no split, final 1 part | same split frames and final parts as baseline |
+| RealSense drawer stage_165946 | split 305 | split 181 | split 181 |
+
+Cardboard triggered 101 live retries; the recovered decisions match baseline,
+including its remaining oversegmentation and uncertain secondary joint. This
+is recovery of a regression, not perfect articulation reconstruction. The
+reported GT purity returns from 57.7% to baseline 90.8%; purity is not sufficient
+to establish usable joint geometry. Drawer triggered no fallback: supported
+frozen evidence retained the earlier split. Runtime/identity details are in the
+report; no broader timing claim is inferred.
+
+For the next experimental demo, select explicitly from the repository root:
+
+```bash
+CONFIG=reprojection_split_frozen_fallback.yaml \
+PORT=8090 OUT=results/author_demo_live \
+examples/multi_part/run_author_demo.sh live --depth 1
+```
+
+Restart the process to load this config. Existing default and frozen-only
+configs are unchanged. Remaining validation: noisy rigid proposals and other
+recordings under this exact combination, joint-axis/trajectory error, and
+opposite-face tracking. The latter is not addressed by a split-gate change.
