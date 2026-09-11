@@ -18,3 +18,11 @@ Next experiment: use the symmetric and face-distinct turnover controls,
 freeze pre-flip geometry/colors, and report support count and RGB error under
 actual tracker candidates. Any GT-pose comparison is an explicitly oracle
 reference only; it cannot be used for runtime candidate generation.
+
+`paired_appearance_evidence` now intersects the visible stored-sample IDs under
+both candidates and scores only that intersection. It reports both individual
+sample counts and the paired count. Fewer than 20 shared samples gives no score
+(configurable for experiments), not zero loss. A regression test drops a hard
+sample out of the second view and verifies that this produces no paired gain.
+This removes one selection artifact; it does not certify the discarded regions
+or solve illumination changes, occlusions, or front/back ambiguity.
