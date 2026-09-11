@@ -176,7 +176,8 @@ def joint_metrics(reader, parts_gt, stream, rows, log):
             continue
         ang = float(np.median(angs))
         d = float(np.median(dists)) if dists else None
-        out.append({"gt": chi, "kind": p.joint.kind, "ref_kind": ref.kind,
+        out.append({"part": j, "parent_part": p.parent, "gt_parent": par,
+                    "gt": chi, "kind": p.joint.kind, "ref_kind": ref.kind,
                     "spec_kind": gt_type.get(chi), "ang": ang, "dist": d})
     return out
 
@@ -189,7 +190,12 @@ def joint_summary(joints):
     typ = [j for j in joints if j["spec_kind"]]
     acc = float(np.mean([j["kind"] == j["spec_kind"] for j in typ])) if typ else float("nan")
     d = [j["dist"] for j in joints if j["dist"] is not None]
-    return {"n": len(joints), "ang_med": float(np.median(ang)),
+    counts = {}
+    for row in joints:
+        counts[row['gt']] = counts.get(row['gt'], 0) + 1
+    return {"n": len(joints), "unique_gt_joints": len(counts),
+            "duplicate_gt_rows": sum(n-1 for n in counts.values()),
+            "ang_med": float(np.median(ang)),
             "ang_mean": float(ang.mean()), "type_acc": acc,
             "dist_med": float(np.median(d)) if d else None}
 
