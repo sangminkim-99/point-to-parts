@@ -111,3 +111,24 @@ observed status is not independently verified pose accuracy. Step medians are
 
 Actual RBO validation with existing predicted masks has been requested
 separately for ikeasmall02_o and cardboardbox01_o. Defaults remain unchanged.
+
+### Actual RBO regression and coverage fallback experiment
+
+At 2bbabfa, the worker reports RBO cardboardbox01 baseline first split f191
+versus no split with frozen geometry. A snapshot at f42 predates lid motion;
+178/281 evaluations had insufficient child support. Predicted SAM2 masks used
+GT-derived initialization boxes (not a fully annotation-free setup); GT part
+poses/labels were confined to evaluation. Report:
+`results/frozen_gate_rbo_v1/frozen_gate_rbo_dataset_validation.md`.
+Ikeasmall02 remained oversegmented in both variants (five parts vs three GT).
+Do not promote frozen geometry unconditionally.
+
+New opt-in config `reprojection_split_frozen_fallback.yaml` retries the original
+live-geometry gate only when retained geometry has too few total/group samples
+or a child's support is below the existing threshold. A supported but low-gain
+snapshot does NOT fall back. The retry must satisfy the same original gate;
+no threshold is lowered. Snapshot memory itself remains frozen. Both existing
+configs keep their prior behavior. Tests cover stale-support recovery and live
+rejection. Matched replay is still required; this is not yet a proven fix for
+the RBO regression. If combined with residual_veto, persistence may span changes
+in geometry source, so that combination needs separate evaluation.

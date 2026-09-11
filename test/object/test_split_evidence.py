@@ -52,3 +52,21 @@ def test_gate_scores_retained_geometry_after_live_geometry_is_replaced():
     assert tracker._validate_split_reprojection(0, part, groups, motions)
     tracker.cfg.split_reprojection_frozen = False
     assert not tracker._validate_split_reprojection(0, part, groups, motions)
+
+
+def test_unsupported_snapshot_can_retry_original_live_gate():
+    from test.object.test_surface_memory import _split_gate_scene
+    tracker, part, groups, motions = _split_gate_scene(.8)
+    part.part_id = 7
+    tracker.cfg.split_reprojection_dense = True
+    tracker.cfg.split_reprojection_frozen = True
+    tracker.model = NS(labels=np.zeros(18,int),cloud=NS(means=torch.tensor(tracker.anchor_xyz)))
+    stale=tracker.anchor_xyz.copy();stale[:,2]=2.
+    tracker._split_evidence=SplitEvidence()
+    tracker._split_evidence.snapshots[7]=(1,stale)
+    assert not tracker._validate_split_reprojection(0,part,groups,motions)
+    tracker.cfg.split_reprojection_frozen_fallback=True
+    assert tracker._validate_split_reprojection(0,part,groups,motions)
+    # Fallback still requires live evidence: it cannot force an acceptance.
+    tracker.model.cloud.means[:,2]=2.
+    assert not tracker._validate_split_reprojection(0,part,groups,motions)

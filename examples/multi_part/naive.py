@@ -294,6 +294,7 @@ class NaiveConfig:
     # contradiction path and ADDS a fit-improvement + persistence path so a
     # prismatic slide (whose moved surface leaves the silhouette) is not
     # rejected for failing to reduce free-space contradiction.
+    split_reprojection_frozen_fallback: bool = False  # retry live if retained coverage is insufficient
     split_reprojection_frozen: bool = False  # preserve evidence before map maintenance
     split_reprojection_mode: str = "contradiction"   # or "residual_veto"
     split_reprojection_resid_gain: float = .004      # m; paired residual must fall this much
@@ -1699,7 +1700,7 @@ class NaivePartTracker:
         return self._accept(j, part, groups, motions, cur, cur_ok, "frame",
                             float("nan"), keep, ss, dbic)
 
-    def _validate_split_reprojection(self, j, part, groups, motions):
+    def _validate_split_reprojection(self, j, part, groups, motions, _live_fallback=False):
         """Test sparse-motion proposals against stored geometry and current RGB-D."""
         from scipy.spatial import cKDTree
         from examples.multi_part.surface_memory import reprojection_evidence
@@ -1711,15 +1712,21 @@ class NaivePartTracker:
             selected = selected[::max(1, int(np.ceil(len(selected) / 1536)))]
             points = self.model.cloud.means[selected].detach().cpu().numpy()
         evidence_source = "live"
-        if cfg.split_reprojection_frozen and cfg.split_reprojection_dense:
+        if cfg.split_reprojection_frozen and cfg.split_reprojection_dense and not _live_fallback:
             evidence = getattr(self, '_split_evidence', None)
             snapshot = evidence.snapshots.get(part.part_id) if evidence is not None else None
             if snapshot is not None:
                 snapshot_frame, points = snapshot
                 evidence_source = f"frozen@{snapshot_frame}"
+        def retry_live():
+            if cfg.split_reprojection_frozen_fallback and evidence_source.startswith("frozen@"):
+                print(f"[reprojection] f{self.n} geometry={evidence_source} "
+                      "insufficient retained support; retry geometry=live")
+                return self._validate_split_reprojection(j, part, groups, motions, _live_fallback=True)
+            return False
         if len(points) < 2 * cfg.split_reprojection_min_points:
             print(f"[reprojection] f{self.n} insufficient total geometry accept=False")
-            return False
+            return retry_live()
         distances = np.stack([cKDTree(self.anchor_xyz[g]).query(points)[0] for g in groups])
         labels = distances.argmin(axis=0)
         rows = []
@@ -1728,7 +1735,7 @@ class NaivePartTracker:
             pts = points[labels == k]
             if len(pts) < cfg.split_reprojection_min_points:
                 print(f"[reprojection] f{self.n} insufficient group geometry accept=False")
-                return False
+                return retry_live()
             common = reprojection_evidence(pts, part.pose, self.current_depth, self.mask,
                                            self.K, cfg.split_reprojection_tol, cfg.split_reprojection_occlusion)
             separate = reprojection_evidence(pts, motion, self.current_depth, self.mask,
@@ -1743,6 +1750,8 @@ class NaivePartTracker:
         # A hidden old face cannot justify articulation just by finding new RGB tracks.
         gain = max(a['contradiction'] - b['contradiction'] for a, b in rows)
         supported = all(b['support'] >= cfg.split_reprojection_support for _, b in rows)
+        if not supported and cfg.split_reprojection_frozen_fallback and evidence_source.startswith("frozen@"):
+            return retry_live()
         baseline_accept = supported and gain >= cfg.split_reprojection_gain
         detail = ""
         residual_accept = False

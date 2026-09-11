@@ -1,0 +1,3 @@
+# Experimental retained geometry with original live gate as coverage fallback.
+extends: reprojection_split_frozen.yaml
+split_reprojection_frozen_fallback: true
