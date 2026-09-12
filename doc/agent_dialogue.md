@@ -1509,3 +1509,40 @@ sequentially moving children is its own open failure.
 NEXT: (1) duplicate-body identity is the upstream blocker for both root rules
 and rigid merging; (2) opt-in `joint_graph` in `_reparent` on `hist` with the
 existing root, tree only; (3) split discovery under staggered motion.
+
+## 2026-09-12 — Claude: duplicate bodies are mixture births; gate artefact on ikea; two default-off fixes
+
+Report `doc/split_partition_purity.md`; artifacts `results/split_purity_v1/`;
+new `replay --dump-split-diag` (per-point own/other residuals + GT track
+labels for every accepted AND refused proposal), `scripts/sim/split_purity.py`,
+`scripts/sim/summarize_split_arms.py`; tests `test_split_partition.py` (4);
+`test/object` 179.
+
+DIAGNOSIS: ikea p1 born f47 as rb0 19 / rb2 18 (purity 0.51); cardboard p2
+born f233 as rb0 17 / rb1 19 (0.53). Two mechanisms: (a) partition at
+marginal separation — pooled 4.3 sigma carried by the big child while the small
+child prefers its motion by 2.5 sigma (ikea f47, frame path); (b) stale
+co-association membership — 92 mm separation but the lid points stayed in the
+group (own inlier 0.56; cardboard f233). Junk anchor pose + mover's points left
+in the parent = the second identity later.
+
+OPTIONS (NaiveConfig, both off): `split_sep_per_child` (min over children of
+the swap displacement), `split_refine_coassoc` (residual re-assignment + band
+drop + refit, the frame path's rule, applied to coassoc groups).
+
+RESULTS: cardboard refine 3->2 parts (=GT), purity 90.8->96.8, births 0.97/1.00.
+ikea under the checkpoint gates: EVERY option loses rb2 (2/3) — refusal log
+shows clean coassoc proposals f61-85 (11-48 sigma, ~200 vs ~75 pts) rejected
+by the contradiction gate every frame (gain~0.001); base found rb2 only because
+the gate accepted the WRONG f48 mixture partition (gain 0.246). Under
+`reprojection_split_residual_veto` ikea BASE is already 3/3 with no duplicates
+(splits f29, f159); refine raises purity 92.3->94.0 and body-part error
+17.8->5.6 mm. With that, kinematic_graph on the refine run: body-drawer pairs
+6.7/9.5 vs drawer-drawer 33.4 per obs; BOTH spec joints found, parents 2/2
+under both root rules, axes 10.6/9.2 deg (star-root: 0/1). Without refine the
+tree still picks the drawer-drawer edge (body pose too poor).
+
+VERDICT: refine = supported (fixes cardboard, helps ikea, no-op on sims);
+per-child = correct diagnosis, no measured benefit, not promoted. The ikea
+duplicate was a gate artefact. Not done: take01/lift01 and other RBO objects;
+door_drawer/two_drawers still one child (co_min_seen).

@@ -73,6 +73,15 @@ class NaiveConfig:
     sigma_floor: float = 0.002          # metres; a RealSense at 0.5 m
     sigma_ceil: float = 0.02
     split_sep_sigma: float = 4.0        # group displacement, in sigma
+    # Both default OFF. Measured on ikeasmall02 f47 and cardboardbox01 f233:
+    # a split can pass the pooled separation test while ONE child is half
+    # another body's points -- the pooled median is carried by the big child,
+    # and the small child's points fit the other motion almost as well (2.4
+    # sigma). That child is born with a compromise anchor pose, its history is
+    # junk for as long as the two bodies move differently, and the points of
+    # the mover left behind in the parent surface later as a second identity.
+    split_sep_per_child: bool = False   # every child must clear split_sep_sigma on its own
+    split_refine_coassoc: bool = False  # re-assign co-association groups by residual, as the frame path does
     # The answer is always a 1-DoF joint, so ask for one: the relative motion
     # has to be a joint displacement of a size worth calling a part, in the
     # units that joint actually has. A noise-relative test alone is hypersensitive
@@ -1868,6 +1877,27 @@ class NaivePartTracker:
             else (trans >= cfg.split_min_trans_m)
         return bool(big), rot, trans
 
+    def _split_refusal(self, via, reason, groups, motions, part, **extra):
+        """Diagnostics (no behaviour): why a proposal that had two motions was
+        refused, with each child's own separation, so refusals are as legible
+        as accepts in `--dump-split-diag`."""
+        if getattr(self, "split_diag", None) is None:
+            return
+        per = []
+        for k, g in enumerate(groups):
+            g = np.asarray(g)
+            if g.size == 0:
+                per.append(None); continue
+            P0 = self.anchor_xyz[g]
+            A = P0 @ motions[k][:3, :3].T + motions[k][:3, 3]
+            B = P0 @ motions[1 - k][:3, :3].T + motions[1 - k][:3, 3]
+            per.append(float(np.median(np.linalg.norm(A - B, axis=1)) / max(part.sigma, 1e-6)))
+        rec = {"frame": int(self.n - 1), "via": via, "refused": reason,
+               "parent_part_id": int(part.part_id), "sigma_mm": float(1000 * part.sigma),
+               "n": [int(len(g)) for g in groups], "sep_sigma_per_child": per}
+        rec.update(extra)
+        self.split_diag.append(rec)
+
     def _sep_sigma(self, groups, motions, part):
         """How far the groups' own points move if you swap the two motions.
 
@@ -1886,6 +1916,10 @@ class NaivePartTracker:
             d.append(np.linalg.norm(A - B, axis=1))
         if not d:
             return 0.0
+        if self.cfg.split_sep_per_child and len(d) == 2:
+            # the weakest child decides: a child whose own points barely
+            # prefer its motion over the other one is not a separate body yet
+            return float(min(np.median(x) for x in d) / max(part.sigma, 1e-6))
         return float(np.median(np.concatenate(d)) / max(part.sigma, 1e-6))
 
     def _co_why(self, tag):
@@ -1956,22 +1990,58 @@ class NaivePartTracker:
                                      w=None, remaining=np.ones(len(g), bool),
                                      init_pose=None)
                 motions.append(np.asarray(c["T"]) if c is not None else part.pose)
+            if cfg.split_refine_coassoc:
+                # The affinity clustering decides membership from history, the
+                # RANSAC motion from the robust core of each group -- and the
+                # points the core rejected stay in the group anyway. Hand every
+                # point to the motion it fits now, drop the ones in the joint
+                # gap (exactly the frame path's rule), and refit the motions.
+                allp = np.concatenate([np.asarray(g) for g in groups])
+                D = np.stack([np.linalg.norm(
+                    self.anchor_xyz[allp] @ T[:3, :3].T + T[:3, 3] - cur[allp], axis=1)
+                    for T in motions])
+                best = D.argmin(axis=0)
+                bv, sv = D.min(axis=0), np.sort(D, axis=0)[1]
+                keep = (bv < cfg.inlier_thres) & (sv > cfg.ambiguous_band * bv)
+                refined = [allp[keep & (best == k)] for k in range(2)]
+                n0 = len(groups[0])
+                self.refine_moved = getattr(self, "refine_moved", 0) + int(
+                    (best[:n0] == 1).sum() + (best[n0:] == 0).sum())
+                self.refine_dropped = getattr(self, "refine_dropped", 0) + int((~keep).sum())
+                if min(len(g) for g in refined) < cfg.min_part_pts:
+                    self.refine_blocked = getattr(self, "refine_blocked", 0) + 1
+                    return False
+                groups = refined
+                motions = []
+                for g in groups:
+                    c = self.reg._RANSAC(p0=self.anchor_xyz[g], tgt_pcd=cur[g],
+                                         w=None, remaining=np.ones(len(g), bool),
+                                         init_pose=None)
+                    motions.append(np.asarray(c["T"]) if c is not None else part.pose)
             ss = self._sep_sigma(groups, motions, part)
             big, rot_d, tr_m = self._joint_sized(motions, groups)
             if not big:
                 self.small_blocked = getattr(self, "small_blocked", 0) + 1
+                self._split_refusal("coassoc", "too_small", groups, motions, part, ss=ss)
             if ss < cfg.split_sep_sigma:
                 self.sep_blocked = getattr(self, "sep_blocked", 0) + 1
+                self._split_refusal("coassoc", "not_separated", groups, motions, part, ss=ss)
             if ss >= cfg.split_sep_sigma and big:
                 if cfg.cohort_veto and self._cohort_split(groups):
                     self.cohort_blocked = getattr(self, "cohort_blocked", 0) + 1
+                    self._split_refusal("coassoc", "cohort", groups, motions, part, ss=ss)
                     return False
                 ok, dbic = ((True, float("nan")) if not cfg.split_bic
                             else self._bic_split(part, sel, groups, motions, cur))
                 if ok:
-                    return self._accept(j, part, groups, motions, cur, cur_ok,
-                                        "coassoc", gap, None, ss, dbic)
+                    n_before = len(self.split_diag) if getattr(self, "split_diag", None) is not None else 0
+                    acc = self._accept(j, part, groups, motions, cur, cur_ok,
+                                       "coassoc", gap, None, ss, dbic)
+                    if not acc:
+                        self._split_refusal("coassoc", "reprojection_gate", groups, motions, part, ss=ss)
+                    return acc
                 self.bic_blocked = getattr(self, "bic_blocked", 0) + 1
+                self._split_refusal("coassoc", "bic", groups, motions, part, ss=ss, dbic=float(dbic))
 
         if cfg.persist and (not cfg.frame_fallback
                             or part.over < cfg.frame_after * cfg.split_frames):
@@ -2002,6 +2072,14 @@ class NaivePartTracker:
         groups = [sel[keep & (best == k)] for k in range(2)]
         if min(len(g) for g in groups) < cfg.min_part_pts:
             return False
+        if cfg.split_sep_per_child:
+            # the pooled test above ran before the points were partitioned;
+            # now each child has to clear it on its own points
+            ss = self._sep_sigma(groups, motions, part)
+            if ss < cfg.split_sep_sigma:
+                self.sep_blocked = getattr(self, "sep_blocked", 0) + 1
+                self._split_refusal("frame", "not_separated_per_child", groups, motions, part, ss=ss)
+                return False
         # splitting must explain the points better than the one body did
         before = float(np.median(np.linalg.norm(
             self.anchor_xyz[sel] @ part.pose[:3, :3].T + part.pose[:3, 3]
@@ -2009,18 +2087,24 @@ class NaivePartTracker:
         after = float(np.median(np.concatenate(
             [D[k][keep & (best == k)] for k in range(2)])))
         if before > 1e-6 and after > cfg.split_gain * before:
+            self._split_refusal("frame", "no_gain", groups, motions, part, ss=ss)
             return False
         if cfg.cohort_veto and self._cohort_split(groups):
             self.cohort_blocked = getattr(self, "cohort_blocked", 0) + 1
+            self._split_refusal("frame", "cohort", groups, motions, part, ss=ss)
             return False
         dbic = float("nan")
         if cfg.split_bic:
             ok, dbic = self._bic_split(part, sel, groups, motions, cur)
             if not ok:
                 self.bic_blocked = getattr(self, "bic_blocked", 0) + 1
+                self._split_refusal("frame", "bic", groups, motions, part, ss=ss, dbic=float(dbic))
                 return False
-        return self._accept(j, part, groups, motions, cur, cur_ok, "frame",
-                            float("nan"), keep, ss, dbic)
+        acc = self._accept(j, part, groups, motions, cur, cur_ok, "frame",
+                           float("nan"), keep, ss, dbic)
+        if not acc:
+            self._split_refusal("frame", "reprojection_gate", groups, motions, part, ss=ss)
+        return acc
 
     def _validate_split_reprojection(self, j, part, groups, motions, _live_fallback=False):
         """Test sparse-motion proposals against stored geometry and current RGB-D."""
@@ -2304,6 +2388,35 @@ class NaivePartTracker:
         if self.cfg.split_reprojection and not self._validate_split_reprojection(j, part, groups, motions):
             self.reprojection_blocked = getattr(self, "reprojection_blocked", 0) + 1
             return False
+        # diagnostics (no behaviour): is each child ONE rigid group, or a
+        # mixture? Under its own motion a pure child's points all fit; under
+        # the other child's motion they do not. A point that fits the other
+        # motion better is a point that belongs to the other body -- the
+        # signature of a partition that Stage B's affinity clustering got
+        # wrong, which then becomes a part born with a compromise anchor pose.
+        if getattr(self, "split_diag", None) is not None:
+            D = np.stack([np.linalg.norm(
+                self.anchor_xyz[np.concatenate(groups)] @ T[:3, :3].T + T[:3, 3]
+                - cur[np.concatenate(groups)], axis=1) for T in motions])
+            off = 0
+            rows = []
+            for k, g in enumerate(groups):
+                n = len(g)
+                own, oth = D[k, off:off + n], D[1 - k, off:off + n]
+                off += n
+                rows.append({"n": int(n), "idx": [int(x) for x in g],
+                             "own_med_mm": float(1000 * np.median(own)),
+                             "oth_med_mm": float(1000 * np.median(oth)),
+                             "own_inlier_frac": float((own < self.cfg.inlier_thres).mean()),
+                             "prefers_other_frac": float((oth < own).mean()),
+                             "prefers_other_clear_frac": float(
+                                 (oth < own / max(self.cfg.ambiguous_band, 1.0)).mean()),
+                             "own_mm": [float(1000 * x) for x in own],
+                             "oth_mm": [float(1000 * x) for x in oth]})
+            self.split_diag.append({"frame": int(self.n - 1), "via": via,
+                                    "parent_part_id": int(part.part_id),
+                                    "sigma_mm": float(1000 * part.sigma),
+                                    "children": rows})
         order = np.argsort([-len(g) for g in groups])
         # born counts in self.n, which the settle gate compares against;
         # birth counts in the frame index hist and _merge_rigid use

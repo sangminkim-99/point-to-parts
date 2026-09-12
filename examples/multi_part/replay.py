@@ -141,6 +141,12 @@ def main():
                          "it (NaivePart.hist, INCLUDING retro back-fill from before the "
                          "part was born), keyed by part_id, frames mapped to reader "
                          "indices; input to examples.multi_part.kinematic_graph --hist")
+    ap.add_argument("--dump-split-diag", default=None,
+                    help="json of every ACCEPTED split's children: per point the "
+                         "residual under its own and the other child's motion, "
+                         "plus (when GT is on) the GT label of every track, so the "
+                         "purity of the partition at birth can be read offline. "
+                         "Default off; diagnostics only")
     ap.add_argument("--dump-surface", default=None,
                     help="json of dense surface-ownership provenance: per split "
                          "the held/assigned counts and seed distances, per carve "
@@ -368,6 +374,8 @@ def main():
             s = _ReferenceReplayTracker(r.K, ncfg, tracker, reg)
         else:
             s = NaivePartTracker(r.K, ncfg, tracker, reg)
+        if args.dump_split_diag:
+            s.split_diag = []       # opt in to split-partition diagnostics
         if args.dump_surface:
             s.surface_log = []      # opt in to dense ownership provenance
         if args.dump_split_reproj:
@@ -584,6 +592,10 @@ def main():
                   f"had not been seen together often enough to group")
             for k, v in getattr(s, "co_why", {}).most_common():
                 print(f"[replay]     {v:4d} x {k}")
+        if getattr(s, "refine_blocked", 0) or getattr(s, "refine_moved", 0) or getattr(s, "refine_dropped", 0):
+            print(f"[replay] coassoc refinement: {getattr(s, 'refine_moved', 0)} points re-assigned, "
+                  f"{getattr(s, 'refine_dropped', 0)} dropped as ambiguous, "
+                  f"{getattr(s, 'refine_blocked', 0)} proposals refused (a child fell under min_part_pts)")
         if getattr(s, "sep_blocked", 0):
             print(f"[replay] {s.sep_blocked} splits refused: the two groups' "
                   f"motions were not separated above the noise")
@@ -622,6 +634,17 @@ def main():
                   f"({summary['ids_born']} ids born, {summary['ids_died']} "
                   f"died, {u['total']} merge verdicts reached on evidence the "
                   f"part had not earned: {u['merged']} merged, {u['kept']} kept)")
+        if args.dump_split_diag and getattr(s, "split_diag", None) is not None:
+            import json
+            out = {"splits": s.split_diag,
+                   "gt_parts": (list(gt["parts"]) if gt is not None else None),
+                   "gt_lab": ([int(x) for x in gt["lab"]] if gt is not None else None),
+                   "inlier_thres": float(cfg.inlier_thres),
+                   "ambiguous_band": float(cfg.ambiguous_band)}
+            Path(args.dump_split_diag).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.dump_split_diag, "w") as fh:
+                json.dump(out, fh, allow_nan=False)
+            print(f"[replay] split diagnostics -> {args.dump_split_diag} ({len(s.split_diag)} splits)")
         if args.dump_hist:
             # hist frames are processed-frame indices (self.n - 1); `frames` is
             # the reader index of each processed frame in order, so hist n maps

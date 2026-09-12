@@ -34,6 +34,7 @@ priority order: `doc/demo_checkpoint_20260911.md`.
 | Validation worktrees under `.claude/worktrees/` (14) | removed 2026-09-11; each one's uncommitted state is a "Snapshot uncommitted worktree state" commit on its own branch (`worktree-articulation-demo`, `wt-articulation-probation`, `frozen-*`, `gate-min-integration`, `growth-ablation`, `jm-rerun`, `kf-baseline-val`, `orphan-snapshot`, `relock-guard-val`, `turnover-diag`, `ikea-idrerun`) |
 | Pairwise relative-motion kinematic graph (offline tool, matched measurement) | done 2026-09-12, `doc/kinematic_graph_discovery.md`: ikea both joints found once each (star: 1+duplicate), parents 1/2 (root=spread) or 2/2 (root=degree) vs star 0/2; cardboard degree-root fails 0/2; duplicate bodies are the upstream blocker |
 | Staggered chain-ambiguity sim controls (`--stagger`) | rendered; tracker splits only one of two children (cohort + contradiction gate) — open |
+| Duplicate bodies (`doc/split_partition_purity.md`) | diagnosed as mixture births; `split_refine_coassoc` (off) fixes cardboard 3→2 parts and ikea body pose 17.8→5.6 mm; ikea duplicates were a contradiction-gate artefact — under `residual_veto` base is 3/3; refine + pairwise graph = both ikea parents correct (2/2) |
 | `test/object` | 175 passing |
 
 ## Next
