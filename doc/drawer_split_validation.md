@@ -63,3 +63,22 @@ Requested replay through the actual ReferenceTracker demo path, because ordinary
 NaivePartTracker replay can choose a different root and change the outcome.
 Required next controls include a second complete capture and a hinge, in addition
 to existing rigid and simulated drawer controls. Worker is implementing fixes.
+
+## September 10, 15:44 — integration review
+
+V2 worker fixed same-frame/partition persistence and uses paired residuals.
+Its union with the original contradiction branch retains the hinge control but
+permits a late third group in the real drawer. Worker diagnosis assigns that
+group to a small body subset moving differently from the drawer. This is not
+proof of a third physical part. A proposed pose-or-direction sibling guard is
+not accepted: parallel independently moving drawers can share direction.
+Requested a minimal opt-in patch without that guard and without unrelated
+probation changes, plus clean-HEAD validation and an explicit experimental config.
+
+Gaussian diagnostic UI review found that reference freshness was based on any
+observed part, observed RGB was passed an annotated overlay, and a proposed
+support fraction counted background valid depth without residual agreement.
+Requested corrections and an actual GPU smoke test before integration. The
+per-part nearest-depth image must be labeled approximate compositing, not a
+globally alpha-composited Gaussian render. Show stale frames and render errors.
+No new code defaults or claimed performance improvement promoted in this review.

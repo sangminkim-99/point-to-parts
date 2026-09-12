@@ -223,3 +223,10 @@ do not call this MotionGen integration or continuous joint-space certification.
    diagnostic is `scripts/sim/diagnose_recovery.py`.
 5. Keep matched ablations and negative results. Commit/push tested checkpoints,
    leave larger data local, and report meaningful progress in Korean.
+
+
+User-approved future architecture: pairwise relative-motion joint discovery,
+then graph selection; root chosen only for representation/view/URDF. Explicit
+reference selection is temporary, not a required input to joint discovery.
+See the 2026-09-10 relative-motion follow-up in doc/agent_dialogue.md. Preserve
+today's demo and ongoing probation controls; implement separately afterward.

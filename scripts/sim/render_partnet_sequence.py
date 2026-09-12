@@ -137,6 +137,10 @@ def main():
     ap.add_argument("--view-elevations", default="15,30,45")
     ap.add_argument("--camera-orbit", type=float, default=0.0,
                     help="degrees of camera travel over the sequence (0 = static)")
+    ap.add_argument("--object-yaw", type=float, default=0.0,
+                    help="whole-object rotation in degrees, around its bounding-box centre")
+    ap.add_argument("--object-translation", type=float, default=0.0,
+                    help="whole-object world-x travel in metres; independent of articulation")
     ap.add_argument("--camera-azimuth", type=float, default=0.0)
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--motion-parts", action="store_true",
@@ -329,6 +333,13 @@ def main():
     pixel_reprojection_errors = []
 
     for t in range(args.frames):
+        frac = t / max(1, args.frames - 1)
+        theta = np.radians(args.object_yaw) * frac
+        R = np.array([[np.cos(theta), -np.sin(theta), 0.],
+                      [np.sin(theta), np.cos(theta), 0.], [0., 0., 1.]])
+        art.set_root_pose(sapien.Pose(
+            p=centre + R @ (root - centre) + [args.object_translation * frac, 0., 0.],
+            q=[np.cos(theta / 2), 0., 0., np.sin(theta / 2)]))
         art.set_qpos(Q[t])
         if not np.allclose(art.get_qpos(), Q[t], atol=1e-6):
             raise RuntimeError("simulator joint state differs from scripted GT")
@@ -412,6 +423,8 @@ def main():
         "joint_range": args.joint_range,
         "open_frac": args.open_frac,
         "camera_orbit_deg": args.camera_orbit,
+        "object_yaw_deg": args.object_yaw,
+        "object_translation_m": args.object_translation,
         "camera_azimuth_deg": float(args.camera_azimuth),
         "camera_elevation_deg": float(args.elevation),
         "static_prefix": args.static_prefix,
