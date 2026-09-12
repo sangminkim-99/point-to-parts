@@ -35,16 +35,20 @@ priority order: `doc/demo_checkpoint_20260911.md`.
 | Pairwise relative-motion kinematic graph (offline tool, matched measurement) | done 2026-09-12, `doc/kinematic_graph_discovery.md`: ikea both joints found once each (star: 1+duplicate), parents 1/2 (root=spread) or 2/2 (root=degree) vs star 0/2; cardboard degree-root fails 0/2; duplicate bodies are the upstream blocker |
 | Staggered chain-ambiguity sim controls (`--stagger`) | rendered; tracker splits only one of two children (cohort + contradiction gate) — open |
 | Duplicate bodies (`doc/split_partition_purity.md`) | diagnosed as mixture births; `split_refine_coassoc` (off) fixes cardboard 3→2 parts and ikea body pose 17.8→5.6 mm; ikea duplicates were a contradiction-gate artefact — under `residual_veto` base is 3/3; refine + pairwise graph = both ikea parents correct (2/2) |
-| `test/object` | 175 passing |
+| `joint_graph` (default off, in-tracker pairwise tree) | done 2026-09-12: ikea parents 0/1 → 1/1, fb 5-part 0/2+dup → 1/0 no dup, sims identical, +2 ms; root still a drawer → only one spec joint scored |
+| `test/object` | 183 passing |
 
 ## Next
 
 Order set by `doc/demo_checkpoint_20260911.md`:
 
-1. ikeasmall02 parent graph: 5 parts vs 3 GT, two joint rows on rb2, both
-   parents wrong. Correct the kinematic graph before adding any more gates.
-   Candidate route: pairwise relative-motion joint discovery (user-approved,
-   see the 09-10 relative-motion dialogue entry).
+1. ~~ikeasmall02 parent graph~~ done as opt-ins (`residual_veto` gate +
+   `split_refine_coassoc` + `joint_graph`): 3/3 parts, tree edges correct,
+   parents correct wherever a joint is scored. Open follow-ups: (a) split
+   discovery under staggered motion — door_drawer/two_drawers split only one
+   child (`co_min_seen`); (b) the evaluator scores root-children, so a drawer
+   root hides one spec joint — score undirected tree edges instead; (c) the
+   same matched table on take01/lift01 and the other RBO objects.
 2. URDF export defect 2 from `doc/urdf_export_audit.md`: `model.npz` poses
    and the URDF chain disagree by the joint-fit residual (up to ~5 deg /
    40 mm) with no test that can catch it. Add the test and disclose the bound

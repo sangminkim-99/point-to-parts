@@ -1546,3 +1546,24 @@ VERDICT: refine = supported (fixes cardboard, helps ikea, no-op on sims);
 per-child = correct diagnosis, no measured benefit, not promoted. The ikea
 duplicate was a gate artefact. Not done: take01/lift01 and other RBO objects;
 door_drawer/two_drawers still one child (co_min_seen).
+
+## 2026-09-12 — Claude: `joint_graph` (default off) in the tracker — parents correct on ikea, no runtime cost
+
+`NaiveConfig.joint_graph`: pairwise fits on `hist` inside `_reparent`, MST on
+BIC/obs, oriented from `_pick_root`, joints rebuilt against tree parents;
+recomputed every 10 frames + at splits, cached by part_id. `_rebuild_joint`
+now rebuilds against `p.parent` (was: always root). Tests test_joint_graph.py
+(4); test/object 183. Evaluator fix: mocap reference forced to spec type for
+prismatic (rb2 vs its true parent rb0 fitted as revolute -> 82deg on a
+correct estimate; never visible while the star compared against rb1).
+
+ikea residual_veto+refine: star parents 0/1 -> graph 1/1 (rb2 8.4deg vs rb0);
+with reroot=true (root becomes p1=rb2) star 0/1 -> graph 1/1 (rb1 10.5deg).
+fb 5-part run: 0/2 + duplicate row -> 1/0, no duplicate row. cardboard, laptop,
+slide identical (2-part trees are trivial). Per-frame median within 2 ms.
+Tree at f238: (p0,p2) 5.8, (p2,p1) 8.1 — both drawers on the body.
+
+REMAINING: root. index 0 and least-spread both pick a DRAWER on ikea, so only
+one spec joint gets a scored row. The evaluator scores root-children; the
+user's framing says score undirected edges. Next: (3) split discovery under
+staggered motion (door_drawer/two_drawers one child), then edge-based scoring.

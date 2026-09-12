@@ -212,6 +212,18 @@ class NaiveConfig:
     root_window: int = 90          # shared frames the spread is read over
     root_margin: float = 0.6       # a new base must be this much stiller
     reroot: bool = False           # pick the base from the poses, not index 0
+    # Kinematic tree from pairwise relative motion (default OFF). The default
+    # topology is a STAR: every part's joint is measured against the root, so
+    # on a cabinet whose root is a drawer every parent is wrong even when the
+    # axis is exact (ikeasmall02: parents 0/2). With this on, every pair of
+    # parts is fitted on its shared history -- T_ij = inv(T_i) T_j, whole-object
+    # motion cancels -- and the minimum-cost spanning tree over the articulated
+    # pairs (BIC per observation) is the topology; the root stays whatever
+    # _pick_root says and only orients the tree. Measured offline first
+    # (doc/kinematic_graph_discovery.md, doc/split_partition_purity.md).
+    joint_graph: bool = False
+    joint_graph_every: int = 10      # frames between tree recomputations
+    joint_graph_min_obs: int = 12    # shared history a pair needs to be an edge
     mask_jump: float = 0.15        # metres behind the local surface; 0 = slope rule
     mask_slope_deg: float = 85.0   # steepest surface kept, when mask_jump is 0
     reseed_points: int = 24             # how many to add each time
@@ -548,6 +560,9 @@ class NaivePartTracker:
                     break
 
         if cfg.reroot and len(self.parts) > 1:
+            self._reparent()
+        elif cfg.joint_graph and len(self.parts) > 2 \
+                and self.n - getattr(self, "_graph_at", -10 ** 9) >= cfg.joint_graph_every:
             self._reparent()
         for j, p in enumerate(self.parts):
             if p.joint is None or j == p.parent or p.parent >= len(self.parts):
@@ -1691,13 +1706,115 @@ class NaivePartTracker:
         """
         r = self._pick_root()
         self.root = r
+        parents = [r] * len(self.parts)
+        if self.cfg.joint_graph and len(self.parts) > 2:
+            parents = self._graph_parents(r)
         for k, p in enumerate(self.parts):
-            was, p.parent = getattr(p, "parent", 0), r
+            was, p.parent = getattr(p, "parent", 0), parents[k]
             if k == r:
                 p.joint = None          # the base has nothing to hinge on
-            elif p.joint is None or was != r:
+            elif p.joint is None or was != p.parent:
                 p.joint = self._new_joint()
                 self._rebuild_joint(k)
+
+    def _pair_history(self, a, b):
+        """[(frame, inv(T_a) @ T_b)] on frames both parts trusted, as _rebuild_joint gates them."""
+        g = self.cfg.joint_gate
+        pa = {n: T for n, T, r in (a.hist or []) if r is None or r < g}
+        out = []
+        for n, T, r in (b.hist or []):
+            if (r is None or r < g) and n in pa:
+                out.append((n, np.linalg.inv(pa[n]) @ T))
+        return out
+
+    def _pair_cost(self, ka, kb):
+        """Per-observation BIC of the best articulated model for one part pair,
+        fitted the way the live joint is (same sigma, rotation floor, geometry
+        and priors), or None when the pair has too little shared history or
+        is best explained as rigid / disconnected."""
+        a, b = self.parts[ka], self.parts[kb]
+        rel = self._pair_history(a, b)
+        if len(rel) < self.cfg.joint_graph_min_obs:
+            return None
+        jm = self._new_joint()
+        jm.min_obs = min(jm.min_obs, self.cfg.joint_graph_min_obs)
+        jm.sigma = max(a.sigma, b.sigma)
+        jm.sigma_r_floor = max(self._rot_floor(a), self._rot_floor(b))
+        def pts(q):
+            idx = q.idx[q.idx < len(self.anchor_xyz)]
+            idx = idx[self.anchor_ok[idx]]
+            if idx.size > 300:
+                idx = idx[np.linspace(0, idx.size - 1, 300).astype(int)]
+            return self.anchor_xyz[idx]
+        pa, pb = pts(a), pts(b)
+        if pa.shape[0] >= 3 and pb.shape[0] >= 3:
+            A0 = rel[0][1]
+            jm.geom = np.concatenate([pa, pb @ A0[:3, :3].T + A0[:3, 3]]).astype(np.float64)
+        for _, A in rel:
+            jm.add(A)
+        if not jm.fit() or jm.kind not in ("revolute", "prismatic"):
+            return None
+        return float(min(jm.bic.values())) / len(jm.A), jm.kind, len(jm.A)
+
+    def _graph_parents(self, r):
+        """Parent index per part: minimum-cost spanning tree over the pairwise
+        articulated fits, oriented away from root `r`. Pairs with no usable
+        fit are not edges; a part the tree cannot reach keeps the star (root
+        as parent), so the result is always a tree containing r.
+
+        Recomputed at most every joint_graph_every frames; between
+        recomputations the last tree is reused by part_id, because a split
+        renumbers indices."""
+        n = len(self.parts)
+        ids = [p.part_id for p in self.parts]
+        cache = getattr(self, "_graph_cache", None)
+        due = self.n - getattr(self, "_graph_at", -10 ** 9) >= self.cfg.joint_graph_every
+        if cache is not None and not due and set(cache) == set(ids):
+            par_id = cache
+        else:
+            edges = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    c = self._pair_cost(i, j)
+                    if c is not None:
+                        edges.append((c[0], i, j, c[1], c[2]))
+            edges.sort()
+            comp = list(range(n))
+            def find(x):
+                while comp[x] != x:
+                    comp[x] = comp[comp[x]]
+                    x = comp[x]
+                return x
+            adj = {i: [] for i in range(n)}
+            chosen = []
+            for cost, i, j, kind, m in edges:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    comp[max(ri, rj)] = min(ri, rj)
+                    adj[i].append(j); adj[j].append(i)
+                    chosen.append((ids[i], ids[j], kind, round(cost, 2), m))
+            parent = {r: None}
+            stack = [r]
+            while stack:
+                u = stack.pop()
+                for v in adj[u]:
+                    if v not in parent:
+                        parent[v] = u
+                        stack.append(v)
+            par_id = {ids[k]: (ids[parent[k]] if k in parent and parent[k] is not None else ids[r])
+                      for k in range(n)}
+            par_id[ids[r]] = None
+            self._graph_cache = par_id
+            self._graph_at = self.n
+            self.graph_log = getattr(self, "graph_log", [])
+            self.graph_log.append({"frame": int(self.n - 1), "root": int(ids[r]),
+                                   "edges": chosen, "parents": {int(k): (int(v) if v is not None else None)
+                                                               for k, v in par_id.items()}})
+            print(f"[graph] f{self.n - 1} tree root p{ids[r]}: "
+                  + ", ".join(f"p{k}->p{v}" for k, v in par_id.items() if v is not None)
+                  + f"  (edges {[(a, b, kd, c) for a, b, kd, c, _ in chosen]})")
+        by_id = {pid: k for k, pid in enumerate(ids)}
+        return [r if par_id.get(pid) is None else by_id.get(par_id[pid], r) for pid in ids]
 
     def _joint_add(self, p, A, frame, source):
         """Append a relative pose and remember where it came from.
@@ -1780,7 +1897,8 @@ class NaivePartTracker:
 
     def _rebuild_joint(self, k):
         """Fill a joint from the two parts' own histories, on shared frames."""
-        p, par = self.parts[k], self.parts[self.root]
+        p = self.parts[k]
+        par = self.parts[p.parent if p.parent < len(self.parts) else self.root]
         # a rebuild replaces the whole stack, so provenance goes with it
         p.obs_prov = []
         if not p.hist or not par.hist:

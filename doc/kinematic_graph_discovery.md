@@ -169,3 +169,37 @@ version (next step) will run in `_reparent` on `hist`.
   tracking is the bottleneck now visible (ikea p2/p4). Track that separately.
 - Keep `--root spread` reportable: it is the failure mode the user described
   (a moving/badly tracked "stillest" part), and it is measurable per sequence.
+
+## In-tracker `joint_graph` (default off) — measured 2026-09-12
+
+`NaiveConfig.joint_graph` runs the same pairwise fit inside
+`NaivePartTracker._reparent` on `NaivePart.hist` (retro included, `joint_gate`
+applied, live conditioning: max sigma, max rotation floor, `_joint_geom`-style
+geometry), takes the minimum-cost spanning tree over articulated pairs (BIC per
+observation), orients it from whatever `_pick_root` returns, sets `p.parent`
+from the tree and rebuilds each joint against that parent. Recomputed every
+`joint_graph_every` (10) frames and at splits; cached by part_id in between.
+Parts the tree cannot reach keep the star. Tests: `test_joint_graph.py` (4);
+`test/object` 183. Artifacts: `results/joint_graph_v1/`.
+
+The evaluator's mocap reference fit is now forced to the spec type for
+prismatic joints (`evaluate.py`): against the TRUE parent rb0 the mocap
+rb2 trace fitted as a huge revolute arc and scored a correct prismatic
+estimate at 82°; this was invisible before because the star only ever
+compared against the wrong parent.
+
+| case (gate) | star: parents, axis | graph: parents, axis | per-frame ms (star → graph) |
+| --- | --- | --- | --- |
+| ikeasmall02 (residual_veto + refine, root = index 0 = rb1) | 0/1, rb2 1.7° vs wrong parent | **1/1**, rb2 8.4° vs rb0 | 88.5 → 90.7 median, 146 → 171 p90 |
+| ikeasmall02 (same, `reroot=true` → root p1 = rb2) | 0/1, rb1 1.3° vs wrong parent | **1/1**, rb1 10.5° vs rb0 | 90.9 → 89.8 |
+| ikeasmall02 (frozen_fallback, 5 parts) | 0/2 + 1 duplicate row | **1/0**, no duplicate row (p1→p3 same body), rb2 19.8° | 140.8 → 138.0 |
+| cardboardbox01 (residual_veto + refine) | 1/1, 5.7° | 1/1, 5.7° (2 parts: trivial tree) | 117.5 → 118.1 |
+| laptop_hinge, storage_slide | 1/1 | identical | ≤ 4 ms difference |
+
+Tree on ikea at f238: `(p0,p2) prismatic 5.8`, `(p2,p1) prismatic 8.1` —
+both drawers on the body, the drawer–drawer pair never chosen. What remains
+is the root: index 0 and least-spread both pick a drawer on this sequence, so
+only one of the two spec joints ever gets a scored row (the root has no
+joint). The undirected topology is right under both; the user's framing
+(root = representation) is what the evaluator now needs to reflect — score
+edges, not root-children.

@@ -140,6 +140,14 @@ def joint_metrics(reader, parts_gt, stream, rows, log, ids_by_frame=None):
         if chi not in gt_type:
             continue
         ref = JointModel()
+        if gt_type.get(chi) == "prismatic":
+            # Sturm's degeneracy runs both ways: the mocap trace of a drawer is
+            # also a huge revolute arc, and with a few cm of mocap noise the
+            # revolute reading won the reference fit for rb2 against its TRUE
+            # parent rb0 (typed "mocap revolute", 82 deg axis error against a
+            # correct prismatic estimate). The spec declares the type; the
+            # reference is only asked for the axis, so do not offer revolute.
+            ref.min_angle = np.pi
         for i, _ in log:
             Tp, Tc = reader.get_gt_pose(i, par), reader.get_gt_pose(i, chi)
             if Tp is None or Tc is None or not np.all(np.isfinite(Tp)) \
