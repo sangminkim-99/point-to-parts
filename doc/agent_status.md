@@ -31,7 +31,7 @@ priority order: `doc/demo_checkpoint_20260911.md`.
 | Demo worker outputs (thin-slab turnover control, growth/appearance probes, URDF audit) | integrated `9bd148b` |
 | Lifecycle ledgers + `merge_probation` (default off) + diagnostics dumps + matched runner | integrated `bec3faf`; runner reproduces `doc/newborn_part_probation.md` |
 | Split-time consistency guard (`split_reprojection_consistency`) | **rejected** by the 09-10 15:44 review; not integrated |
-| Validation worktrees under `.claude/worktrees/` (14) | dirty state to be snapshot-committed to their branches, then removed |
+| Validation worktrees under `.claude/worktrees/` (14) | removed 2026-09-11; each one's uncommitted state is a "Snapshot uncommitted worktree state" commit on its own branch (`worktree-articulation-demo`, `wt-articulation-probation`, `frozen-*`, `gate-min-integration`, `growth-ablation`, `jm-rerun`, `kf-baseline-val`, `orphan-snapshot`, `relock-guard-val`, `turnover-diag`, `ikea-idrerun`) |
 | `test/object` | 175 passing |
 
 ## Next
