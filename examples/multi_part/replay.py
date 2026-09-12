@@ -136,6 +136,11 @@ def main():
                     help="json of per-part_id birth/death/coverage and every "
                          "merge decision; the only machine-readable survival "
                          "record, and unlike --trace-out it needs no GT")
+    ap.add_argument("--dump-hist", default=None,
+                    help="npz of every live part's pose history as the tracker holds "
+                         "it (NaivePart.hist, INCLUDING retro back-fill from before the "
+                         "part was born), keyed by part_id, frames mapped to reader "
+                         "indices; input to examples.multi_part.kinematic_graph --hist")
     ap.add_argument("--dump-surface", default=None,
                     help="json of dense surface-ownership provenance: per split "
                          "the held/assigned counts and seed distances, per carve "
@@ -617,6 +622,32 @@ def main():
                   f"({summary['ids_born']} ids born, {summary['ids_died']} "
                   f"died, {u['total']} merge verdicts reached on evidence the "
                   f"part had not earned: {u['merged']} merged, {u['kept']} kept)")
+        if args.dump_hist:
+            # hist frames are processed-frame indices (self.n - 1); `frames` is
+            # the reader index of each processed frame in order, so hist n maps
+            # to frames[n]. Deleted identities carry no hist and are absent.
+            d = {"part_ids": np.array([p.part_id for p in s.parts]),
+                 "processed_to_reader": np.array(frames, dtype=int)}
+            for p in s.parts:
+                h = p.hist or []
+                d[f"frames_{p.part_id}"] = np.array([frames[n] for n, _, _ in h if n < len(frames)], dtype=int)
+                d[f"poses_{p.part_id}"] = np.stack([T for n, T, _ in h if n < len(frames)]) if h else np.zeros((0, 4, 4))
+                d[f"resid_{p.part_id}"] = np.array([np.nan if r is None else r for n, _, r in h if n < len(frames)])
+                # what the tracker's joint fit is conditioned on besides the poses:
+                # the part's anchor points (its own frame), its fit noise and its
+                # rotation floor -- so an offline pairwise fit can be built the way
+                # _joint_geom / sigma / sigma_r_floor build the live one
+                idx = p.idx[p.idx < len(s.anchor_xyz)]
+                idx = idx[s.anchor_ok[idx]]
+                if idx.size > 300:
+                    idx = idx[np.linspace(0, idx.size - 1, 300).astype(int)]
+                d[f"points_{p.part_id}"] = s.anchor_xyz[idx].astype(np.float64)
+                d[f"sigma_{p.part_id}"] = float(p.sigma)
+                d[f"rot_floor_{p.part_id}"] = float(s._rot_floor(p))
+            Path(args.dump_hist).parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(args.dump_hist, **d)
+            print(f"[replay] part histories -> {args.dump_hist} "
+                  f"({', '.join(f'p{p.part_id}:{len(p.hist or [])}' for p in s.parts)})")
         if args.dump_surface and getattr(s, "surface_log", None) is not None:
             import json
             splits = [e for e in s.surface_log if e["event"] == "split"]

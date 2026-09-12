@@ -147,6 +147,11 @@ def main():
                     help="GT parts are rigid motion groups, merging fixed/unexcited joints")
     ap.add_argument("--active-joints", default=None,
                     help="comma-separated movable joint names; others stay at their start state")
+    ap.add_argument("--stagger", action="store_true",
+                    help="active joints move one after another (each in its own "
+                         "sub-window of the moving phase) instead of together; the "
+                         "chain-ambiguity control: two children of one body never "
+                         "move at the same time, so their RELATIVE motion is 2-DoF")
     ap.add_argument("--static-prefix", type=float, default=0.2,
                     help="fraction of the sequence with no articulation")
     ap.add_argument("--open-frac", type=float, default=0.5)
@@ -312,6 +317,27 @@ def main():
         Q.append(joint_trajectory(args.frames, lo, hi, args.static_prefix,
                                   args.open_frac, args.motion if j.get_name() in active else "static"))
     Q = np.stack(Q, axis=1)                                   # (T, J)
+    if args.stagger and args.motion != "static":
+        # Re-script the active joints one after another. The moving phase is
+        # the frames after the static prefix (mirrored at the end, as
+        # joint_trajectory does); it is cut into one equal segment per active
+        # joint, and joint k runs its whole trajectory inside segment k while
+        # every other joint holds. Motion range and mode are unchanged, only
+        # the timing, so per-joint travel matches the simultaneous script.
+        order = [k for k, j in enumerate(joints) if j.get_name() in active]
+        a = int(args.frames * args.static_prefix)
+        seg = (args.frames - 2 * a) // max(1, len(order))
+        if seg < 8:
+            ap.error("too few frames to stagger the active joints")
+        for m, k in enumerate(order):
+            lo_k, hi_k = Q[:, k].min(), Q[:, k].max()
+            local = joint_trajectory(seg, lo_k, hi_k, 0.0, args.open_frac, args.motion)
+            q = np.full(args.frames, lo_k)
+            q[a + m * seg:a + (m + 1) * seg] = local
+            q[a + (m + 1) * seg:] = local[-1]
+            Q[:, k] = q
+        print(f"[sim] stagger: {len(order)} active joints, {seg} frames each, "
+              f"starting at frames {[a + m * seg for m in range(len(order))]}")
 
     moving = {j.get_name() for k, j in enumerate(joints) if np.ptp(Q[:, k]) > 1e-7}
     relations = [(j.get_name(), j.get_parent_link().get_name(), j.get_child_link().get_name())
@@ -425,6 +451,7 @@ def main():
         "camera_orbit_deg": args.camera_orbit,
         "object_yaw_deg": args.object_yaw,
         "object_translation_m": args.object_translation,
+        "stagger": bool(args.stagger),
         "camera_azimuth_deg": float(args.camera_azimuth),
         "camera_elevation_deg": float(args.elevation),
         "static_prefix": args.static_prefix,

@@ -1469,3 +1469,43 @@ stride 1 (the runner sets it). At stride 2 laptop_hinge never splits under
 reprojection_split.yaml, which is a different result, not a regression.
 Also: in zsh `env $VAR python ...` does not word-split; gsplat then loads
 with a wrong CUDA_HOME and dies with the known 'NoneType ... CameraModelType'.
+
+## 2026-09-12 — Claude: pairwise relative-motion kinematic graph — first matched measurement
+
+Offline tool `examples/multi_part/kinematic_graph.py` (+ `replay --dump-hist`,
+renderer `--stagger`); nothing changed in the tracker. Full report
+`doc/kinematic_graph_discovery.md`; artifacts `results/kinematic_graph_v1/`.
+
+METHOD: T_ij = inv(T_i) T_j on shared frames of every part pair, fitted with
+JointModel under the tracker's exact conditioning (sigma/rot-floor/geom from
+the dumped anchor points) on the tracker's own `hist` (retro included) — the
+live trace alone does NOT reproduce the tracker (a part split after its joint
+stopped has no motion in the trace; 74deg-off revolute vs the tracker's 13.5deg
+prismatic). Bodies via rigid pairs (never fired), Kruskal MST on BIC/obs, root
+afterwards (spread = tracker rule, or degree).
+
+IKEA (the target failure): star-root 0/2 parents, 1 unique joint + 1
+duplicate. Pairwise: body-drawer pairs cost 35/37 per obs, drawer-drawer 66,
+so the chain ambiguity resolves; BOTH spec joints found once each. Parents
+1/2 with root=spread (the drawer p0 is still the stillest), 2/2 with
+root=degree. Axis vs mocap 21/39deg — WORSE than the star's 0.5/2.3deg, which
+were measured against the wrong (still) parent; against the right parent the
+axis inherits body-part tracking error (p2 drifts to 37mm, p4's retro hist
+0.8m spread). Correct topology exposes the body-tracking problem.
+
+CONTROLS: laptop_hinge/noisy/storage_slide/orbit/door_drawer/two_drawers —
+tree == star to <1deg wherever the tracker found the right parts. Cardboard:
+root=spread 1/1 (4.2deg), root=degree 0/2 (two body fragments both attach to
+the lid, lid becomes hub). NEITHER root rule is safe with duplicate bodies;
+default stays spread; both reported. hinge_orbit unscorable (tracker p0 1m/178deg
+off under camera orbit — the tracker breaks there, not the graph).
+
+NEGATIVE RESULT: the staggered chain-ambiguity controls (40147 door+drawer,
+40417 two drawers, `--stagger`) never got both children split — cohort
+`co_min_seen` refusals (133/202) + contradiction gate (gain~0.001) — so the
+drawer-drawer ambiguity was exercised only on real ikea. Split discovery on
+sequentially moving children is its own open failure.
+
+NEXT: (1) duplicate-body identity is the upstream blocker for both root rules
+and rigid merging; (2) opt-in `joint_graph` in `_reparent` on `hist` with the
+existing root, tree only; (3) split discovery under staggered motion.

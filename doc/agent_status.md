@@ -32,6 +32,8 @@ priority order: `doc/demo_checkpoint_20260911.md`.
 | Lifecycle ledgers + `merge_probation` (default off) + diagnostics dumps + matched runner | integrated `bec3faf`; runner reproduces `doc/newborn_part_probation.md` |
 | Split-time consistency guard (`split_reprojection_consistency`) | **rejected** by the 09-10 15:44 review; not integrated |
 | Validation worktrees under `.claude/worktrees/` (14) | removed 2026-09-11; each one's uncommitted state is a "Snapshot uncommitted worktree state" commit on its own branch (`worktree-articulation-demo`, `wt-articulation-probation`, `frozen-*`, `gate-min-integration`, `growth-ablation`, `jm-rerun`, `kf-baseline-val`, `orphan-snapshot`, `relock-guard-val`, `turnover-diag`, `ikea-idrerun`) |
+| Pairwise relative-motion kinematic graph (offline tool, matched measurement) | done 2026-09-12, `doc/kinematic_graph_discovery.md`: ikea both joints found once each (star: 1+duplicate), parents 1/2 (root=spread) or 2/2 (root=degree) vs star 0/2; cardboard degree-root fails 0/2; duplicate bodies are the upstream blocker |
+| Staggered chain-ambiguity sim controls (`--stagger`) | rendered; tracker splits only one of two children (cohort + contradiction gate) — open |
 | `test/object` | 175 passing |
 
 ## Next
