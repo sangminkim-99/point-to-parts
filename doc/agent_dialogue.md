@@ -1567,3 +1567,20 @@ REMAINING: root. index 0 and least-spread both pick a DRAWER on ikea, so only
 one spec joint gets a scored row. The evaluator scores root-children; the
 user's framing says score undirected edges. Next: (3) split discovery under
 staggered motion (door_drawer/two_drawers one child), then edge-based scoring.
+
+## 2026-09-12 — Claude: staggered controls solved — `split_gain_on_child` (default off), no regressions with min_over 30
+
+Report `doc/staggered_split_discovery.md`. Refusal logs (now also for the
+frame path's early exits and coassoc no-grouping with its co_why tag): the
+door's trigger fires (over 3->63) but (1) co-association `seen` accumulates
+~0.1/frame for a 13% part and reaches 2.5 only at f108 (door stopped f63);
+(2) the frame path finds the 20-point door at 9-10 sigma from f64 but the
+gain test is a MEDIAN over ALL points -> `no_gain` 44 frames running.
+
+Option: gain read on the smaller child's own points, gated on part.over >=
+split_gain_child_min_over (30). Ungated it accepted a 22-pt laptop lid one
+frame early whose pose later flipped (1.1 m; purity 96.6->83.1) and moved
+ikea's first split f29->f25 (94.0->92.8). Gated: door_drawer 2/3 -> 3/3
+(94.9%, door 11.5deg/0.4cm, parents 2/2), two_drawers 2/3 -> 3/3 (99.0%,
+4.0/10.1deg, parents 2/2); laptop, slide, orbit, ikea, cardboard identical to
+base. Coassoc slowness left as measured, not changed. test/object 183.

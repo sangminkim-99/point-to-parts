@@ -81,6 +81,20 @@ class NaiveConfig:
     # junk for as long as the two bodies move differently, and the points of
     # the mover left behind in the parent surface later as a second identity.
     split_sep_per_child: bool = False   # every child must clear split_sep_sigma on its own
+    # The frame path's "splitting must explain the points better" test compares
+    # the MEDIAN residual over ALL points before and after, so a child holding
+    # 7% of the points cannot move the median no matter how badly the single
+    # body explains it -- measured on a staggered sim door (20 of 270 points,
+    # 9-10 sigma apart, refused 44 frames running as no_gain). With this on the
+    # gain is read on the points that change hands: their residual under the
+    # one-body pose against their residual under their own motion.
+    split_gain_on_child: bool = False
+    # ... but only once the differential motion has persisted this many frames
+    # (`part.over`). Read on the child alone, the gain test accepts a 22-point
+    # lid one frame earlier than the pooled test on laptop_hinge, and that
+    # smaller child's pose later flipped (1.1 m error). The staggered door had
+    # over = 23..63 when it was refused; a one-frame-early laptop lid has ~15.
+    split_gain_child_min_over: int = 30
     split_refine_coassoc: bool = False  # re-assign co-association groups by residual, as the frame path does
     # The answer is always a 1-DoF joint, so ask for one: the relative motion
     # has to be a joint displacement of a size worth calling a part, in the
@@ -2095,11 +2109,22 @@ class NaivePartTracker:
 
         # Stage B first: groups that held together over frames, not one frame's
         # RANSAC. The single frame decides only when the history is too thin.
+        n_why = sum(getattr(self, "co_why", {}).values()) if getattr(self, "co_why", None) else 0
         cc = self._cluster_co(sel) if cfg.persist else None
         if cc is None and cfg.persist:
             # the commonest silent refusal: the points that disagree have not
             # been seen together often enough to form a group
             self.co_none = getattr(self, "co_none", 0) + 1
+            if getattr(self, "split_diag", None) is not None:
+                why = getattr(self, "co_why", None)
+                tag = None
+                if why and sum(why.values()) > n_why:
+                    tag = list(why.keys())[-1]
+                self.split_diag.append({"frame": int(self.n - 1), "via": "coassoc",
+                                        "refused": "no_grouping", "why": tag,
+                                        "parent_part_id": int(part.part_id),
+                                        "n": [int(sel.size)], "over": int(part.over),
+                                        "out_pts": int(part.out_pts)})
         if cc is not None:
             groups, gap = cc
             motions = []
@@ -2173,12 +2198,18 @@ class NaivePartTracker:
                 break
             motions.append(np.asarray(c["T"]))
         if len(motions) < 2:
+            if getattr(self, "split_diag", None) is not None:
+                self.split_diag.append({"frame": int(self.n - 1), "via": "frame",
+                                        "refused": "one_motion", "parent_part_id": int(part.part_id),
+                                        "n": [int(sel.size)], "sep_sigma_per_child": [None]})
             return False
         ss = self._sep_sigma([sel, sel], motions, part)
         big, rot_d, tr_m = self._joint_sized(motions, [sel, sel])
         if not big:
             self.small_blocked = getattr(self, "small_blocked", 0) + 1
         if ss < cfg.split_sep_sigma or not big:
+            self._split_refusal("frame", "too_small" if not big else "not_separated_pooled",
+                                [sel, sel], motions, part, ss=ss, rot_deg=float(rot_d), trans_m=float(tr_m))
             return False
         D = np.stack([np.linalg.norm(
             self.anchor_xyz[sel] @ T[:3, :3].T + T[:3, 3] - cur[sel], axis=1)
@@ -2189,6 +2220,7 @@ class NaivePartTracker:
         keep = (bv < cfg.inlier_thres) & (sv > cfg.ambiguous_band * bv)
         groups = [sel[keep & (best == k)] for k in range(2)]
         if min(len(g) for g in groups) < cfg.min_part_pts:
+            self._split_refusal("frame", "child_too_few_points", groups, motions, part, ss=ss)
             return False
         if cfg.split_sep_per_child:
             # the pooled test above ran before the points were partitioned;
@@ -2199,11 +2231,20 @@ class NaivePartTracker:
                 self._split_refusal("frame", "not_separated_per_child", groups, motions, part, ss=ss)
                 return False
         # splitting must explain the points better than the one body did
-        before = float(np.median(np.linalg.norm(
+        r_one = np.linalg.norm(
             self.anchor_xyz[sel] @ part.pose[:3, :3].T + part.pose[:3, 3]
-            - cur[sel], axis=1)))
-        after = float(np.median(np.concatenate(
-            [D[k][keep & (best == k)] for k in range(2)])))
+            - cur[sel], axis=1)
+        if cfg.split_gain_on_child and part.over >= cfg.split_gain_child_min_over:
+            # the smaller group is the one being born; judge the split on how
+            # much better ITS points are explained by their own motion
+            small = int(np.argmin([len(g) for g in groups]))
+            m = keep & (best == small)
+            before = float(np.median(r_one[m])) if m.any() else 0.0
+            after = float(np.median(D[small][m])) if m.any() else 0.0
+        else:
+            before = float(np.median(r_one))
+            after = float(np.median(np.concatenate(
+                [D[k][keep & (best == k)] for k in range(2)])))
         if before > 1e-6 and after > cfg.split_gain * before:
             self._split_refusal("frame", "no_gain", groups, motions, part, ss=ss)
             return False

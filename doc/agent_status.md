@@ -6,8 +6,8 @@ agent (lead, integrator and worker).
 Read this file **and** `doc/agent_dialogue.md` before starting any task.
 Update the "Status" and "Next" rows when you finish a unit of work.
 
-Last updated: 2026-09-11 21:30 EDT by Claude.
-Base commit: `bec3faf`.
+Last updated: 2026-09-12 by Claude.
+Base commit: see `git log`; every option below is default-off.
 
 ## Objective
 
@@ -33,9 +33,10 @@ priority order: `doc/demo_checkpoint_20260911.md`.
 | Split-time consistency guard (`split_reprojection_consistency`) | **rejected** by the 09-10 15:44 review; not integrated |
 | Validation worktrees under `.claude/worktrees/` (14) | removed 2026-09-11; each one's uncommitted state is a "Snapshot uncommitted worktree state" commit on its own branch (`worktree-articulation-demo`, `wt-articulation-probation`, `frozen-*`, `gate-min-integration`, `growth-ablation`, `jm-rerun`, `kf-baseline-val`, `orphan-snapshot`, `relock-guard-val`, `turnover-diag`, `ikea-idrerun`) |
 | Pairwise relative-motion kinematic graph (offline tool, matched measurement) | done 2026-09-12, `doc/kinematic_graph_discovery.md`: ikea both joints found once each (star: 1+duplicate), parents 1/2 (root=spread) or 2/2 (root=degree) vs star 0/2; cardboard degree-root fails 0/2; duplicate bodies are the upstream blocker |
-| Staggered chain-ambiguity sim controls (`--stagger`) | rendered; tracker splits only one of two children (cohort + contradiction gate) — open |
+| Staggered chain-ambiguity sim controls (`--stagger`) | rendered; base tracker splits only one of two children — solved as opt-in, see the row below |
 | Duplicate bodies (`doc/split_partition_purity.md`) | diagnosed as mixture births; `split_refine_coassoc` (off) fixes cardboard 3→2 parts and ikea body pose 17.8→5.6 mm; ikea duplicates were a contradiction-gate artefact — under `residual_veto` base is 3/3; refine + pairwise graph = both ikea parents correct (2/2) |
 | `joint_graph` (default off, in-tracker pairwise tree) | done 2026-09-12: ikea parents 0/1 → 1/1, fb 5-part 0/2+dup → 1/0 no dup, sims identical, +2 ms; root still a drawer → only one spec joint scored |
+| Staggered split discovery (`doc/staggered_split_discovery.md`) | `split_gain_on_child` (off, min_over 30): door_drawer and two_drawers 2/3 → 3/3, parents 2/2; all other cases identical to base |
 | `test/object` | 183 passing |
 
 ## Next
@@ -44,9 +45,8 @@ Order set by `doc/demo_checkpoint_20260911.md`:
 
 1. ~~ikeasmall02 parent graph~~ done as opt-ins (`residual_veto` gate +
    `split_refine_coassoc` + `joint_graph`): 3/3 parts, tree edges correct,
-   parents correct wherever a joint is scored. Open follow-ups: (a) split
-   discovery under staggered motion — door_drawer/two_drawers split only one
-   child (`co_min_seen`); (b) the evaluator scores root-children, so a drawer
+   parents correct wherever a joint is scored. Open follow-ups: (a) ~~staggered split discovery~~ solved as opt-in
+   `split_gain_on_child`; co-association slowness for small parts remains; (b) the evaluator scores root-children, so a drawer
    root hides one spec joint — score undirected tree edges instead; (c) the
    same matched table on take01/lift01 and the other RBO objects.
 2. URDF export defect 2 from `doc/urdf_export_audit.md`: `model.npz` poses
