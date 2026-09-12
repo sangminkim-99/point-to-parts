@@ -132,6 +132,28 @@ def main():
                          "GT part-index map on the frames that add tracks")
     ap.add_argument("--dump-joint", default=None,
                     help="npz of every joint's relative-pose stack, for analysis")
+    ap.add_argument("--dump-lifecycle", default=None,
+                    help="json of per-part_id birth/death/coverage and every "
+                         "merge decision; the only machine-readable survival "
+                         "record, and unlike --trace-out it needs no GT")
+    ap.add_argument("--dump-surface", default=None,
+                    help="json of dense surface-ownership provenance: per split "
+                         "the held/assigned counts and seed distances, per carve "
+                         "the label carved and whether it was assigned via a far "
+                         "seed (misassign->carve) or never split-assigned "
+                         "(stale-copy). Default off; diagnostics only")
+    ap.add_argument("--reference-part", type=int, default=None,
+                    help="pin the kinematic root to this part_id (reference-tracker "
+                         "replay mode, matching the demo's ReferenceTracker) instead "
+                         "of the least-motion _pick_root; for validating the split "
+                         "gate under the demo's root convention")
+    ap.add_argument("--dump-split-reproj", default=None,
+                    help="json of reprojection-split-gate evidence: per candidate "
+                         "the common/separate depth support, contradiction, valid "
+                         "and behind-occluded counts, continuous residual, and the "
+                         "candidate relative motion. Distinguishes a floor effect "
+                         "(common already low / mostly occluded) from insufficient "
+                         "candidate motion. Default off; diagnostics only")
     ap.add_argument("--save-model", default=None,
                     help="naive dense path: save final labelled Gaussians and part poses as npz")
     ap.add_argument("--urdf", default=None,
@@ -323,7 +345,28 @@ def main():
             ncfg.sampler = args.sampler
         from examples.multi_part.acquire import apply_overrides
         apply_overrides(ncfg, args.set)
-        s = NaivePartTracker(r.K, ncfg, tracker, reg)
+        if args.reference_part is not None:
+            # Reference-tracker replay mode: pin the root to a chosen identity, as
+            # the demo's ReferenceTracker does (author_demo.py), instead of
+            # NaivePartTracker's least-motion _pick_root. The split gate scores
+            # geometry under the splitting part's pose, and the root choice feeds
+            # _reparent, so this lets the gate be validated under the demo's root
+            # convention without importing the demo module.
+            _ref = int(args.reference_part)
+
+            class _ReferenceReplayTracker(NaivePartTracker):
+                def _pick_root(self):
+                    for k, p in enumerate(self.parts):
+                        if p.part_id == _ref:
+                            return k
+                    return getattr(self, "root", 0)
+            s = _ReferenceReplayTracker(r.K, ncfg, tracker, reg)
+        else:
+            s = NaivePartTracker(r.K, ncfg, tracker, reg)
+        if args.dump_surface:
+            s.surface_log = []      # opt in to dense ownership provenance
+        if args.dump_split_reproj:
+            s.split_reproj_log = []  # opt in to reprojection-split-gate evidence
         cfg = ncfg
     else:
         s = StreamingPartDiscovery(r.K, cfg, tracker, reg)
@@ -557,6 +600,76 @@ def main():
             np.savez(args.dump_joint, **d)
             print(f"[replay] joint observations -> {args.dump_joint} "
                   f"({len(d)//3} joints)")
+        if args.dump_lifecycle:
+            import json
+            summary = s.lifecycle_summary()
+            summary["timing_ms"] = {
+                "per_frame_median": float(np.median(times)) if times else None,
+                "per_frame_p90": (float(np.percentile(times, 90))
+                                  if times else None)}
+            Path(args.dump_lifecycle).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.dump_lifecycle, "w") as fh:
+                # allow_nan=False: a NaN would make this unreadable by any
+                # strict JSON parser, so it must fail here instead
+                json.dump(summary, fh, indent=1, allow_nan=False)
+            u = summary["verdicts_on_unearned_evidence"]
+            print(f"[replay] lifecycle -> {args.dump_lifecycle} "
+                  f"({summary['ids_born']} ids born, {summary['ids_died']} "
+                  f"died, {u['total']} merge verdicts reached on evidence the "
+                  f"part had not earned: {u['merged']} merged, {u['kept']} kept)")
+        if args.dump_surface and getattr(s, "surface_log", None) is not None:
+            import json
+            splits = [e for e in s.surface_log if e["event"] == "split"]
+            carves = [e for e in s.surface_log if e["event"] == "carve"]
+            cov = [e for e in s.surface_log if e["event"] == "coverage"]
+            final = None
+            if getattr(s, "model", None) is not None:
+                lb = s.model.labels
+                u, c = np.unique(lb, return_counts=True)
+                final = {int(k): int(v) for k, v in zip(u, c)}
+            # coverage-over-time: does re-grow keep the observed surface covered
+            # while -1 climbs? low, flat uncovered => healthy turnover, not loss
+            uncov = [e["uncovered"] for e in cov]
+            coverage = None
+            if cov:
+                coverage = {
+                    "uncovered_mean": float(np.mean(uncov)),
+                    "uncovered_p50": float(np.median(uncov)),
+                    "uncovered_p90": float(np.percentile(uncov, 90)),
+                    "uncovered_max": float(np.max(uncov)),
+                    "uncovered_last": float(uncov[-1]),
+                    "alive_first": int(cov[0]["alive"]),
+                    "alive_last": int(cov[-1]["alive"]),
+                    "series": [[e["frame"], round(e["uncovered"], 4),
+                                e["alive"], e["dead"]] for e in cov]}
+            out = {"final_label_hist": final,
+                   "carved_total": sum(e["carved"] for e in carves),
+                   "carved_far_seed_gt_5cm": sum(e["far_seed_gt_5cm"] for e in carves),
+                   "carved_far_seed_gt_2cm": sum(e["far_seed_gt_2cm"] for e in carves),
+                   "carved_never_split_assigned":
+                       sum(e["never_split_assigned"] for e in carves),
+                   "n_splits": len(splits), "coverage": coverage,
+                   "events": s.surface_log}
+            Path(args.dump_surface).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.dump_surface, "w") as fh:
+                json.dump(out, fh, indent=1, allow_nan=False)
+            print(f"[replay] surface provenance -> {args.dump_surface} "
+                  f"({out['n_splits']} splits, {out['carved_total']} carved: "
+                  f"{out['carved_far_seed_gt_5cm']} via far seed >5cm, "
+                  f"{out['carved_never_split_assigned']} never split-assigned)")
+        if args.dump_split_reproj and getattr(s, "split_reproj_log", None) is not None:
+            import json
+            log = s.split_reproj_log
+            accepts = [e for e in log if e.get("verdict", {}).get("accept")]
+            rejects = [e for e in log if "verdict" in e and not e["verdict"]["accept"]]
+            out = {"n_candidates": len(log),
+                   "n_accept_rows": len(accepts), "n_reject_rows": len(rejects),
+                   "events": log}
+            Path(args.dump_split_reproj).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.dump_split_reproj, "w") as fh:
+                json.dump(out, fh, indent=1, allow_nan=False)   # strict JSON
+            print(f"[replay] split-reproj evidence -> {args.dump_split_reproj} "
+                  f"({len(log)} candidate rows)")
         print(f"[replay] naive: {len(s.parts)} parts, splits {s.split_log}"
               + f", joint-tracked {getattr(s, 'joint_frames', 0)} part-frames"
               + (f", grown {getattr(s, 'grown', 0)}, carved "

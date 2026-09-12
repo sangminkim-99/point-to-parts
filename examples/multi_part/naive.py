@@ -115,6 +115,19 @@ class NaiveConfig:
     # the smoothness of q(t) can, because a real joint is driven and error is
     # white. Measured on synthetic data: real joints 1.00, pure jitter 0.00.
     merge_smooth: float = 0.15
+    # Newborn-merge probation (default OFF; never enable globally without a
+    # matched review). A part born mid-clip is judged on a joint whose history
+    # was back-filled from before it existed (retro + _rebuild_joint), so the
+    # merge verdict rests on evidence the part never earned. Probation withholds
+    # the verdict until the part has accumulated `probation_min_obs` genuine
+    # post-birth paired observations -- accepted, measured live, at or after its
+    # own birth frame, against its current parent -- and then scores the merge on
+    # a SEPARATE joint fitted from ONLY those fresh observations, leaving the
+    # tracking/export joint untouched. A part that never earns enough fresh
+    # evidence stays on probation and is never merged: it is bounded-unverified,
+    # not credible-by-survival.
+    merge_probation: bool = False
+    probation_min_obs: int = 12         # fresh post-birth paired obs to be judged
     # A hinge is a physical thing: it lives in or on the object. Used as a MAP
     # prior on the axis, scaled by the object's own radius. Proposal generators
     # assume this (H-SAUR, Real2Code); using it to REJECT a joint is new.
@@ -354,6 +367,17 @@ class NaivePart:
     n_off: int = 0                      # how many points disagree
     box: object = None                  # oriented box in the anchor frame
     born: int = 0
+    # born is a settle clock: a merge resets it (see _merge_rigid) so the
+    # surviving part has to earn the right to split again. That makes it
+    # useless for asking how old a part actually is, which is the question
+    # the merge decision needs, so identity carries its own birth frame.
+    birth: int = 0                      # frame this part_id came into being,
+                                        # in the index hist and the merge
+                                        # check use, which is self.n - 1
+    obs_prov: object = None             # [(frame, parent_part_id, source)]
+                                        # parallel to joint.A; "live" is a
+                                        # fresh paired observation,
+                                        # "rebuild" one reconstructed
     last_seed: int = -999
     energy: float = float("inf")
     over: int = 0                       # consecutive frames above split_res
@@ -372,6 +396,14 @@ class NaivePartTracker:
         self.last_timings = {}
         self.last_mode = ""
         self.split_log = []
+        # split_log is (frame, n_parts), which cannot answer whether a part
+        # survived -- two runs ending at two parts may have kept different
+        # ones. These ledgers follow part_id instead.
+        self.alive_frames = {}          # part_id -> frames it existed for
+        self.seen_frames = {}           # part_id -> frames it was measured on
+        self.birth_log = []             # every part_id that came into being
+        self.death_log = []             # every part_id merged away
+        self.merge_log = []             # every merge decision, kept or not
 
     def start(self, rgb, depth, mask):
         from point2pose.data_types.frame import Frame
@@ -524,8 +556,8 @@ class NaivePartTracker:
                 p.joint.sigma_r_floor = max(
                     self._rot_floor(p), self._rot_floor(self.parts[p.parent]))
                 if i > p.joint_upto:        # the rebuild may already hold it
-                    p.joint.add(np.linalg.inv(self.parts[p.parent].pose)
-                                @ p.pose)
+                    self._joint_add(p, np.linalg.inv(self.parts[p.parent].pose)
+                                    @ p.pose, i, "live")
                     p.joint_upto = i
                 if p.joint.kind is None or len(p.joint.A) % 4 == 0:
                     if p.joint.fit():
@@ -536,6 +568,13 @@ class NaivePartTracker:
             self.reproj, self.covdist = self._reproject_owner(tracks, depth)
         if cfg.pending:
             self._place_pending(i)
+
+        # a part that exists but is never measured is not evidence of
+        # tracking, so existence and observation are counted separately
+        for q in self.parts:
+            self.alive_frames[q.part_id] = self.alive_frames.get(q.part_id, 0) + 1
+            if q.observed:
+                self.seen_frames[q.part_id] = self.seen_frames.get(q.part_id, 0) + 1
 
         if cfg.merge_rigid and len(self.parts) > 1 and i % cfg.merge_every == 0:
             self._merge_rigid(i)
@@ -580,14 +619,40 @@ class NaivePartTracker:
             poses = [p.pose for p in self.parts]
 
         if i % cfg.carve_every == 0:
-            self.carved = getattr(self, "carved", 0) + \
-                self.model.carve(depth, [p.pose if p.observed else None for p in self.parts])
+            n_carved = self.model.carve(
+                depth, [p.pose if p.observed else None for p in self.parts])
+            self.carved = getattr(self, "carved", 0) + n_carved
+            # diagnostics (no behaviour): attribute each carve. A carved gaussian
+            # whose last split assigned it via a FAR seed (no visible seed) is the
+            # misassign->carve path; a NaN seed_dist was never split-assigned
+            # (grown/initial) -- ordinary stale-copy carving.
+            note = getattr(self.model, "_carve_note", None)
+            if getattr(self, "surface_log", None) is not None and note is not None:
+                sd = note["seed_dist"]
+                self.surface_log.append({
+                    "event": "carve", "frame": int(i), "carved": int(note["idx"].size),
+                    "by_label": {int(k): int((note["labels"] == k).sum())
+                                 for k in np.unique(note["labels"])},
+                    "far_seed_gt_5cm": int(np.nansum(sd > 0.05)),
+                    "far_seed_gt_2cm": int(np.nansum(sd > 0.02)),
+                    "never_split_assigned": int(np.isnan(sd).sum())})
         fresh = [p.observed or p.surface_recovered for p in self.parts]
         if cfg.grow_every > 0 and i % cfg.grow_every == 0 and all(fresh):
             ok = [p.resid < cfg.joint_gate for p in self.parts]
             self.grown = getattr(self, "grown", 0) + \
                 self.model.grow(rgb, depth, mask, poses, grow_ok=ok)
         self.unmodelled = self.model.uncovered(depth, mask, poses)
+        # diagnostics (no behaviour): coverage-over-time answers "does re-grow
+        # replace what carve removes?". uncovered is the fraction of OBSERVED
+        # object surface no part explains; if it stays low while -1 climbs, the
+        # loss is healthy turnover, not surface destruction.
+        if getattr(self, "surface_log", None) is not None:
+            lb = self.model.labels
+            self.surface_log.append({
+                "event": "coverage", "frame": int(i),
+                "uncovered": float(self.unmodelled),
+                "alive": int((lb >= 0).sum()), "dead": int((lb == -1).sum()),
+                "total": int(lb.size)})
 
     def _on_object(self, t2, mask):
         """True where a track still sits inside the (padded) object mask."""
@@ -1282,6 +1347,143 @@ class NaivePartTracker:
             b = b @ A0[:3, :3].T + A0[:3, 3]
         return np.concatenate([a, b]).astype(np.float64)
 
+    def lifecycle_summary(self):
+        """Per-identity survival, for a run-to-run comparison.
+
+        The final part count cannot distinguish a run that discovered the
+        right part and kept it from one that discovered it, lost it and
+        discovered another, so everything here is keyed by part_id.
+
+        Two conventions this report depends on:
+
+        `birth`, `death` and every ledger `frame` are the processed frame
+        index, `self.n - 1`. `lifetime` is a difference of those, so a part
+        that lives for one frame has lifetime 0 and one alive frame;
+        `alive_frames` is an inclusive count. The pre-existing `born` settle
+        clock and `split_log` still count in `self.n` and are left alone, so
+        the same split reads one higher there.
+
+        `observed_frames` counts frames on which the part carried
+        `observed=True`. NaivePart defaults that to True, and a part is
+        created part-way through the frame it is born on, after that frame's
+        fit has run -- so its birth frame is counted as observed without an
+        independent measurement behind it. Coverage is therefore an upper
+        bound, not a count of fitted poses.
+        """
+        died = {int(d["part_id"]): d for d in self.death_log}
+        # a split entry for the continuing half is not a birth
+        born = {int(b["part_id"]): b for b in self.birth_log
+                if b.get("new_identity", True)}
+        live = {int(p.part_id) for p in self.parts}
+        rows = []
+        for pid in sorted(set(born) | live | set(died)):
+            b, d = born.get(pid), died.get(pid)
+            alive = int(self.alive_frames.get(pid, 0))
+            seen = int(self.seen_frames.get(pid, 0))
+            rows.append(
+                {"part_id": pid,
+                 "birth": int(b["frame"]) if b else 0,
+                 "death": int(d["frame"]) if d else None,
+                 "survived": pid in live,
+                 "lifetime": int(d["lifetime"]) if d
+                             else int(self.n - 1 - (b["frame"] if b else 0)),
+                 "alive_frames": alive,
+                 "observed_frames": seen,
+                 "coverage": round(seen / alive, 4) if alive else 0.0,
+                 "evidence_at_birth": b["evidence"] if b else None,
+                 "evidence_at_death": d["evidence"] if d else None,
+                 "death_smooth": d["smooth"] if d else None})
+        # a merge/keep verdict reached before the part earned enough of its own
+        # evidence is unsound whichever way it fell, so both directions are
+        # counted. on_probation is not a verdict on the part -- it is the
+        # decision NOT to judge it yet -- so it is tallied separately, never as
+        # an unearned verdict.
+        unearned = [m for m in self.merge_log
+                    if m["verdict"] in ("merged", "kept_driven")
+                    and not m["earned_enough"]]
+        withheld = [m for m in self.merge_log if m["verdict"] == "on_probation"]
+        return {"frames": int(self.n),
+                "final_parts": len(self.parts),
+                # part 0 exists from the first frame and is never in birth_log
+                "ids_born": len(set(born) | {0}),
+                "ids_died": len(died),
+                "ids_surviving": sorted(live),
+                "config": {"merge_probation": bool(self.cfg.merge_probation),
+                           "probation_min_obs": int(self.cfg.probation_min_obs),
+                           "merge_min_obs": int(self.cfg.merge_min_obs),
+                           "merge_smooth": float(self.cfg.merge_smooth)},
+                "verdicts_on_unearned_evidence": {
+                    "merged": sum(1 for m in unearned
+                                  if m["verdict"] == "merged"),
+                    "kept": sum(1 for m in unearned
+                                if m["verdict"] == "kept_driven"),
+                    "total": len(unearned)},
+                # how many times a merge verdict was withheld for want of the
+                # part's own fresh evidence, and over how many distinct parts
+                "probation_withheld": {
+                    "checks": len(withheld),
+                    "part_ids": sorted({int(m["part_id"]) for m in withheld})},
+                "split_log": [[int(f), int(k)] for f, k in self.split_log],
+                "parts": rows,
+                "births": self.birth_log,
+                "deaths": self.death_log,
+                "merge_decisions": self.merge_log,
+                "refusals": {k: int(getattr(self, k, 0)) for k in
+                             ("co_none", "thin_blocked", "small_blocked",
+                              "sep_blocked", "cohort_blocked", "bic_blocked",
+                              "reprojection_blocked", "merged_total")}}
+    def _merge_note(self, i, j, p, verdict, c, scored_on="full",
+                    fresh_obs=None):
+        """Record what the merge check saw, whether or not it merged.
+
+        The decision turns on the smoothness of q(t), but q(t) may have been
+        assembled from frames before this part existed as a separate part
+        (_accept -> _reparent -> _rebuild_joint back-fills it when retro is
+        on). Splitting the observation count into pre- and post-birth is the
+        whole point of this ledger: it says how much of the evidence the part
+        actually earned.
+
+        `scored_on` is "full" when the verdict used the part's real joint (the
+        baseline) and "fresh" when probation scored it on a joint fitted only
+        from earned observations. `earned_enough` is measured against the gate
+        that was actually in force -- `probation_min_obs` under probation,
+        `merge_min_obs` otherwise -- so a probation verdict, which by
+        construction only fires once enough fresh evidence exists, never counts
+        as reached on unearned evidence.
+        """
+        cfg = self.cfg
+        ev = self._evidence(p)
+        thresh = cfg.probation_min_obs if cfg.merge_probation else cfg.merge_min_obs
+        rec = {"frame": int(i), "part_id": int(p.part_id),
+               "birth": int(p.birth), "age": int(i - p.birth),
+               "verdict": verdict,
+               "evidence": ev,
+               "min_obs": int(cfg.merge_min_obs),
+               "scored_on": scored_on,
+               "fresh_obs": (int(fresh_obs) if fresh_obs is not None else None),
+               "earned_thresh": int(thresh),
+               # an unmeasured value is null, not a NaN no strict JSON
+               # reader will accept
+               "smooth": float(c["smooth"]) if c and "smooth" in c else None,
+               "smooth_thresh": float(cfg.merge_smooth),
+               "axis_std_deg": (float(c["axis_std_deg"])
+                                if c and "axis_std_deg" in c else None),
+               "earned_enough": bool(ev["earned"] >= thresh)}
+        self.merge_log.append(rec)
+        if verdict != "too_few_obs" and rec["smooth"] is not None:
+            print(f"[lifecycle] frame {i}: merge check part_id {p.part_id} "
+                  f"(born {p.birth}, age {rec['age']}): {verdict}, "
+                  f"{ev['earned']}/{ev['total']} obs earned "
+                  f"(gate {thresh}, scored_on {scored_on}), "
+                  f"smoothness {rec['smooth']:.2f} "
+                  f"vs {rec['smooth_thresh']:.2f}")
+        elif verdict == "on_probation":
+            print(f"[lifecycle] frame {i}: part_id {p.part_id} on probation "
+                  f"(born {p.birth}, age {rec['age']}): "
+                  f"{ev['earned']}/{cfg.probation_min_obs} fresh obs earned, "
+                  f"merge verdict withheld")
+        return rec
+
     def _merge_rigid(self, i):
         """Undo a split whose relative motion is best explained by no joint.
 
@@ -1303,11 +1505,50 @@ class NaivePartTracker:
             if j in gone or par in gone or len(self.parts) - len(gone) < 2:
                 continue
             if len(jm.A) < cfg.merge_min_obs:
+                self._merge_note(i, j, p, "too_few_obs", None)
                 continue
-            c = jm.confidence()
+            # Probation (default off): withhold the verdict until the part has
+            # earned enough of its OWN evidence, then score on a fresh-only
+            # model. Eligibility is checked BEFORE confidence, at the same gate
+            # merge_min_obs sits at, so a part with too little fresh evidence is
+            # never judged -- it stays alive and unverified, not merged.
+            if cfg.merge_probation:
+                earned = self._evidence(p)["earned"]
+                if earned < cfg.probation_min_obs:
+                    self._merge_note(i, j, p, "on_probation", None,
+                                     scored_on="fresh", fresh_obs=earned)
+                    continue
+                scoring = self._fresh_model(p)
+                if scoring is None:
+                    # eligible by count but the fresh model would not build;
+                    # cannot justify a merge on evidence we cannot fit, so keep
+                    self._merge_note(i, j, p, "on_probation", None,
+                                     scored_on="fresh", fresh_obs=earned)
+                    continue
+                c = scoring.confidence()
+                scored_on, fresh_obs = "fresh", len(scoring.A)
+            else:
+                c = jm.confidence()
+                scored_on, fresh_obs = "full", None
             if c.get("smooth", 1.0) >= cfg.merge_smooth:
+                self._merge_note(i, j, p, "kept_driven", c,
+                                 scored_on=scored_on, fresh_obs=fresh_obs)
                 continue        # q(t) is driven, so this is a joint
             keep = self.parts[par]
+            self._merge_note(i, j, p, "merged", c,
+                             scored_on=scored_on, fresh_obs=fresh_obs)
+            ev = self._evidence(p)
+            earned_thresh = (cfg.probation_min_obs if cfg.merge_probation
+                             else cfg.merge_min_obs)
+            self.death_log.append(
+                {"frame": int(i), "part_id": int(p.part_id),
+                 "birth": int(p.birth), "lifetime": int(i - p.birth),
+                 "absorbed_into": int(keep.part_id),
+                 "evidence": ev,
+                 "scored_on": scored_on,
+                 "fresh_obs": (int(fresh_obs) if fresh_obs is not None else None),
+                 "earned_enough": bool(ev["earned"] >= earned_thresh),
+                 "smooth": float(c["smooth"]) if "smooth" in c else None})
             keep.idx = np.unique(np.concatenate([keep.idx, p.idx]))
             keep.box = self._fit_box(keep)
             keep.born = self.n              # earn the right to split again
@@ -1449,9 +1690,90 @@ class NaivePartTracker:
                 p.joint = self._new_joint()
                 self._rebuild_joint(k)
 
+    def _joint_add(self, p, A, frame, source):
+        """Append a relative pose and remember where it came from.
+
+        JointModel.add drops a degenerate transform silently, so provenance
+        can only be extended when the stack actually grew -- counting
+        attempts instead of appends overstates the evidence a part holds.
+        """
+        n = len(p.joint.A)
+        p.joint.add(A)
+        if len(p.joint.A) == n:
+            return False
+        if p.obs_prov is None:
+            p.obs_prov = []
+        par = self.parts[p.parent] if p.parent < len(self.parts) else None
+        p.obs_prov.append((int(frame),
+                           int(par.part_id) if par is not None else -1,
+                           source))
+        return True
+
+    def _evidence(self, p):
+        """How much of this part's joint evidence is its own.
+
+        Three ways an observation fails to be the part's own: it predates
+        the part, it was reconstructed rather than measured, or it was taken
+        against a different parent before a reparent.
+        """
+        prov = p.obs_prov or []
+        par = self.parts[p.parent] if p.parent < len(self.parts) else None
+        par_id = int(par.part_id) if par is not None else -1
+        return {"total": len(prov),
+                "earned": sum(1 for f, pid, src in prov
+                              if src == "live" and f >= p.birth
+                              and pid == par_id),
+                "pre_birth": sum(1 for f, _, _ in prov if f < p.birth),
+                "rebuilt_post_birth": sum(1 for f, _, src in prov
+                                          if src == "rebuild"
+                                          and f >= p.birth),
+                "against_other_parent": sum(1 for _, pid, _ in prov
+                                            if pid != par_id),
+                "frames": [int(f) for f, _, _ in prov]}
+
+    def _fresh_model(self, p):
+        """A joint fitted on ONLY the part's own earned observations.
+
+        Probation scores the merge on evidence the part earned after its own
+        birth -- accepted, measured live, against its current parent -- and
+        never on the retro history that back-fill produced. `obs_prov` is
+        appended in lock-step with `p.joint.A` in `_joint_add` (the only path
+        that grows either), so entry k of one aligns with entry k of the other.
+
+        This is a DIAGNOSTIC model, used to decide the merge only. The part's
+        real tracking/export joint (`p.joint`) is never replaced or refitted
+        here. Returns the fitted model, or None if there is nothing earned to
+        fit or provenance and stack have diverged.
+        """
+        prov = p.obs_prov or []
+        A = p.joint.A
+        if len(prov) != len(A):
+            return None                 # alignment lost; refuse to guess
+        par = self.parts[p.parent] if p.parent < len(self.parts) else None
+        par_id = int(par.part_id) if par is not None else -1
+        fresh = [A[k] for k, (f, pid, src) in enumerate(prov)
+                 if src == "live" and f >= p.birth and pid == par_id]
+        if not fresh:
+            return None
+        jm = self._new_joint()
+        # carry the same fit configuration the live joint used, so the only
+        # difference between the two models is which observations they hold
+        jm.sigma = p.joint.sigma
+        jm.axis_max = p.joint.axis_max
+        jm.min_angle = p.joint.min_angle
+        jm.allow_free = p.joint.allow_free
+        jm.geom = p.joint.geom
+        jm.sigma_r_floor = p.joint.sigma_r_floor
+        for a in fresh:
+            jm.add(a)
+        jm.fit()                        # may fail (too few / too still); that is
+        return jm                       # reported honestly as smooth 0.0
+
     def _rebuild_joint(self, k):
         """Fill a joint from the two parts' own histories, on shared frames."""
         p, par = self.parts[k], self.parts[self.root]
+        # a rebuild replaces the whole stack, so provenance goes with it
+        p.obs_prov = []
         if not p.hist or not par.hist:
             return
         # the same gate the incremental path uses: a frame whose pose the part
@@ -1464,8 +1786,8 @@ class NaivePartTracker:
                 continue
             Tp = pp.get(n)
             if Tp is not None:
-                p.joint.add(np.linalg.inv(Tp) @ T)
-                p.joint_upto = n
+                if self._joint_add(p, np.linalg.inv(Tp) @ T, n, "rebuild"):
+                    p.joint_upto = n
 
     def _cohort_split(self, groups):
         """True when the two groups are just two different seeding batches."""
@@ -1747,6 +2069,28 @@ class NaivePartTracker:
                 pc, ps, npaired = self._paired_resid(pts, part.pose, motion)
                 child_rows.append({"common": common, "separate": separate,
                                    "paired_com": pc, "paired_sep": ps, "n_paired": npaired})
+            # diagnostics (no behaviour): full evidence + the candidate motion, to
+            # tell the floor effect (common already low because most samples project
+            # BEHIND the surface = occluded/neutral) from insufficient candidate
+            # motion (separate ~ common because the proposed motion ~ parent pose).
+            if getattr(self, "split_reproj_log", None) is not None:
+                cd = self._reproj_diag(pts, part.pose)
+                sd = self._reproj_diag(pts, motion)
+                rel = np.linalg.inv(part.pose) @ motion
+                rot = float(np.degrees(np.linalg.norm(
+                    _R.from_matrix(rel[:3, :3]).as_rotvec())))
+                self.split_reproj_log.append({
+                    "frame": int(self.n - 1), "part_id": int(part.part_id),
+                    "child": int(k), "n_pts": int(len(pts)),
+                    "geometry": evidence_source,
+                    "candidate_motion_vs_parent": {
+                        "rot_deg": rot, "trans_m": float(np.linalg.norm(rel[:3, 3]))},
+                    "common": cd, "separate": sd,
+                    "contradiction_gain": float(cd["contradiction"] - sd["contradiction"]),
+                    "support_gain": float(sd["support"] - cd["support"]),
+                    "resid_gain_m": (float(cd["resid_m"] - sd["resid_m"])
+                                     if cd["resid_m"] is not None
+                                     and sd["resid_m"] is not None else None)})
         # A hidden old face cannot justify articulation just by finding new RGB tracks.
         gain = max(a['contradiction'] - b['contradiction'] for a, b in rows)
         supported = all(b['support'] >= cfg.split_reprojection_support for _, b in rows)
@@ -1779,7 +2123,50 @@ class NaivePartTracker:
               f"mode={cfg.split_reprojection_mode} geometry={evidence_source} reason={reason} "
               f"gain_min={cfg.split_reprojection_gain:.3f} "
               f"support_min={cfg.split_reprojection_support:.3f}{detail}")
+        if getattr(self, "split_reproj_log", None) is not None:
+            # tag the aggregate verdict onto this frame's rows for this part
+            for e in self.split_reproj_log:
+                if e["frame"] == self.n - 1 and e["part_id"] == int(part.part_id):
+                    e.setdefault("verdict", {
+                        "gain": float(gain), "gain_thresh": float(cfg.split_reprojection_gain),
+                        "supported": bool(supported), "accept": bool(accept),
+                        "reason": reason})
         return accept
+
+    def _reproj_diag(self, pts, pose):
+        """Extended reprojection evidence for diagnosis (mirrors reprojection_evidence,
+        adds valid/behind counts and a continuous on-object depth residual)."""
+        K, depth, mask = self.K, self.current_depth, self.mask
+        tol = self.cfg.split_reprojection_tol
+        pts = np.asarray(pts)
+        q = pts @ pose[:3, :3].T + pose[:3, 3]
+        z = q[:, 2]
+        uv = q @ np.asarray(K).T
+        xy = np.rint(uv[:, :2] / np.maximum(z[:, None], 1e-6)).astype(int)
+        h, w = depth.shape
+        valid = np.isfinite(q).all(axis=1) & (z > .05) & \
+            (xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h)
+        u, v = np.clip(xy[:, 0], 0, w - 1), np.clip(xy[:, 1], 0, h - 1)
+        d = depth[v, u]
+        valid &= np.isfinite(d) & (d > .05)
+        obj = mask[v, u] > 0
+        dz = z - d
+        support = valid & obj & (np.abs(dz) <= tol)
+        freespace = valid & (z < d - tol)              # in front of a confirmed surface
+        offsil = valid & ~obj & (z <= d + tol)         # spilled past the silhouette
+        contra = freespace | offsil
+        behind = valid & (z > d + tol)                 # occluded/neutral (occlusion-aware)
+        on_obj = valid & obj & (np.abs(dz) <= 0.1)     # continuous residual window
+        resid = float(np.mean(np.abs(dz[on_obj]))) if on_obj.any() else None
+        n = max(int(len(pts)), 1)
+        return {"support": float(support.mean()), "contradiction": float(contra.mean()),
+                "contradiction_freespace": float(freespace.mean()),
+                "contradiction_offsilhouette": float(offsil.mean()),
+                "n_pts": int(len(pts)), "n_valid": int(valid.sum()),
+                "n_support": int(support.sum()), "n_contra": int(contra.sum()),
+                "n_behind_occluded": int(behind.sum()),
+                "frac_behind": float(behind.sum() / n), "frac_valid": float(valid.sum() / n),
+                "resid_m": resid, "n_on_obj": int(on_obj.sum())}
 
     def _paired_resid(self, pts, com_pose, sep_pose):
         """On-object depth residual under BOTH poses over the SAME samples.
@@ -1918,12 +2305,19 @@ class NaivePartTracker:
             self.reprojection_blocked = getattr(self, "reprojection_blocked", 0) + 1
             return False
         order = np.argsort([-len(g) for g in groups])
+        # born counts in self.n, which the settle gate compares against;
+        # birth counts in the frame index hist and _merge_rigid use
         new = [NaivePart(idx=np.asarray(groups[k]), pose=motions[k],
-                         born=self.n, view_dirs=[np.array([0., 0., 1.])])
+                         born=self.n, birth=self.n - 1,
+                         view_dirs=[np.array([0., 0., 1.])])
                for k in order]
         new[0].part_id = part.part_id
         new[1].part_id = self.next_part_id
         self.next_part_id += 1
+        # the larger group carries the split part's identity onward, so only
+        # the smaller one is actually born here; giving both the current
+        # frame as a birth would restart an identity that never ended
+        new[0].birth = part.birth
         # the affinity that justified this split has been spent; each new part
         # has to earn its own before it may split again
         all_idx = np.concatenate([np.asarray(g) for g in groups])
@@ -1959,6 +2353,21 @@ class NaivePartTracker:
 
         # how much relative motion it actually took, which is the number the
         # "wiggle and it becomes controllable" claim lives or dies on
+        for q in new:
+            ev = self._evidence(q)
+            self.birth_log.append(
+                {"frame": int(self.n - 1), "part_id": int(q.part_id),
+                 "new_identity": bool(q.part_id != part.part_id),
+                 "via": via, "n_points": int(len(q.idx)),
+                 "hist": 0 if not q.hist else int(len(q.hist)),
+                 "evidence": ev})
+            what = ("born" if q.part_id != part.part_id
+                    else f"continues (born {q.birth})")
+            print(f"[lifecycle] frame {self.n - 1}: part_id {q.part_id} "
+                  f"{what} ({len(q.idx)} pts, {ev['total']} joint obs, "
+                  f"{ev['pre_birth']} retro from before it existed, "
+                  f"{ev['earned']} earned)")
+
         mm = sep_sigma * part.sigma * 1000
         self.split_evidence = (self.n, mm, part.sigma * 1000)
         print(f"[naive] split at frame {self.n} via {via}: {len(self.parts)} "
@@ -1994,8 +2403,26 @@ class NaivePartTracker:
             return
         pts = np.concatenate(seeds)
         own = np.concatenate(owner)
-        _, nn = cKDTree(pts).query(gm[held], k=1)
+        dsel, nn = cKDTree(pts).query(gm[held], k=1)
         self.model.labels[held] = own[nn]
+        # diagnostics (no behaviour): the seed distance that drove each
+        # assignment. A held gaussian far from every child's *currently tracked*
+        # sparse seed had no visible seed nearby -- the signature of a
+        # historical, non-visible surface being assigned blind.
+        if getattr(self.model, "seed_dist", None) is not None:
+            self.model.seed_dist[held] = dsel.astype(np.float32)
+        if getattr(self, "surface_log", None) is not None:
+            assigned = own[nn]
+            self.surface_log.append({
+                "event": "split", "frame": int(self.n - 1), "parent_id": int(j),
+                "held": int(held.size),
+                "per_child": {int(k): int((assigned == k).sum())
+                              for k in np.unique(own)},
+                "seed_dist_m": {
+                    "p50": float(np.median(dsel)), "p90": float(np.percentile(dsel, 90)),
+                    "max": float(dsel.max()),
+                    "gt_2cm": int((dsel > 0.02).sum()),
+                    "gt_5cm": int((dsel > 0.05).sum())}})
 
     # ---- visualisation ----
     PAL = [(60, 140, 235), (200, 120, 40), (70, 180, 90), (200, 80, 200),

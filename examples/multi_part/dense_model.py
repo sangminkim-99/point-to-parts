@@ -31,6 +31,11 @@ class PartGaussians:
             if pm is not None and pm.shape[0] == n:
                 self.labels[pm] = j
         self.n_initial = n
+        # diagnostics only (no behaviour): the nearest sparse-seed distance that
+        # drove each gaussian's last split reassignment, and the last carve's
+        # per-gaussian detail. NaN = never split-assigned (grown or initial).
+        self.seed_dist = np.full(n, np.nan, dtype=np.float32)
+        self._carve_note = None
 
     # ---- membership ----
     def weights(self, j, n=None):
@@ -56,6 +61,8 @@ class PartGaussians:
         if not n_new:
             return 0
         self.labels = np.concatenate([self.labels, np.asarray(owner, np.int32)])
+        self.seed_dist = np.concatenate(
+            [self.seed_dist, np.full(n_new, np.nan, np.float32)])
         return n_new
 
     def uncovered(self, depth, mask, poses):
@@ -102,6 +109,13 @@ class PartGaussians:
         self._votes = v_
         go = np.where(v_[:n] >= votes)[0]
         if go.size:
+            # diagnostics: record what is about to be carved, and the seed
+            # distance that assigned it at its last split, BEFORE overwriting
+            self._carve_note = {"idx": go.copy(),
+                                "labels": self.labels[go].copy(),
+                                "seed_dist": self.seed_dist[go].copy()}
             self.labels[go] = -1
             v_[go] = 0
+        else:
+            self._carve_note = None
         return int(go.size)
